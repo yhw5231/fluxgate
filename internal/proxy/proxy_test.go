@@ -1,0 +1,261 @@
+package proxy
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/yhw5231/fluxgate/internal/domain"
+	"github.com/yhw5231/fluxgate/internal/router"
+)
+
+type recordingObserver struct {
+	mu        sync.Mutex
+	failures  []domain.Failure
+	successes []domain.Attempt
+}
+
+func (o *recordingObserver) RecordFailure(failure domain.Failure) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.failures = append(o.failures, failure)
+}
+
+func (o *recordingObserver) RecordSuccess(attempt domain.Attempt) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.successes = append(o.successes, attempt)
+}
+
+func noSleep(context.Context, time.Duration) error {
+	return nil
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
+
+func TestEngineRetriesSameChannelThenFailsOver(t *testing.T) {
+	var firstCalls int
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstCalls++
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"temporary"}`))
+	}))
+	defer first.Close()
+
+	var secondCalls int
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondCalls++
+		if got := r.Header.Get("Authorization"); got != "Bearer second-key" {
+			t.Errorf("Authorization = %q, want second channel credential", got)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		if got := body["model"]; got != "mapped-model" {
+			t.Errorf("model = %#v, want mapped-model", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer second.Close()
+
+	selector := router.NewMemorySelector([]domain.Channel{
+		{
+			ID:       "first",
+			BaseURL:  first.URL,
+			Enabled:  true,
+			Priority: 20,
+			Weight:   1,
+		},
+		{
+			ID:           "second",
+			BaseURL:      second.URL,
+			APIKey:       "second-key",
+			Enabled:      true,
+			Priority:     10,
+			Weight:       1,
+			ModelMapping: map[string]string{"gpt-*": "mapped-model"},
+		},
+	})
+	observer := &recordingObserver{}
+	engine := Engine{
+		Selector: selector,
+		Observer: observer,
+		Client:   &http.Client{},
+		Policy: domain.RetryPolicy{
+			MaxAttempts:           4,
+			MaxAttemptsPerChannel: 2,
+			RetryStatuses:         map[int]struct{}{http.StatusServiceUnavailable: {}},
+		},
+		Sleep: noSleep,
+	}
+
+	result, err := engine.Forward(context.Background(), domain.Request{
+		Method:  http.MethodPost,
+		Path:    "/v1/chat/completions",
+		Headers: http.Header{"Authorization": []string{"Bearer downstream"}},
+		Body:    []byte(`{"model":"gpt-4.1","messages":[]}`),
+		Model:   "gpt-4.1",
+	})
+	if err != nil {
+		t.Fatalf("Forward() error = %v", err)
+	}
+	defer result.Response.Body.Close()
+
+	if result.Attempt.Number != 3 {
+		t.Fatalf("successful attempt number = %d, want 3", result.Attempt.Number)
+	}
+	if result.Attempt.ChannelID != "second" {
+		t.Fatalf("successful channel = %q, want second", result.Attempt.ChannelID)
+	}
+	if firstCalls != 2 {
+		t.Fatalf("first channel calls = %d, want 2", firstCalls)
+	}
+	if secondCalls != 1 {
+		t.Fatalf("second channel calls = %d, want 1", secondCalls)
+	}
+	responseBody, err := io.ReadAll(result.Response.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(responseBody) != `{"ok":true}` {
+		t.Fatalf("response body = %s, want final successful response", responseBody)
+	}
+	if len(observer.failures) != 2 {
+		t.Fatalf("recorded failures = %d, want 2", len(observer.failures))
+	}
+	if len(observer.successes) != 1 {
+		t.Fatalf("recorded successes = %d, want 1", len(observer.successes))
+	}
+}
+
+func TestEngineReturnsNonRetryableResponseWithoutFailover(t *testing.T) {
+	var firstCalls int
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		firstCalls++
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"bad request"}`))
+	}))
+	defer first.Close()
+
+	var secondCalls int
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		secondCalls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer second.Close()
+
+	engine := Engine{
+		Selector: router.NewMemorySelector([]domain.Channel{
+			{ID: "first", BaseURL: first.URL, Enabled: true, Priority: 20, Weight: 1},
+			{ID: "second", BaseURL: second.URL, Enabled: true, Priority: 10, Weight: 1},
+		}),
+		Policy: domain.RetryPolicy{
+			MaxAttempts:           4,
+			MaxAttemptsPerChannel: 1,
+			RetryStatuses:         map[int]struct{}{http.StatusServiceUnavailable: {}},
+		},
+		Sleep: noSleep,
+	}
+
+	result, err := engine.Forward(context.Background(), domain.Request{
+		Method: http.MethodPost,
+		Path:   "/v1/responses",
+		Body:   []byte(`{"model":"gpt-4.1"}`),
+		Model:  "gpt-4.1",
+	})
+	if err != nil {
+		t.Fatalf("Forward() error = %v", err)
+	}
+	defer result.Response.Body.Close()
+
+	if result.Response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", result.Response.StatusCode)
+	}
+	if firstCalls != 1 || secondCalls != 0 {
+		t.Fatalf("channel calls = first:%d second:%d, want 1 and 0", firstCalls, secondCalls)
+	}
+}
+
+func TestEngineStopsAtGlobalAttemptLimit(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer upstream.Close()
+
+	engine := Engine{
+		Selector: router.NewMemorySelector([]domain.Channel{
+			{ID: "only", BaseURL: upstream.URL, Enabled: true, Priority: 1, Weight: 1},
+		}),
+		Policy: domain.RetryPolicy{
+			MaxAttempts:           3,
+			MaxAttemptsPerChannel: 5,
+			RetryStatuses:         map[int]struct{}{http.StatusTooManyRequests: {}},
+		},
+		Sleep: noSleep,
+	}
+
+	_, err := engine.Forward(context.Background(), domain.Request{
+		Method: http.MethodPost,
+		Path:   "/v1/messages",
+		Body:   []byte(`{"model":"claude"}`),
+		Model:  "claude",
+	})
+	if err == nil {
+		t.Fatal("Forward() error = nil, want attempt-limit failure")
+	}
+	if calls != 3 {
+		t.Fatalf("upstream calls = %d, want 3", calls)
+	}
+}
+
+func TestEngineAppliesChannelRequestTimeout(t *testing.T) {
+	requestCanceled := make(chan struct{}, 1)
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		<-request.Context().Done()
+		requestCanceled <- struct{}{}
+		return nil, request.Context().Err()
+	})}
+
+	engine := Engine{
+		Selector: router.NewMemorySelector([]domain.Channel{{
+			ID:             "slow",
+			BaseURL:        "http://upstream.test",
+			Enabled:        true,
+			Weight:         1,
+			RequestTimeout: 25 * time.Millisecond,
+		}}),
+		Client: client,
+		Policy: domain.RetryPolicy{MaxAttempts: 1, MaxAttemptsPerChannel: 1},
+		Sleep:  noSleep,
+	}
+
+	_, err := engine.Forward(context.Background(), domain.Request{
+		Method: http.MethodPost,
+		Path:   "/v1/chat/completions",
+		Body:   []byte(`{"model":"gpt-4.1"}`),
+		Model:  "gpt-4.1",
+	})
+	if err == nil {
+		t.Fatal("Forward() error = nil, want request timeout")
+	}
+
+	select {
+	case <-requestCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("upstream request context was not canceled by the channel timeout")
+	}
+}

@@ -1,0 +1,53 @@
+# Build outputs
+bin/
+build/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/fluxgate
+/fluxgate.exe
+
+# Go workspace and coverage artifacts
+go.work
+go.work.sum
+coverage/
+coverage.out
+*.coverprofile
+
+# Runtime data and SQLite files
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Environment files and local secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+.cache/
+
+# IDE and editor settings
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

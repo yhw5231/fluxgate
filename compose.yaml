@@ -1,0 +1,54 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fluxgate:local
+    container_name: fluxgate
+    restart: unless-stopped
+    ports:
+      - "${FLUXGATE_HOST_PORT:-8081}:8081"
+    environment:
+      FLUXGATE_ADDRESS: ":8081"
+      FLUXGATE_DATABASE_PATH: "/data/hub.db"
+      FLUXGATE_MANAGEMENT_TOKEN: "${FLUXGATE_MANAGEMENT_TOKEN:-}"
+      FLUXGATE_MAX_BODY_BYTES: "${FLUXGATE_MAX_BODY_BYTES:-8388608}"
+      FLUXGATE_REQUEST_TIMEOUT: "${FLUXGATE_REQUEST_TIMEOUT:-60s}"
+      FLUXGATE_CONNECT_TIMEOUT: "${FLUXGATE_CONNECT_TIMEOUT:-10s}"
+      FLUXGATE_TLS_HANDSHAKE_TIMEOUT: "${FLUXGATE_TLS_HANDSHAKE_TIMEOUT:-10s}"
+      FLUXGATE_RESPONSE_HEADER_TIMEOUT: "${FLUXGATE_RESPONSE_HEADER_TIMEOUT:-30s}"
+      FLUXGATE_IDLE_CONN_TIMEOUT: "${FLUXGATE_IDLE_CONN_TIMEOUT:-90s}"
+      FLUXGATE_READ_HEADER_TIMEOUT: "${FLUXGATE_READ_HEADER_TIMEOUT:-10s}"
+      FLUXGATE_READ_TIMEOUT: "${FLUXGATE_READ_TIMEOUT:-30s}"
+      FLUXGATE_WRITE_TIMEOUT: "${FLUXGATE_WRITE_TIMEOUT:-0s}"
+      FLUXGATE_IDLE_TIMEOUT: "${FLUXGATE_IDLE_TIMEOUT:-120s}"
+      FLUXGATE_SHUTDOWN_TIMEOUT: "${FLUXGATE_SHUTDOWN_TIMEOUT:-15s}"
+      FLUXGATE_MAX_ATTEMPTS: "${FLUXGATE_MAX_ATTEMPTS:-8}"
+      FLUXGATE_MAX_ATTEMPTS_PER_CHANNEL: "${FLUXGATE_MAX_ATTEMPTS_PER_CHANNEL:-2}"
+      FLUXGATE_RETRY_BASE_BACKOFF: "${FLUXGATE_RETRY_BASE_BACKOFF:-50ms}"
+      FLUXGATE_RETRY_MAX_BACKOFF: "${FLUXGATE_RETRY_MAX_BACKOFF:-1s}"
+      FLUXGATE_BREAKER_MODE: "${FLUXGATE_BREAKER_MODE:-cooldown}"
+      FLUXGATE_BREAKER_THRESHOLD: "${FLUXGATE_BREAKER_THRESHOLD:-3}"
+      FLUXGATE_BREAKER_BASE_COOLDOWN: "${FLUXGATE_BREAKER_BASE_COOLDOWN:-30s}"
+      FLUXGATE_BREAKER_MAX_COOLDOWN: "${FLUXGATE_BREAKER_MAX_COOLDOWN:-15m}"
+      HTTP_PROXY: "${HTTP_PROXY:-}"
+      HTTPS_PROXY: "${HTTPS_PROXY:-}"
+      NO_PROXY: "${NO_PROXY:-127.0.0.1,localhost}"
+    volumes:
+      - type: bind
+        source: "${FLUXGATE_DATA_DIR:-./data}"
+        target: /data
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8081/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    stop_grace_period: 20s

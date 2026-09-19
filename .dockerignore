@@ -1,0 +1,46 @@
+.git
+.gitignore
+.github
+
+# Documentation and editor metadata
+README.md
+.idea
+.vscode
+.DS_Store
+Thumbs.db
+
+# Local configuration and secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Build, test, and coverage artifacts
+bin
+build
+dist
+coverage
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.coverprofile
+fluxgate
+fluxgate.exe
+
+# Runtime data must be mounted, not baked into the image
+data
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Temporary files
+*.log
+tmp
+temp
+.cache

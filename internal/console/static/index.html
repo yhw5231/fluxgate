@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Fluxgate Console</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 1.8 20.4 6.7v9.8L12 21.4 3.6 16.5V6.7L12 1.8z' fill='%230b1220' stroke='%2338bdf8' stroke-width='1.6'/%3E%3Cpath d='M13.1 6.2 8.4 13h3.2l-.7 4.8 4.7-6.8h-3.2l.7-4.8z' fill='%2338bdf8'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/console/styles.css">
+</head>
+<body>
+  <div class="backdrop" aria-hidden="true">
+    <div class="glow glow-a"></div>
+    <div class="glow glow-b"></div>
+    <div class="grid-overlay"></div>
+  </div>
+
+  <!-- Shared paint server for the brand mark -->
+  <svg class="sprite" aria-hidden="true" focusable="false">
+    <defs>
+      <linearGradient id="logo-gradient" x1="0" y1="0" x2="24" y2="24" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color="#38bdf8"/>
+        <stop offset="1" stop-color="#818cf8"/>
+      </linearGradient>
+    </defs>
+  </svg>
+
+  <!-- Authentication gate -->
+  <div id="auth-overlay" class="auth-overlay">
+    <div class="auth-card" role="dialog" aria-labelledby="auth-title">
+      <div class="auth-logo">
+        <svg class="logo-mark" viewBox="0 0 24 24" aria-hidden="true">
+          <path class="logo-hex" d="M12 1.8 20.4 6.7v9.8L12 21.4 3.6 16.5V6.7L12 1.8z"/>
+          <path class="logo-bolt" d="M13.1 6.2 8.4 13h3.2l-.7 4.8 4.7-6.8h-3.2l.7-4.8z"/>
+        </svg>
+      </div>
+      <h1 id="auth-title">Gateway Console</h1>
+      <p class="auth-subtitle">Fluxgate &middot; management access</p>
+      <form id="auth-form" autocomplete="off">
+        <label class="auth-label" for="auth-token">Management token</label>
+        <input id="auth-token" type="password" spellcheck="false" autocomplete="off"
+               placeholder="FLUXGATE_MANAGEMENT_TOKEN" required>
+        <button id="auth-submit" type="submit" class="btn btn-primary btn-block">
+          <span class="btn-label">Unlock console</span>
+        </button>
+        <p id="auth-error" class="auth-error" role="alert" hidden></p>
+        <p class="auth-hint">The token is kept in this browser only and sent as a
+          bearer credential to <code>/management/*</code> endpoints.</p>
+      </form>
+    </div>
+  </div>
+
+  <!-- Console -->
+  <div id="app" class="app" hidden>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <div class="brand">
+          <svg class="logo-mark" viewBox="0 0 24 24" aria-hidden="true">
+            <path class="logo-hex" d="M12 1.8 20.4 6.7v9.8L12 21.4 3.6 16.5V6.7L12 1.8z"/>
+            <path class="logo-bolt" d="M13.1 6.2 8.4 13h3.2l-.7 4.8 4.7-6.8h-3.2l.7-4.8z"/>
+          </svg>
+          <div class="brand-text">
+            <span class="brand-name">Fluxgate</span>
+            <span class="brand-sub">Management Console</span>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <span id="topbar-uptime" class="uptime" data-uptime title="Process uptime">&mdash;</span>
+          <span id="topbar-status" class="status-pill status-unknown" data-status>
+            <span class="status-dot" aria-hidden="true"></span><span data-status-label>Connecting</span>
+          </span>
+          <button id="refresh-button" class="btn btn-ghost btn-icon" type="button" title="Refresh now" aria-label="Refresh now">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M20 12a8 8 0 1 1-2.34-5.66M20 3v5h-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+          <button id="signout-button" class="btn btn-ghost btn-icon" type="button" title="Sign out" aria-label="Sign out">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M15 3h4a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1h-4M10 17l5-5-5-5M15 12H3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main class="container">
+      <div id="error-banner" class="banner banner-error" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 8v5M12 16.5v.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          <path d="M12 2.5 22 20H2L12 2.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+        </svg>
+        <div class="banner-body">
+          <strong data-banner-title>Request failed</strong>
+          <span data-banner-detail></span>
+        </div>
+        <button id="banner-retry" class="btn btn-ghost" type="button">Retry</button>
+      </div>
+
+      <section class="stats-grid" aria-label="Overview">
+        <article class="stat-card" data-stat="service">
+          <div class="stat-icon">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l2.5-6 4 12L16 12h5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <div class="stat-body">
+            <span class="stat-label">Gateway</span>
+            <span class="stat-value" data-value>&mdash;</span>
+            <span class="stat-sub" data-sub>service status</span>
+          </div>
+        </article>
+        <article class="stat-card" data-stat="models">
+          <div class="stat-icon">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+          </div>
+          <div class="stat-body">
+            <span class="stat-label">Models</span>
+            <span class="stat-value" data-value>&mdash;</span>
+            <span class="stat-sub" data-sub>routable</span>
+          </div>
+        </article>
+        <article class="stat-card" data-stat="channels">
+          <div class="stat-icon">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.5" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="18" cy="6" r="2.5" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="18" r="2.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M6 8.5v1a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3v-1M12 12.5v3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          </div>
+          <div class="stat-body">
+            <span class="stat-label">Channels</span>
+            <span class="stat-value" data-value>&mdash;</span>
+            <span class="stat-sub" data-sub>upstream routes</span>
+          </div>
+        </article>
+        <article class="stat-card" data-stat="breakers">
+          <div class="stat-icon">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.8 20 6.3v5.2c0 5-3.4 8.1-8 9.7-4.6-1.6-8-4.7-8-9.7V6.3l8-3.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="m8.8 12 2.2 2.2 4.2-4.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <div class="stat-body">
+            <span class="stat-label">Breakers</span>
+            <span class="stat-value" data-value>&mdash;</span>
+            <span class="stat-sub" data-sub>open / tracked</span>
+          </div>
+        </article>
+      </section>
+
+      <section class="panel" data-panel="breakers">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="title-tick" aria-hidden="true"></span>
+            <h2>Circuit Breakers</h2>
+            <span class="panel-meta" data-meta></span>
+          </div>
+          <span class="panel-note">auto-refreshes every 10s &middot; <span data-next-refresh>&mdash;</span></span>
+        </header>
+        <div class="table-wrap">
+          <table class="data-table" data-breakers-table>
+            <thead>
+              <tr>
+                <th>Scope</th>
+                <th>Channel</th>
+                <th>Key</th>
+                <th>Model</th>
+                <th class="num">Failures</th>
+                <th class="num">Level</th>
+                <th>State</th>
+              </tr>
+            </thead>
+            <tbody data-breakers-body></tbody>
+          </table>
+        </div>
+        <div class="empty-state" data-breakers-empty hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.8 20 6.3v5.2c0 5-3.4 8.1-8 9.7-4.6-1.6-8-4.7-8-9.7V6.3l8-3.5z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="m8.8 12 2.2 2.2 4.2-4.4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <p>All circuits healthy &mdash; no open breakers</p>
+        </div>
+      </section>
+
+      <section class="panel" data-panel="channels">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="title-tick" aria-hidden="true"></span>
+            <h2>Upstream Channels</h2>
+            <span class="panel-meta" data-meta></span>
+          </div>
+          <span class="panel-note">sorted by priority</span>
+        </header>
+        <div class="table-wrap">
+          <table class="data-table" data-channels-table>
+            <thead>
+              <tr>
+                <th>Channel</th>
+                <th>Status</th>
+                <th class="num">Priority</th>
+                <th class="num">Weight</th>
+                <th>Strategy</th>
+                <th>Breaker</th>
+                <th>Proxy</th>
+                <th class="num">Mappings</th>
+              </tr>
+            </thead>
+            <tbody data-channels-body></tbody>
+          </table>
+        </div>
+        <div class="empty-state" data-channels-empty hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.5" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="18" cy="6" r="2.5" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="12" cy="18" r="2.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M6 8.5v1a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3v-1M12 12.5v3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+          <p>No upstream channels configured</p>
+        </div>
+      </section>
+
+      <section class="panel" data-panel="models">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="title-tick" aria-hidden="true"></span>
+            <h2>Models</h2>
+            <span class="panel-meta" data-meta></span>
+          </div>
+          <input id="model-filter" class="filter-input" type="search" placeholder="Filter models&hellip;" aria-label="Filter models">
+        </header>
+        <div class="chip-cloud" data-models-cloud></div>
+        <div class="empty-state" data-models-empty hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+          <p>No models match the filter</p>
+        </div>
+      </section>
+
+      <footer class="console-footer">
+        <span data-footer-generated>snapshot: &mdash;</span>
+        <span data-footer-loaded>config loaded: &mdash;</span>
+        <span class="footer-brand">fluxgate console</span>
+      </footer>
+    </main>
+  </div>
+
+  <script src="/console/app.js"></script>
+</body>
+</html>
