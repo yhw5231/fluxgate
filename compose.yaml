@@ -4,12 +4,9 @@
 #   cp .env.example .env   # 复制环境变量模板并按需修改（必填 FLUXGATE_MANAGEMENT_TOKEN）
 #   docker compose up -d --build
 #
-# 注意：网关容器以非 root 用户（UID/GID 10001）运行，宿主机数据目录必须允许该
-# 用户读写（SQLite 需要在目录中创建 hub.db、hub.db-wal、hub.db-shm 等文件），
-# 否则启动时会报错：
-#   ping SQLite database: unable to open database file: out of memory (14)
-# 修复方法（在宿主机数据目录上执行）：
-#   sudo chown -R 10001:10001 ./data
+# 数据目录权限：镜像入口脚本会在启动时自动把 FLUXGATE_DATA_DIR 对应的宿主机
+# 目录交给容器运行用户（UID/GID 10001），无需手动 chown。仅 SELinux 环境可能
+# 还需为挂载启用标签（bind mount 加 selinux: z 或 :Z）。
 services:
   gateway:
     build:
@@ -77,7 +74,7 @@ services:
     volumes:
       # 将宿主机数据目录挂载到容器 /data，持久化 SQLite 数据库；
       # 宿主机目录由 .env 中 FLUXGATE_DATA_DIR 指定（默认 ./data），
-      # 必须保证 UID 10001 可读写（见文件头说明）
+      # 目录属主由入口脚本在启动时自动修正（见文件头说明）
       - type: bind
         source: "${FLUXGATE_DATA_DIR:-./data}"
         target: /data
@@ -88,11 +85,17 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
-    # 安全加固：禁止提权、丢弃全部 Linux capabilities
+    # 安全加固：禁止提权、丢弃全部 Linux capabilities；
+    # 仅保留 CHOWN/SETUID/SETGID 供入口脚本在启动初期自动修正数据目录属主
+    # 并降权为非特权用户（UID 10001），root 阶段不接触网络请求
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
     # 根文件系统只读，临时文件走内存盘 /tmp，降低被入侵后的影响面
     read_only: true
     tmpfs:

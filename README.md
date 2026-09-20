@@ -90,12 +90,17 @@ mkdir -p data
 cp ../data/hub.db data/hub.db
 ```
 
-The container runs as the unprivileged user and group ID `10001`. On Linux, ensure that this identity can read and update the database and its directory because SQLite may create write-ahead log and shared memory files:
+The image fixes the data-directory ownership automatically: the container starts briefly as root with only the `CHOWN`, `SETUID`, and `SETGID` capabilities, the entrypoint hands the mounted directory (and everything inside it) to the runtime user and group ID `10001`, and the gateway then runs unprivileged. No manual `chown` is required, even when Docker created a missing host directory as root. New database files are created with mode `0600` (`umask 077`).
+
+Manual steps are only needed in two cases:
+
+- **SELinux** (CentOS/RHEL/Rocky): ownership is correct but the label is not. Enable labeling for the mount (`selinux: z` on the Compose bind mount, or `:Z` in `docker run`) and run `sudo chcon -Rt container_file_t data` once.
+- **Explicit non-root startup** (`docker run --user 10001:10001` or a Kubernetes `securityContext`): the entrypoint skips its root phase, so the directory must already be writable by that identity.
+
+To check the directory on the host at any time:
 
 ```bash
-sudo chown -R 10001:10001 data
-sudo chmod 750 data
-sudo chmod 640 data/hub.db
+ls -ln data   # third and fourth columns should be 10001 10001
 ```
 
 > **Keep the gateway the only writer of this file.** SQLite requires all
@@ -171,7 +176,7 @@ docker compose down
 
 By default, Compose publishes host port `8081`, mounts `./data` at `/data`, and configures the gateway to use `/data/hub.db`. Override the host port or data location in `.env` with `FLUXGATE_HOST_PORT` and `FLUXGATE_DATA_DIR`.
 
-The Compose service runs with a read-only root filesystem, drops Linux capabilities, enables `no-new-privileges`, uses a temporary `/tmp`, persists the SQLite database through a bind mount, and includes an HTTP health check.
+The Compose service runs with a read-only root filesystem, drops all Linux capabilities except `CHOWN`, `SETUID`, and `SETGID` (used only by the startup entrypoint to repair data-directory ownership before dropping to the unprivileged gateway user), enables `no-new-privileges`, uses a temporary `/tmp`, persists the SQLite database through a bind mount, and includes an HTTP health check.
 
 ### Upgrade an existing deployment
 
@@ -201,6 +206,9 @@ docker run -d \
   --tmpfs /tmp:rw,noexec,nosuid,size=16m \
   --security-opt no-new-privileges \
   --cap-drop ALL \
+  --cap-add CHOWN \
+  --cap-add SETUID \
+  --cap-add SETGID \
   -p 8081:8081 \
   -v "$(pwd)/data:/data" \
   -e FLUXGATE_MANAGEMENT_TOKEN="replace-with-a-strong-secret" \
