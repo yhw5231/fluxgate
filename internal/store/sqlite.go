@@ -187,12 +187,54 @@ var requiredUpstreamTables = []string{
 	"route_group_sources",
 }
 
-// VerifyUpstreamSchema rejects a configuration database that does not carry the
-// upstream schema. Without this check the gateway would surface the missing
-// tables one query at a time as opaque "no such table" SQL errors; here the
-// absent tables and the tables that do exist are named, so a wrong or empty
-// file placed at the configured path is reported with its fix at startup.
-func (s *SQLiteStore) VerifyUpstreamSchema(ctx context.Context) error {
+// upstreamSchemaDDL creates the upstream configuration tables on a fresh
+// database. The store tests execute the same statements, so the replica schema
+// used by the tests cannot drift from what the gateway creates.
+var upstreamSchemaDDL = []string{
+	`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`,
+	`CREATE TABLE IF NOT EXISTS proxy_profiles (
+		id INTEGER PRIMARY KEY, name TEXT NOT NULL, protocol TEXT NOT NULL,
+		url TEXT NOT NULL, is_default INTEGER DEFAULT 0, enabled INTEGER DEFAULT 1
+	)`,
+	`CREATE TABLE IF NOT EXISTS downstream_api_keys (
+		id INTEGER PRIMARY KEY, name TEXT NOT NULL, key TEXT NOT NULL, enabled INTEGER DEFAULT 1,
+		expires_at TEXT, max_cost REAL, used_cost REAL DEFAULT 0, max_requests INTEGER,
+		used_requests INTEGER DEFAULT 0, supported_models TEXT, allowed_route_ids TEXT,
+		site_weight_multipliers TEXT, excluded_site_ids TEXT, excluded_credential_refs TEXT
+	)`,
+	`CREATE TABLE IF NOT EXISTS sites (
+		id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, platform TEXT NOT NULL,
+		proxy_url TEXT, use_system_proxy INTEGER DEFAULT 0, custom_headers TEXT,
+		status TEXT DEFAULT 'active', global_weight REAL DEFAULT 1, forced_upstream_endpoint TEXT
+	)`,
+	`CREATE TABLE IF NOT EXISTS accounts (
+		id INTEGER PRIMARY KEY, site_id INTEGER NOT NULL, access_token TEXT NOT NULL,
+		api_token TEXT, extra_config TEXT, status TEXT DEFAULT 'active'
+	)`,
+	`CREATE TABLE IF NOT EXISTS account_tokens (
+		id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, token TEXT NOT NULL,
+		proxy_url TEXT, use_system_proxy INTEGER DEFAULT 0, enabled INTEGER DEFAULT 1
+	)`,
+	`CREATE TABLE IF NOT EXISTS token_routes (
+		id INTEGER PRIMARY KEY, model_pattern TEXT NOT NULL, model_mapping TEXT,
+		routing_strategy TEXT DEFAULT 'weighted', enabled INTEGER DEFAULT 1,
+		display_name TEXT, route_mode TEXT DEFAULT 'pattern'
+	)`,
+	`CREATE TABLE IF NOT EXISTS route_channels (
+		id INTEGER PRIMARY KEY, route_id INTEGER NOT NULL, account_id INTEGER NOT NULL,
+		token_id INTEGER, source_model TEXT, priority INTEGER DEFAULT 0,
+		weight INTEGER DEFAULT 10, enabled INTEGER DEFAULT 1
+	)`,
+	`CREATE TABLE IF NOT EXISTS route_group_sources (id INTEGER PRIMARY KEY, group_route_id INTEGER NOT NULL, source_route_id INTEGER NOT NULL)`,
+}
+
+// EnsureUpstreamSchema prepares the configuration tables at startup. A fresh
+// database (or one the gateway itself created empty) gets the full schema so a
+// first-time deployment starts healthy with an empty configuration. A database
+// that carries part of the schema is treated as a wrong or truncated file and
+// rejected with the tables it has and the ones it is missing, so half-migrated
+// data cannot serve subtly wrong routing.
+func (s *SQLiteStore) EnsureUpstreamSchema(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table'`)
 	if err != nil {
 		return fmt.Errorf("list configuration database tables: %w", err)
@@ -219,14 +261,23 @@ func (s *SQLiteStore) VerifyUpstreamSchema(ctx context.Context) error {
 	if len(missing) == 0 {
 		return nil
 	}
-	present := make([]string, 0, len(found))
-	for name := range found {
-		present = append(present, name)
+	if len(missing) < len(requiredUpstreamTables) {
+		present := make([]string, 0, len(found))
+		for name := range found {
+			present = append(present, name)
+		}
+		sort.Strings(present)
+		return fmt.Errorf(
+			"the configuration database is missing the upstream tables %s but contains %s; place the management server's SQLite database (hub.db) at the configured FLUXGATE_DATABASE_PATH",
+			strings.Join(missing, ", "), strings.Join(present, ", "))
 	}
-	sort.Strings(present)
-	return fmt.Errorf(
-		"the configuration database is missing the upstream tables %s but contains %s; place the management server's SQLite database (hub.db) at the configured FLUXGATE_DATABASE_PATH",
-		strings.Join(missing, ", "), strings.Join(present, ", "))
+
+	for _, statement := range upstreamSchemaDDL {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("create upstream table: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *SQLiteStore) EnsureBreakerSchema(ctx context.Context) error {

@@ -51,7 +51,7 @@ func run(parent context.Context, logger *slog.Logger) error {
 		return err
 	}
 
-	if err := persistentStore.VerifyUpstreamSchema(parent); err != nil {
+	if err := persistentStore.EnsureUpstreamSchema(parent); err != nil {
 		return err
 	}
 

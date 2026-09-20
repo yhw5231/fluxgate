@@ -468,48 +468,11 @@ func TestCleanupBreakerStatesRemovesOnlyInactiveExpiredRows(t *testing.T) {
 	}
 }
 
-// createUpstreamTables builds the empty upstream configuration schema the
-// gateway expects to find in the shared database.
+// createUpstreamTables builds the empty upstream configuration schema using the
+// same DDL the gateway applies to a fresh database.
 func createUpstreamTables(t *testing.T, store *SQLiteStore) {
 	t.Helper()
-	statements := []string{
-		`CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)`,
-		`CREATE TABLE proxy_profiles (
-			id INTEGER PRIMARY KEY, name TEXT NOT NULL, protocol TEXT NOT NULL,
-			url TEXT NOT NULL, is_default INTEGER DEFAULT 0, enabled INTEGER DEFAULT 1
-		)`,
-		`CREATE TABLE downstream_api_keys (
-			id INTEGER PRIMARY KEY, name TEXT NOT NULL, key TEXT NOT NULL, enabled INTEGER DEFAULT 1,
-			expires_at TEXT, max_cost REAL, used_cost REAL DEFAULT 0, max_requests INTEGER,
-			used_requests INTEGER DEFAULT 0, supported_models TEXT, allowed_route_ids TEXT,
-			site_weight_multipliers TEXT, excluded_site_ids TEXT, excluded_credential_refs TEXT
-		)`,
-		`CREATE TABLE sites (
-			id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, platform TEXT NOT NULL,
-			proxy_url TEXT, use_system_proxy INTEGER DEFAULT 0, custom_headers TEXT,
-			status TEXT DEFAULT 'active', global_weight REAL DEFAULT 1, forced_upstream_endpoint TEXT
-		)`,
-		`CREATE TABLE accounts (
-			id INTEGER PRIMARY KEY, site_id INTEGER NOT NULL, access_token TEXT NOT NULL,
-			api_token TEXT, extra_config TEXT, status TEXT DEFAULT 'active'
-		)`,
-		`CREATE TABLE account_tokens (
-			id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, token TEXT NOT NULL,
-			proxy_url TEXT, use_system_proxy INTEGER DEFAULT 0, enabled INTEGER DEFAULT 1
-		)`,
-		`CREATE TABLE token_routes (
-			id INTEGER PRIMARY KEY, model_pattern TEXT NOT NULL, model_mapping TEXT,
-			routing_strategy TEXT DEFAULT 'weighted', enabled INTEGER DEFAULT 1,
-			display_name TEXT, route_mode TEXT DEFAULT 'pattern'
-		)`,
-		`CREATE TABLE route_channels (
-			id INTEGER PRIMARY KEY, route_id INTEGER NOT NULL, account_id INTEGER NOT NULL,
-			token_id INTEGER, source_model TEXT, priority INTEGER DEFAULT 0,
-			weight INTEGER DEFAULT 10, enabled INTEGER DEFAULT 1
-		)`,
-		`CREATE TABLE route_group_sources (id INTEGER PRIMARY KEY, group_route_id INTEGER NOT NULL, source_route_id INTEGER NOT NULL)`,
-	}
-	for _, statement := range statements {
+	for _, statement := range upstreamSchemaDDL {
 		if _, err := store.db.Exec(statement); err != nil {
 			t.Fatalf("execute test schema statement: %v", err)
 		}
@@ -599,35 +562,58 @@ func TestOpenSQLiteRejectsDirectoryAsDatabasePath(t *testing.T) {
 	}
 }
 
-func TestVerifyUpstreamSchemaAcceptsCompleteSchema(t *testing.T) {
+func TestEnsureUpstreamSchemaAcceptsCompleteSchema(t *testing.T) {
 	store := openTestStore(t)
 	createUpstreamTables(t, store)
-	if err := store.VerifyUpstreamSchema(context.Background()); err != nil {
-		t.Fatalf("VerifyUpstreamSchema() error = %v", err)
+	if err := store.VerifyIntegrity(context.Background()); err != nil {
+		t.Fatalf("VerifyIntegrity() error = %v", err)
+	}
+	if err := store.EnsureUpstreamSchema(context.Background()); err != nil {
+		t.Fatalf("EnsureUpstreamSchema() error = %v", err)
 	}
 }
 
-// A wrong or freshly created database without the upstream tables used to fail
-// deep inside configuration loading with opaque "no such table" SQL errors; the
-// schema check must name the missing tables, the ones it did find, and the fix.
-func TestVerifyUpstreamSchemaNamesMissingTablesAndFix(t *testing.T) {
+// A first-time deployment starts against a database the gateway created empty,
+// so the full upstream schema must be created instead of failing configuration
+// loading with opaque "no such table" SQL errors.
+func TestEnsureUpstreamSchemaCreatesMissingTablesOnFreshDatabase(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 	if err := store.EnsureBreakerSchema(ctx); err != nil {
 		t.Fatalf("EnsureBreakerSchema() error = %v", err)
 	}
 
-	err := store.VerifyUpstreamSchema(ctx)
+	if err := store.EnsureUpstreamSchema(ctx); err != nil {
+		t.Fatalf("EnsureUpstreamSchema() error = %v", err)
+	}
+	for _, table := range requiredUpstreamTables {
+		var name string
+		err := store.db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
+		if err != nil {
+			t.Fatalf("table %s was not created: %v", table, err)
+		}
+	}
+}
+
+// A database that carries part of the schema is a wrong or truncated file, not
+// a fresh deployment; it must be rejected with the tables it has and lacks.
+func TestEnsureUpstreamSchemaRejectsPartialSchema(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	if err := store.EnsureBreakerSchema(ctx); err != nil {
+		t.Fatalf("EnsureBreakerSchema() error = %v", err)
+	}
+	if _, err := store.db.Exec(`CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatalf("create partial schema: %v", err)
+	}
+
+	err := store.EnsureUpstreamSchema(ctx)
 	if err == nil {
-		t.Fatal("VerifyUpstreamSchema() accepted a database without the upstream tables")
+		t.Fatal("EnsureUpstreamSchema() accepted a partially populated schema")
 	}
-	if !strings.Contains(err.Error(), "settings") || !strings.Contains(err.Error(), "route_channels") {
-		t.Fatalf("error = %v, want the missing upstream tables named", err)
-	}
-	if !strings.Contains(err.Error(), "gateway_breaker_states") {
-		t.Fatalf("error = %v, want the existing tables listed", err)
-	}
-	if !strings.Contains(err.Error(), "hub.db") {
-		t.Fatalf("error = %v, want the database placement fix", err)
+	for _, fragment := range []string{"sites", "token_routes", "settings", "gateway_breaker_states", "hub.db"} {
+		if !strings.Contains(err.Error(), fragment) {
+			t.Fatalf("error %q does not mention %q", err, fragment)
+		}
 	}
 }
