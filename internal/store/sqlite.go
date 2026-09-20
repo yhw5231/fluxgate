@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -169,6 +170,63 @@ func (s *SQLiteStore) VerifyIntegrity(ctx context.Context) error {
 		return fmt.Errorf("SQLite database failed its integrity check: %s", result)
 	}
 	return nil
+}
+
+// requiredUpstreamTables lists the configuration tables the gateway reads at
+// startup. gateway_breaker_states is excluded because the gateway owns and
+// creates that one itself.
+var requiredUpstreamTables = []string{
+	"settings",
+	"proxy_profiles",
+	"downstream_api_keys",
+	"sites",
+	"accounts",
+	"account_tokens",
+	"token_routes",
+	"route_channels",
+	"route_group_sources",
+}
+
+// VerifyUpstreamSchema rejects a configuration database that does not carry the
+// upstream schema. Without this check the gateway would surface the missing
+// tables one query at a time as opaque "no such table" SQL errors; here the
+// absent tables and the tables that do exist are named, so a wrong or empty
+// file placed at the configured path is reported with its fix at startup.
+func (s *SQLiteStore) VerifyUpstreamSchema(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table'`)
+	if err != nil {
+		return fmt.Errorf("list configuration database tables: %w", err)
+	}
+	defer rows.Close()
+	found := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return fmt.Errorf("scan configuration database table name: %w", err)
+		}
+		found[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("list configuration database tables: %w", err)
+	}
+
+	missing := make([]string, 0, len(requiredUpstreamTables))
+	for _, table := range requiredUpstreamTables {
+		if !found[table] {
+			missing = append(missing, table)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	present := make([]string, 0, len(found))
+	for name := range found {
+		present = append(present, name)
+	}
+	sort.Strings(present)
+	return fmt.Errorf(
+		"the configuration database is missing the upstream tables %s but contains %s; place the management server's SQLite database (hub.db) at the configured FLUXGATE_DATABASE_PATH",
+		strings.Join(missing, ", "), strings.Join(present, ", "))
 }
 
 func (s *SQLiteStore) EnsureBreakerSchema(ctx context.Context) error {

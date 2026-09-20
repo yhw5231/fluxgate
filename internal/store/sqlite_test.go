@@ -468,12 +468,10 @@ func TestCleanupBreakerStatesRemovesOnlyInactiveExpiredRows(t *testing.T) {
 	}
 }
 
-// The upstream schema leaves api_token, extra_config and custom_headers NULL in
-// normal rows, so every nullable column must be scanned through sql.NullString.
-func TestLoadRoutesToleratesNullableAccountAndSiteColumns(t *testing.T) {
-	store := openTestStore(t)
-	ctx := context.Background()
-
+// createUpstreamTables builds the empty upstream configuration schema the
+// gateway expects to find in the shared database.
+func createUpstreamTables(t *testing.T, store *SQLiteStore) {
+	t.Helper()
 	statements := []string{
 		`CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)`,
 		`CREATE TABLE proxy_profiles (
@@ -510,6 +508,22 @@ func TestLoadRoutesToleratesNullableAccountAndSiteColumns(t *testing.T) {
 			weight INTEGER DEFAULT 10, enabled INTEGER DEFAULT 1
 		)`,
 		`CREATE TABLE route_group_sources (id INTEGER PRIMARY KEY, group_route_id INTEGER NOT NULL, source_route_id INTEGER NOT NULL)`,
+	}
+	for _, statement := range statements {
+		if _, err := store.db.Exec(statement); err != nil {
+			t.Fatalf("execute test schema statement: %v", err)
+		}
+	}
+}
+
+// The upstream schema leaves api_token, extra_config and custom_headers NULL in
+// normal rows, so every nullable column must be scanned through sql.NullString.
+func TestLoadRoutesToleratesNullableAccountAndSiteColumns(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	createUpstreamTables(t, store)
+	statements := []string{
 		`INSERT INTO sites (id, name, url, platform) VALUES (1, 'site', 'https://example.test/v1', 'openai')`,
 		// api_token and extra_config deliberately NULL.
 		`INSERT INTO accounts (id, site_id, access_token) VALUES (1, 1, 'account-access')`,
@@ -582,5 +596,38 @@ func TestOpenSQLiteRejectsDirectoryAsDatabasePath(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "is a directory") {
 		t.Fatalf("error = %v, want the is-a-directory diagnosis", err)
+	}
+}
+
+func TestVerifyUpstreamSchemaAcceptsCompleteSchema(t *testing.T) {
+	store := openTestStore(t)
+	createUpstreamTables(t, store)
+	if err := store.VerifyUpstreamSchema(context.Background()); err != nil {
+		t.Fatalf("VerifyUpstreamSchema() error = %v", err)
+	}
+}
+
+// A wrong or freshly created database without the upstream tables used to fail
+// deep inside configuration loading with opaque "no such table" SQL errors; the
+// schema check must name the missing tables, the ones it did find, and the fix.
+func TestVerifyUpstreamSchemaNamesMissingTablesAndFix(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	if err := store.EnsureBreakerSchema(ctx); err != nil {
+		t.Fatalf("EnsureBreakerSchema() error = %v", err)
+	}
+
+	err := store.VerifyUpstreamSchema(ctx)
+	if err == nil {
+		t.Fatal("VerifyUpstreamSchema() accepted a database without the upstream tables")
+	}
+	if !strings.Contains(err.Error(), "settings") || !strings.Contains(err.Error(), "route_channels") {
+		t.Fatalf("error = %v, want the missing upstream tables named", err)
+	}
+	if !strings.Contains(err.Error(), "gateway_breaker_states") {
+		t.Fatalf("error = %v, want the existing tables listed", err)
+	}
+	if !strings.Contains(err.Error(), "hub.db") {
+		t.Fatalf("error = %v, want the database placement fix", err)
 	}
 }
