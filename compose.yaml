@@ -1,55 +1,101 @@
+# Fluxgate 网关部署配置（Docker Compose v2）
+#
+# 使用方式：
+#   cp .env.example .env   # 复制环境变量模板并按需修改（必填 FLUXGATE_MANAGEMENT_TOKEN）
+#   docker compose up -d --build
+#
+# 注意：网关容器以非 root 用户（UID/GID 10001）运行，宿主机数据目录必须允许该
+# 用户读写（SQLite 需要在目录中创建 hub.db、hub.db-wal、hub.db-shm 等文件），
+# 否则启动时会报错：
+#   ping SQLite database: unable to open database file: out of memory (14)
+# 修复方法（在宿主机数据目录上执行）：
+#   sudo chown -R 10001:10001 ./data
 services:
   gateway:
     build:
+      # 以当前目录的 Dockerfile 构建镜像（多阶段构建，纯 Go，无需 CGO）
       context: .
       dockerfile: Dockerfile
+    # 本地构建的镜像标签
     image: fluxgate:local
     container_name: fluxgate
+    # 容器异常退出后自动重启（手动 docker stop 除外）
     restart: unless-stopped
     ports:
+      # 宿主机端口:容器端口；宿主机端口可在 .env 中通过 FLUXGATE_HOST_PORT 修改
       - "${FLUXGATE_HOST_PORT:-8081}:8081"
     environment:
+      # 网关 HTTP 监听地址（容器内固定 8081，对外端口见上方 ports 映射）
       FLUXGATE_ADDRESS: ":8081"
+      # 容器内 SQLite 数据库文件路径（对应下方挂载到 /data 的宿主机目录）
       FLUXGATE_DATABASE_PATH: "/data/hub.db"
+      # 管理端点/控制台的访问令牌，必填；为空时管理接口返回 503
       FLUXGATE_MANAGEMENT_TOKEN: "${FLUXGATE_MANAGEMENT_TOKEN:-}"
+      # 启动时对共享 SQLite 数据库做完整性检查，发现损坏即拒绝启动（默认开启）
       FLUXGATE_INTEGRITY_CHECK: "${FLUXGATE_INTEGRITY_CHECK:-true}"
+      # 请求体大小上限（字节），默认 8 MiB
       FLUXGATE_MAX_BODY_BYTES: "${FLUXGATE_MAX_BODY_BYTES:-8388608}"
+      # 上游请求超时
       FLUXGATE_REQUEST_TIMEOUT: "${FLUXGATE_REQUEST_TIMEOUT:-60s}"
+      # TCP 连接建立超时
       FLUXGATE_CONNECT_TIMEOUT: "${FLUXGATE_CONNECT_TIMEOUT:-10s}"
+      # TLS 握手超时
       FLUXGATE_TLS_HANDSHAKE_TIMEOUT: "${FLUXGATE_TLS_HANDSHAKE_TIMEOUT:-10s}"
+      # 等待上游响应头的超时
       FLUXGATE_RESPONSE_HEADER_TIMEOUT: "${FLUXGATE_RESPONSE_HEADER_TIMEOUT:-30s}"
+      # 空闲连接在连接池中的最长保留时间
       FLUXGATE_IDLE_CONN_TIMEOUT: "${FLUXGATE_IDLE_CONN_TIMEOUT:-90s}"
+      # 读取请求头的超时（防慢速攻击）
       FLUXGATE_READ_HEADER_TIMEOUT: "${FLUXGATE_READ_HEADER_TIMEOUT:-10s}"
+      # 整个请求（含 body）的读取超时
       FLUXGATE_READ_TIMEOUT: "${FLUXGATE_READ_TIMEOUT:-30s}"
+      # 响应写超时；保持 0s 以兼容长连接的流式（SSE）响应
       FLUXGATE_WRITE_TIMEOUT: "${FLUXGATE_WRITE_TIMEOUT:-0s}"
+      # HTTP 空闲连接（keep-alive）超时
       FLUXGATE_IDLE_TIMEOUT: "${FLUXGATE_IDLE_TIMEOUT:-120s}"
+      # 收到退出信号后等待存量请求完成的优雅关停时间
       FLUXGATE_SHUTDOWN_TIMEOUT: "${FLUXGATE_SHUTDOWN_TIMEOUT:-15s}"
+      # 单次请求的最大重试总次数
       FLUXGATE_MAX_ATTEMPTS: "${FLUXGATE_MAX_ATTEMPTS:-8}"
+      # 同一渠道在一次请求中最多尝试的次数
       FLUXGATE_MAX_ATTEMPTS_PER_CHANNEL: "${FLUXGATE_MAX_ATTEMPTS_PER_CHANNEL:-2}"
+      # 重试退避：初始间隔与上限（指数退避）
       FLUXGATE_RETRY_BASE_BACKOFF: "${FLUXGATE_RETRY_BASE_BACKOFF:-50ms}"
       FLUXGATE_RETRY_MAX_BACKOFF: "${FLUXGATE_RETRY_MAX_BACKOFF:-1s}"
+      # 熔断器模式：cooldown（冷却）/ disable（禁用）/
+      # key_cooldown（按密钥冷却）/ key_model_cooldown（按密钥+模型冷却）
       FLUXGATE_BREAKER_MODE: "${FLUXGATE_BREAKER_MODE:-cooldown}"
+      # 连续失败多少次触发熔断
       FLUXGATE_BREAKER_THRESHOLD: "${FLUXGATE_BREAKER_THRESHOLD:-3}"
+      # 熔断基础冷却时长与上限（按失败次数指数递增）
       FLUXGATE_BREAKER_BASE_COOLDOWN: "${FLUXGATE_BREAKER_BASE_COOLDOWN:-30s}"
       FLUXGATE_BREAKER_MAX_COOLDOWN: "${FLUXGATE_BREAKER_MAX_COOLDOWN:-15m}"
+      # 出站代理（供部分上游站点需要走代理的场景）；NO_PROXY 排除本机地址
       HTTP_PROXY: "${HTTP_PROXY:-}"
       HTTPS_PROXY: "${HTTPS_PROXY:-}"
       NO_PROXY: "${NO_PROXY:-127.0.0.1,localhost}"
     volumes:
+      # 将宿主机数据目录挂载到容器 /data，持久化 SQLite 数据库；
+      # 宿主机目录由 .env 中 FLUXGATE_DATA_DIR 指定（默认 ./data），
+      # 必须保证 UID 10001 可读写（见文件头说明）
       - type: bind
         source: "${FLUXGATE_DATA_DIR:-./data}"
         target: /data
+    # 健康检查：通过 /healthz 探测，连续 3 次失败判定为不健康
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8081/healthz"]
       interval: 30s
       timeout: 5s
       start_period: 10s
       retries: 3
+    # 安全加固：禁止提权、丢弃全部 Linux capabilities
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # 根文件系统只读，临时文件走内存盘 /tmp，降低被入侵后的影响面
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
+    # 停止容器前等待 20 秒给优雅关停留出时间（略大于 SHUTDOWN_TIMEOUT）
     stop_grace_period: 20s

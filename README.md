@@ -49,7 +49,30 @@ The default address is `:8081`, and the default database path is `../data/hub.db
 
 ## Container deployment
 
-The repository includes a multi-stage `Dockerfile`, a hardened `compose.yaml`, a `.dockerignore`, and an `.env.example` configuration template.
+The repository includes a multi-stage `Dockerfile`, a hardened `compose.yaml`, a `.dockerignore`, and an `.env.example` configuration template. The steps below cover the full path on a fresh machine: install the toolchain, clone the repository, place the database, configure the environment, then start and verify the service.
+
+### Prerequisites
+
+- Docker with the Compose v2 plugin — verify with `docker compose version`:
+  - Windows and macOS: install [Docker Desktop](https://docs.docker.com/desktop/).
+  - Linux: install [Docker Engine](https://docs.docker.com/engine/install/) together with the `docker-compose-plugin` package.
+- Git — verify with `git --version`.
+- The existing upstream SQLite database file (`hub.db`) from the current management server.
+
+### Get the code
+
+Clone the repository and enter the project directory (the clone creates a `fluxgate` folder):
+
+```bash
+git clone https://github.com/yhw5231/fluxgate.git
+cd fluxgate
+```
+
+Every command below runs from this directory. If you already have a checkout, update it instead:
+
+```bash
+git pull
+```
 
 ### Prepare the database
 
@@ -93,9 +116,9 @@ sudo chmod 640 data/hub.db
 > The gateway refuses to start on a damaged file unless
 > `FLUXGATE_INTEGRITY_CHECK=false` is set.
 
-### Deploy with Docker Compose
+### Configure the environment
 
-Copy the example configuration and replace the management token with a strong secret:
+Copy the example configuration:
 
 ```powershell
 Copy-Item .env.example .env
@@ -107,7 +130,17 @@ On Linux or macOS:
 cp .env.example .env
 ```
 
-Then build and start the service:
+Then edit `.env` and set `FLUXGATE_MANAGEMENT_TOKEN` to a strong random secret. Generate one with OpenSSL (available in Git Bash on Windows and on Linux):
+
+```bash
+openssl rand -hex 32
+```
+
+The token is required: management endpoints and the console answer `503 management_auth_not_configured` while it is empty. Adjust `FLUXGATE_HOST_PORT` (default `8081`) and `FLUXGATE_DATA_DIR` (default `./data`) only if the defaults do not fit.
+
+### Deploy with Docker Compose
+
+Build and start the service:
 
 ```bash
 docker compose up -d --build
@@ -139,6 +172,16 @@ docker compose down
 By default, Compose publishes host port `8081`, mounts `./data` at `/data`, and configures the gateway to use `/data/hub.db`. Override the host port or data location in `.env` with `FLUXGATE_HOST_PORT` and `FLUXGATE_DATA_DIR`.
 
 The Compose service runs with a read-only root filesystem, drops Linux capabilities, enables `no-new-privileges`, uses a temporary `/tmp`, persists the SQLite database through a bind mount, and includes an HTTP health check.
+
+### Upgrade an existing deployment
+
+Pull the latest code and rebuild the image in place. The SQLite database lives in the bind-mounted data directory, so it survives both steps:
+
+```bash
+git pull
+docker compose up -d --build
+docker compose ps
+```
 
 ### Deploy with Docker directly
 
