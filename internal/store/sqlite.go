@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -63,9 +64,17 @@ func sqliteDSN(path string) string {
 	return "file:" + filepath.ToSlash(path) + "?_pragma=busy_timeout(10000)"
 }
 
+// OpenSQLite opens the configuration database and verifies the connection is
+// usable. A missing parent directory is created so a first-time deployment only
+// needs the configured path. SQLite reports every "cannot open the file"
+// condition as the opaque "unable to open database file: out of memory (14)"
+// message, so a failed ping is re-diagnosed and reported with the real cause.
 func OpenSQLite(path string) (*SQLiteStore, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("SQLite database path is required")
+	}
+	if err := ensureSQLiteDirectory(path); err != nil {
+		return nil, err
 	}
 	db, err := sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
@@ -74,9 +83,70 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 	db.SetMaxOpenConns(1)
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("ping SQLite database: %w", err)
+		if diagnosis := diagnoseSQLiteOpenFailure(path); diagnosis != "" {
+			return nil, fmt.Errorf("ping SQLite database %s: %w: %s", path, err, diagnosis)
+		}
+		return nil, fmt.Errorf("ping SQLite database %s: %w", path, err)
 	}
 	return &SQLiteStore{db: db}, nil
+}
+
+// ensureSQLiteDirectory creates the database's parent directory so a fresh
+// deployment pointed at ../data/hub.db does not fail before SQLite is reached.
+func ensureSQLiteDirectory(path string) error {
+	dir := filepath.Dir(path)
+	if dir == "" || dir == "." {
+		return nil
+	}
+	info, err := os.Stat(dir)
+	if err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("SQLite database directory %s exists but is not a directory", dir)
+		}
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect SQLite database directory %s: %w", dir, err)
+	}
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return fmt.Errorf("create SQLite database directory %s: %w", dir, err)
+	}
+	return nil
+}
+
+// diagnoseSQLiteOpenFailure explains why SQLite could not open the database
+// file. The pure-Go driver reports missing directories, permission problems,
+// and path mix-ups all as "unable to open database file: out of memory (14)",
+// which hides the real cause, so the filesystem condition is probed here. An
+// empty result means the directory and file are accessible and the original
+// error should stand on its own.
+func diagnoseSQLiteOpenFailure(path string) string {
+	info, statErr := os.Stat(path)
+	if statErr == nil && info.IsDir() {
+		return fmt.Sprintf("%s is a directory, not a SQLite database file", path)
+	}
+	if statErr == nil {
+		file, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			return fmt.Sprintf("the database file %s exists but cannot be opened for reading and writing: %v", path, err)
+		}
+		_ = file.Close()
+		return ""
+	}
+	dir := filepath.Dir(path)
+	probe, err := os.CreateTemp(dir, ".fluxgate-write-check-*")
+	if err != nil {
+		diagnosis := fmt.Sprintf("the data directory %s is not writable by the current process", dir)
+		if uid := os.Getuid(); uid >= 0 {
+			diagnosis += fmt.Sprintf(" (uid=%d gid=%d)", uid, os.Getgid())
+		}
+		diagnosis += "; grant the process write access, e.g. chown 10001:10001 <data directory> for the default Docker image"
+		return diagnosis
+	}
+	name := probe.Name()
+	_ = probe.Close()
+	_ = os.Remove(name)
+	return ""
 }
 
 func (s *SQLiteStore) Close() error {

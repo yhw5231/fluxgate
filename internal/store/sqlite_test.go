@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -534,5 +536,51 @@ func TestLoadRoutesToleratesNullableAccountAndSiteColumns(t *testing.T) {
 	}
 	if !channel.Enabled {
 		t.Fatal("channel with NULL optional columns was treated as disabled")
+	}
+}
+
+// A fresh deployment points the gateway at ../data/hub.db without creating the
+// directory first, so OpenSQLite must create it instead of surfacing the opaque
+// SQLite "unable to open database file" error.
+func TestOpenSQLiteCreatesMissingParentDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing", "nested", "hub.db")
+	store, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("database file was not created: %v", err)
+	}
+}
+
+func TestOpenSQLiteRejectsParentDirectoryThatIsAFile(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("occupied"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	_, err := OpenSQLite(filepath.Join(blocker, "hub.db"))
+	if err == nil {
+		t.Fatal("OpenSQLite() succeeded with a file in place of the data directory")
+	}
+	if !strings.Contains(err.Error(), "is not a directory") {
+		t.Fatalf("error = %v, want the not-a-directory diagnosis", err)
+	}
+}
+
+// Docker bind mounts make a missing or root-owned host directory unwritable for
+// the container user, and SQLite reports that as "out of memory (14)". The
+// store must name the real cause instead.
+func TestOpenSQLiteRejectsDirectoryAsDatabasePath(t *testing.T) {
+	_, err := OpenSQLite(t.TempDir())
+	if err == nil {
+		t.Fatal("OpenSQLite() succeeded with a directory as the database path")
+	}
+	if !strings.Contains(err.Error(), "is a directory") {
+		t.Fatalf("error = %v, want the is-a-directory diagnosis", err)
 	}
 }
