@@ -41,6 +41,12 @@ func run(parent context.Context, logger *slog.Logger) error {
 	}
 	defer persistentStore.Close()
 
+	if cfg.IntegrityCheck {
+		if err := persistentStore.VerifyIntegrity(parent); err != nil {
+			return err
+		}
+	}
+
 	if err := persistentStore.EnsureBreakerSchema(parent); err != nil {
 		return err
 	}
@@ -76,7 +82,7 @@ func run(parent context.Context, logger *slog.Logger) error {
 
 	transportPool := proxy.NewTransportPool(baseTransport)
 	engine := &proxy.Engine{
-		Selector:      router.NewMemorySelectorWithFilter(configuration.Channels, circuitBreaker),
+		Selector:      router.NewMemorySelectorWithFilter(configuration.Routes, circuitBreaker),
 		Observer:      circuitBreaker,
 		Client:        &http.Client{Transport: baseTransport},
 		ProxyResolver: buildProxyResolver(configuration),
@@ -89,6 +95,7 @@ func run(parent context.Context, logger *slog.Logger) error {
 		Authenticator:       persistentStore,
 		ManagementToken:     cfg.ManagementToken,
 		Configuration:       configuration,
+		Routes:              configuration.Routes,
 		BreakerSnapshotter:  breakerStore,
 		Models:              configuration.Models,
 		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,

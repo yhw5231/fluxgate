@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"path"
 	"strings"
 
 	"github.com/yhw5231/fluxgate/internal/domain"
@@ -34,26 +33,6 @@ func ApplyHeaders(source http.Header, rules domain.TransformRules, apiKey string
 	}
 	result.Set("Content-Type", "application/json")
 	return result
-}
-
-// MapModel applies case-insensitive exact mappings before glob mappings.
-func MapModel(requested string, mappings map[string]string) string {
-	requested = strings.TrimSpace(requested)
-	for pattern, target := range mappings {
-		if strings.EqualFold(strings.TrimSpace(pattern), requested) && strings.TrimSpace(target) != "" {
-			return strings.TrimSpace(target)
-		}
-	}
-	for pattern, target := range mappings {
-		if strings.TrimSpace(target) == "" {
-			continue
-		}
-		matched, err := path.Match(strings.ToLower(strings.TrimSpace(pattern)), strings.ToLower(requested))
-		if err == nil && matched {
-			return strings.TrimSpace(target)
-		}
-	}
-	return requested
 }
 
 // ApplyJSON mutates a JSON object using JSON Pointer or dotted paths.

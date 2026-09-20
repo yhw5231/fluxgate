@@ -61,7 +61,11 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 	var lastFailure domain.Failure
 
 	for attemptNumber := 1; attemptNumber <= policy.MaxAttempts; attemptNumber++ {
-		selection, err := e.Selector.Select(input.Model, excluded)
+		selection, err := e.Selector.Select(domain.SelectionRequest{
+			Model:    input.Model,
+			Policy:   input.Policy,
+			Excluded: excluded,
+		})
 		if err != nil {
 			if lastFailure.Err != nil || lastFailure.StatusCode != 0 {
 				return Result{}, finalError(lastFailure)

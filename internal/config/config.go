@@ -33,6 +33,7 @@ const (
 	defaultBreakerThreshold      = 3
 	defaultBreakerBaseCooldown   = 30 * time.Second
 	defaultBreakerMaxCooldown    = 15 * time.Minute
+	defaultIntegrityCheck        = true
 )
 
 // Config contains process-level settings for the production gateway runtime.
@@ -53,6 +54,9 @@ type Config struct {
 	ShutdownTimeout       time.Duration
 	Retry                 domain.RetryPolicy
 	Breaker               breaker.Policy
+	// IntegrityCheck verifies the shared SQLite database at startup so a
+	// damaged file fails loudly instead of serving wrong routing data.
+	IntegrityCheck bool
 }
 
 // Load reads gateway settings from environment variables and applies bounded,
@@ -124,6 +128,9 @@ func Load() (Config, error) {
 	if cfg.Breaker.Threshold, err = intEnv("FLUXGATE_BREAKER_THRESHOLD", cfg.Breaker.Threshold, true); err != nil {
 		return Config{}, err
 	}
+	if cfg.IntegrityCheck, err = boolEnv("FLUXGATE_INTEGRITY_CHECK", cfg.IntegrityCheck); err != nil {
+		return Config{}, err
+	}
 
 	if value := strings.TrimSpace(os.Getenv("FLUXGATE_BREAKER_MODE")); value != "" {
 		cfg.Breaker.Mode = breaker.Mode(value)
@@ -186,7 +193,20 @@ func Default() Config {
 			BaseCooldown: defaultBreakerBaseCooldown,
 			MaxCooldown:  defaultBreakerMaxCooldown,
 		},
+		IntegrityCheck: defaultIntegrityCheck,
 	}
+}
+
+func boolEnv(name string, fallback bool) (bool, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean", name)
+	}
+	return parsed, nil
 }
 
 func durationEnv(name string, fallback time.Duration, positive bool) (time.Duration, error) {

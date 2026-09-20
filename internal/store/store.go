@@ -23,6 +23,7 @@ type Store interface {
 // Configuration is an immutable snapshot loaded from the existing SQLite
 // tables. The Go gateway does not migrate or mutate these application tables.
 type Configuration struct {
+	Routes         []domain.Route
 	Channels       []domain.Channel
 	Models         []string
 	DownstreamKeys []DownstreamAPIKey
@@ -47,15 +48,20 @@ type DownstreamAPIKey struct {
 	AllowedRouteIDs     []int64
 	ExcludedSiteIDs     []int64
 	SiteMultipliers     map[int64]float64
-	ExcludedCredentials []ExcludedCredential
+	ExcludedCredentials []domain.ExcludedCredential
 }
 
-// ExcludedCredential identifies an upstream credential excluded for a
-// downstream key without retaining another secret value.
-type ExcludedCredential struct {
-	AccountID *int64 `json:"accountId,omitempty"`
-	TokenID   *int64 `json:"tokenId,omitempty"`
-	Reference string `json:"reference,omitempty"`
+// Policy converts the stored columns into the routing policy used for
+// selection. supported_models is an exclusion list, so its entries become deny
+// patterns.
+func (k DownstreamAPIKey) Policy() domain.RoutingPolicy {
+	return domain.RoutingPolicy{
+		DeniedModelPatterns: k.SupportedModels,
+		AllowedRouteIDs:     k.AllowedRouteIDs,
+		ExcludedSiteIDs:     k.ExcludedSiteIDs,
+		SiteMultipliers:     k.SiteMultipliers,
+		ExcludedCredentials: k.ExcludedCredentials,
+	}
 }
 
 // ProxyProfile represents one configured proxy endpoint.

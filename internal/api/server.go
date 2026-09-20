@@ -19,6 +19,7 @@ import (
 	"github.com/yhw5231/fluxgate/internal/console"
 	"github.com/yhw5231/fluxgate/internal/domain"
 	"github.com/yhw5231/fluxgate/internal/proxy"
+	"github.com/yhw5231/fluxgate/internal/router"
 	"github.com/yhw5231/fluxgate/internal/store"
 )
 
@@ -38,6 +39,7 @@ type Server struct {
 	Authenticator       Authenticator
 	ManagementToken     string
 	Configuration       store.Configuration
+	Routes              []domain.Route
 	BreakerSnapshotter  BreakerSnapshotter
 	Models              []string
 	MaxRequestBodyBytes int64
@@ -141,10 +143,10 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 	}
 
 	channels := make([]channelSnapshot, 0, len(s.Configuration.Channels))
-	for _, channel := range s.Configuration.Channels {
-		mappings := make([]modelMappingSnapshot, 0, len(channel.ModelMapping))
-		for pattern, target := range channel.ModelMapping {
-			mappings = append(mappings, modelMappingSnapshot{Pattern: pattern, Target: target})
+	for _, route := range s.Configuration.Routes {
+		mappings := make([]modelMappingSnapshot, 0, len(route.ModelMapping))
+		for _, entry := range route.ModelMapping {
+			mappings = append(mappings, modelMappingSnapshot{Pattern: entry.Pattern, Target: entry.Target})
 		}
 		sort.Slice(mappings, func(i, j int) bool {
 			if mappings[i].Pattern == mappings[j].Pattern {
@@ -153,29 +155,33 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 			return mappings[i].Pattern < mappings[j].Pattern
 		})
 
-		proxySource := "direct"
-		switch {
-		case channel.ProxyURL != "":
-			proxySource = "key"
-		case channel.UseSystemProxy:
-			proxySource = "system"
-		case channel.SiteProxyURL != "":
-			proxySource = "site"
-		case channel.SiteUseSystemProxy:
-			proxySource = "system"
+		for _, channel := range route.Channels {
+			proxySource := "direct"
+			switch {
+			case channel.ProxyURL != "":
+				proxySource = "key"
+			case channel.UseSystemProxy:
+				proxySource = "system"
+			case channel.SiteProxyURL != "":
+				proxySource = "site"
+			case channel.SiteUseSystemProxy:
+				proxySource = "system"
+			}
+			channels = append(channels, channelSnapshot{
+				ID:              channel.ID,
+				Name:            channel.Name,
+				Enabled:         channel.Enabled,
+				Priority:        channel.Priority,
+				Weight:          channel.Weight,
+				RoutingStrategy: channel.RoutingStrategy,
+				BreakerMode:     channel.BreakerMode,
+				ProxySource:     proxySource,
+				ModelMappings:   mappings,
+			})
 		}
-		channels = append(channels, channelSnapshot{
-			ID:              channel.ID,
-			Name:            channel.Name,
-			Enabled:         channel.Enabled,
-			Priority:        channel.Priority,
-			Weight:          channel.Weight,
-			RoutingStrategy: channel.RoutingStrategy,
-			BreakerMode:     channel.BreakerMode,
-			ProxySource:     proxySource,
-			ModelMappings:   mappings,
-		})
 	}
+	// Channels are rendered per route so the panel can show each channel
+	// together with the model mappings that apply to it.
 	sort.Slice(channels, func(i, j int) bool {
 		if channels[i].Priority != channels[j].Priority {
 			return channels[i].Priority > channels[j].Priority
@@ -236,16 +242,14 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	allowed := make(map[string]struct{}, len(key.SupportedModels))
-	for _, model := range key.SupportedModels {
-		allowed[model] = struct{}{}
-	}
+	policy := key.Policy()
 	data := make([]map[string]any, 0, len(s.Models))
 	for _, model := range s.Models {
-		if len(allowed) != 0 {
-			if _, permitted := allowed[model]; !permitted {
-				continue
-			}
+		if !domain.AllowsModel(s.Routes, policy, model) {
+			continue
+		}
+		if !s.hasRoutableChannel(model, policy) {
+			continue
 		}
 		data = append(data, map[string]any{
 			"id":       model,
@@ -255,6 +259,15 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
+// hasRoutableChannel reports whether a channel could serve the model, so the
+// listing never advertises a model that would immediately fail.
+func (s *Server) hasRoutableChannel(model string, policy domain.RoutingPolicy) bool {
+	if s.Engine == nil || s.Engine.Selector == nil {
+		return true
+	}
+	return s.Engine.Selector.HasCandidate(model, policy)
 }
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
@@ -294,7 +307,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_model", "request model is required")
 		return
 	}
-	if !modelAllowed(key.SupportedModels, envelope.Model) {
+	policy := key.Policy()
+	if !domain.AllowsModel(s.Routes, policy, envelope.Model) {
 		writeError(w, http.StatusForbidden, "model_not_allowed", "requested model is not allowed for this API key")
 		return
 	}
@@ -305,8 +319,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		Headers: sanitizedHeaders(r.Header),
 		Body:    body,
 		Model:   envelope.Model,
+		Policy:  policy,
 	})
 	if err != nil {
+		// A model with no usable route or channel is an availability problem,
+		// not a bad gateway: no upstream request was attempted.
+		if errors.Is(err, router.ErrNoChannel) || errors.Is(err, router.ErrModelNotRoutable) {
+			writeError(w, http.StatusServiceUnavailable, "no_available_channel", "no upstream channel can serve the requested model")
+			return
+		}
 		writeError(w, http.StatusBadGateway, "upstream_unavailable", "upstream request failed")
 		return
 	}
@@ -361,18 +382,6 @@ func sanitizedHeaders(source http.Header) http.Header {
 	result.Del("X-API-Key")
 	result.Del("Api-Key")
 	return result
-}
-
-func modelAllowed(allowed []string, requested string) bool {
-	if len(allowed) == 0 {
-		return true
-	}
-	for _, model := range allowed {
-		if model == requested {
-			return true
-		}
-	}
-	return false
 }
 
 func streamResponse(w http.ResponseWriter, source io.Reader) {

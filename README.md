@@ -75,6 +75,24 @@ sudo chmod 750 data
 sudo chmod 640 data/hub.db
 ```
 
+> **Keep the gateway the only writer of this file.** SQLite requires all
+> processes that write one database to share the same host and locking
+> primitives. A bind mount on Docker Desktop reaches the file through a VM file
+> share, and two processes writing through it can corrupt the database: the
+> symptom is an `integrity_check` failure such as a missing index entry or a
+> duplicated primary key. Verified combinations:
+>
+> | Writer(s) | Result |
+> | --- | --- |
+> | Gateway only | clean, across restarts |
+> | Host process only | clean |
+> | Gateway **and** a host process at the same time | corrupt within a few rounds |
+>
+> Run the gateway against its own database copy, or run every writer on one side
+> of the boundary, when another application also updates the same SQLite file.
+> The gateway refuses to start on a damaged file unless
+> `FLUXGATE_INTEGRITY_CHECK=false` is set.
+
 ### Deploy with Docker Compose
 
 Copy the example configuration and replace the management token with a strong secret:
@@ -227,6 +245,16 @@ Authenticated endpoints expect an enabled, unexpired downstream API key:
 Authorization: Bearer YOUR_DOWNSTREAM_API_KEY
 ```
 
+Proxy errors use the OpenAI error envelope with a `code` field:
+
+- `401 invalid_api_key`: missing, unknown, expired, or exhausted key.
+- `403 model_not_allowed`: the key's `supported_models` denies the model.
+- `400 missing_model`, `400 invalid_json`, `413 request_too_large`.
+- `503 no_available_channel`: no enabled route matches the model, or no channel
+  can serve it. No upstream request is attempted.
+- `502 upstream_unavailable`: every attempt against the selected channels
+  failed. The response carries the last upstream status.
+
 Example model request:
 
 ```powershell
@@ -253,6 +281,67 @@ Invoke-RestMethod `
   -Body $body
 ```
 
+## Model routing
+
+A request is served only by channels belonging to a route that actually covers
+the requested model. Routes and patterns are read from `token_routes`.
+
+Route resolution order, highest precedence first:
+
+1. An `explicit_group` route matched by its `display_name`.
+2. A route whose `model_pattern` is an exact model name.
+3. A non-group route matched by its `display_name`.
+4. A non-group route matched by a glob or `re:` pattern.
+
+Patterns are case-insensitive. A glob supports `*` (any run, including empty)
+and `?` (exactly one character); every other character is literal. A pattern
+starting with `re:` is a regular expression. When no route matches, the request
+is answered with `503` and the error code `no_available_channel`; no upstream is
+contacted. The same applies when a route matches but every channel is blocked,
+excluded, or in cooldown.
+
+Candidate channels are then filtered by:
+
+- `route_channels.source_model`: when set, the channel only serves models that
+  equal it, are alias-equivalent (a `vendor/` prefix and a trailing `-free` are
+  ignored), or match it as a pattern. A channel on an exact-pattern route
+  inherits that pattern as its source model when the column is empty.
+- The downstream key exclusions described below.
+- The circuit breaker and channels already tried by the retry loop.
+
+The model written into the upstream request body is resolved in this order:
+
+1. If the request named the route's `display_name` and the channel has a
+   `source_model`, that source model is used.
+2. Otherwise, if `model_mapping` did not rewrite the name and the route pattern
+   is an exact match, the channel `source_model` is used, falling back to the
+   route pattern.
+3. Otherwise the mapped model is used, defaulting to the requested name.
+
+`model_mapping` entries are evaluated in declaration order: an exact key first,
+then the first matching pattern. Order is preserved rather than relying on map
+iteration, so overlapping patterns resolve deterministically.
+
+### Downstream key restrictions
+
+- `supported_models` is an **exclusion** list. A requested model matching any
+  entry (exact, glob, or `re:`) is rejected with `403` and hidden from
+  `GET /v1/models`. An empty or absent value excludes nothing.
+- `allowed_route_ids` limits the key to the listed routes, which are addressed
+  by their public name (`display_name` when set, otherwise `model_pattern`). A
+  route with an exact `model_pattern` stays visible regardless of this list.
+- `excluded_site_ids` removes every channel on those sites.
+- `excluded_credential_refs` removes the channel identified by an
+  `{"kind":"account_token","siteId":…,"accountId":…,"tokenId":…}` entry; all
+  three identifiers must match, and a channel without a token is never matched.
+  Malformed entries are ignored.
+- `site_weight_multipliers` scales the selection weight of the named sites.
+  Weight is `route_channels.weight × sites.global_weight × multiplier`, with a
+  multiplier of `1` when a site has no entry.
+
+`GET /v1/models` lists the public model names of enabled routes, minus denied
+models and minus models with no channel the key may use.
+
 ## Configuration
 
 ### Core settings
@@ -260,6 +349,7 @@ Invoke-RestMethod `
 - `FLUXGATE_ADDRESS`: HTTP listen address. Default: `:8081`.
 - `FLUXGATE_DATABASE_PATH`: Existing upstream SQLite database path. Default: `../data/hub.db`.
 - `FLUXGATE_MAX_BODY_BYTES`: Maximum accepted JSON request body size. Default: 8 MiB.
+- `FLUXGATE_INTEGRITY_CHECK`: Run `PRAGMA quick_check` against the configuration database at startup and refuse to start when it fails. Default: `true`. Disable it only if start-up time on a very large database matters more than detecting a damaged file.
 
 ### Retry settings
 

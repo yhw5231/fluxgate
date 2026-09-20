@@ -24,6 +24,18 @@ type fakeAuthenticator struct {
 	seen           string
 }
 
+// testRoutes wraps channels in a single catch-all route so tests can focus on
+// transport behavior rather than route resolution.
+func testRoutes(channels ...domain.Channel) []domain.Route {
+	return []domain.Route{{
+		ID:           1,
+		ModelPattern: "*",
+		Mode:         domain.RouteModePattern,
+		Enabled:      true,
+		Channels:     channels,
+	}}
+}
+
 func (a *fakeAuthenticator) AuthenticateDownstreamKey(_ context.Context, credential string, _ time.Time) (store.DownstreamAPIKey, error) {
 	a.seen = credential
 	if a.err != nil || credential != a.wantCredential {
@@ -82,10 +94,12 @@ func TestAuthenticationFailureDoesNotExposeCredential(t *testing.T) {
 	}
 }
 
-func TestModelsFiltersByAuthenticatedKey(t *testing.T) {
+// supported_models is an exclusion list: a listed model is hidden, everything
+// else stays visible.
+func TestModelsHidesDeniedModelsForAuthenticatedKey(t *testing.T) {
 	authenticator := &fakeAuthenticator{
 		wantCredential: "secret",
-		key:            store.DownstreamAPIKey{SupportedModels: []string{"gpt-4.1"}},
+		key:            store.DownstreamAPIKey{SupportedModels: []string{"claude-sonnet"}},
 	}
 	server := &Server{
 		Authenticator: authenticator,
@@ -102,10 +116,97 @@ func TestModelsFiltersByAuthenticatedKey(t *testing.T) {
 	}
 	body := response.Body.String()
 	if !strings.Contains(body, `"id":"gpt-4.1"`) {
-		t.Fatalf("body = %s, want permitted model", body)
+		t.Fatalf("body = %s, want the model that is not excluded", body)
 	}
 	if strings.Contains(body, "claude-sonnet") {
-		t.Fatalf("body = %s, contained forbidden model", body)
+		t.Fatalf("body = %s, contained an excluded model", body)
+	}
+}
+
+func TestModelsOmitModelsWithoutAnyChannel(t *testing.T) {
+	authenticator := &fakeAuthenticator{wantCredential: "secret"}
+	server := &Server{
+		Authenticator: authenticator,
+		Models:        []string{"served-model", "orphan-model"},
+		Engine: &proxy.Engine{Selector: router.NewMemorySelector([]domain.Route{{
+			ID:           1,
+			ModelPattern: "served-model",
+			Mode:         domain.RouteModePattern,
+			Enabled:      true,
+			Channels:     []domain.Channel{{ID: "channel", Enabled: true, Weight: 1}},
+		}})},
+	}
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request.Header.Set("Authorization", "Bearer secret")
+	response := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(response, request)
+
+	body := response.Body.String()
+	if !strings.Contains(body, "served-model") {
+		t.Fatalf("body = %s, want the routable model", body)
+	}
+	if strings.Contains(body, "orphan-model") {
+		t.Fatalf("body = %s, listed a model with no channel", body)
+	}
+}
+
+// A model with no usable route or channel never reaches an upstream, so it is
+// an availability failure rather than a bad gateway.
+func TestProxyReturnsServiceUnavailableWhenNothingCanServeTheModel(t *testing.T) {
+	engine := &proxy.Engine{
+		Selector: router.NewMemorySelector([]domain.Route{{
+			ID:           1,
+			ModelPattern: "known-model",
+			Mode:         domain.RouteModePattern,
+			Enabled:      true,
+			Channels:     []domain.Channel{{ID: "channel", Enabled: true, Weight: 1}},
+		}}),
+		Policy: domain.RetryPolicy{MaxAttempts: 1, MaxAttemptsPerChannel: 1},
+	}
+	server := &Server{Engine: engine, Authenticator: allowTestAuthentication()}
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"unknown-model"}`))
+	request.Header.Set("Authorization", "Bearer test-key")
+	response := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body = %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"code":"no_available_channel"`) {
+		t.Fatalf("body = %s, want no_available_channel", response.Body.String())
+	}
+}
+
+func TestProxyRejectsDeniedModelWithForbidden(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("upstream was contacted for a denied model")
+	}))
+	defer upstream.Close()
+
+	engine := &proxy.Engine{
+		Selector: router.NewMemorySelector(testRoutes(domain.Channel{
+			ID: "channel", BaseURL: upstream.URL, Enabled: true, Weight: 1,
+		})),
+		Policy: domain.RetryPolicy{MaxAttempts: 1, MaxAttemptsPerChannel: 1},
+	}
+	authenticator := &fakeAuthenticator{
+		wantCredential: "secret",
+		key:            store.DownstreamAPIKey{SupportedModels: []string{"blocked-*"}},
+	}
+	server := &Server{Engine: engine, Authenticator: authenticator}
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"blocked-model"}`))
+	request.Header.Set("Authorization", "Bearer secret")
+	response := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body = %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"code":"model_not_allowed"`) {
+		t.Fatalf("body = %s, want model_not_allowed", response.Body.String())
 	}
 }
 
@@ -158,9 +259,9 @@ func TestProxyRemovesDownstreamCredentialsBeforeForwarding(t *testing.T) {
 
 	authenticator := &fakeAuthenticator{wantCredential: "downstream-secret"}
 	engine := &proxy.Engine{
-		Selector: router.NewMemorySelector([]domain.Channel{{
+		Selector: router.NewMemorySelector(testRoutes(domain.Channel{
 			ID: "channel", BaseURL: upstream.URL, APIKey: "upstream-secret", Enabled: true, Weight: 1,
-		}}),
+		})),
 		Policy: domain.RetryPolicy{MaxAttempts: 1, MaxAttemptsPerChannel: 1},
 	}
 	server := &Server{Engine: engine, Authenticator: authenticator}
@@ -188,7 +289,7 @@ func TestSSEIsFlushedIncrementally(t *testing.T) {
 	defer upstream.Close()
 
 	engine := &proxy.Engine{
-		Selector: router.NewMemorySelector([]domain.Channel{{ID: "stream", BaseURL: upstream.URL, Enabled: true, Weight: 1}}),
+		Selector: router.NewMemorySelector(testRoutes(domain.Channel{ID: "stream", BaseURL: upstream.URL, Enabled: true, Weight: 1})),
 		Policy:   domain.RetryPolicy{MaxAttempts: 1, MaxAttemptsPerChannel: 1},
 	}
 	server := &Server{Engine: engine, Authenticator: allowTestAuthentication()}

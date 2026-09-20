@@ -36,6 +36,19 @@ func noSleep(context.Context, time.Duration) error {
 	return nil
 }
 
+// routeFor wraps channels in one catch-all route. Model mapping lives on the
+// route, so tests exercising mapping declare it here.
+func routeFor(mapping domain.ModelMapping, channels ...domain.Channel) []domain.Route {
+	return []domain.Route{{
+		ID:           1,
+		ModelPattern: "*",
+		Mode:         domain.RouteModePattern,
+		Enabled:      true,
+		ModelMapping: mapping,
+		Channels:     channels,
+	}}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -70,24 +83,24 @@ func TestEngineRetriesSameChannelThenFailsOver(t *testing.T) {
 	}))
 	defer second.Close()
 
-	selector := router.NewMemorySelector([]domain.Channel{
-		{
+	selector := router.NewMemorySelector(routeFor(
+		domain.ModelMapping{{Pattern: "gpt-*", Target: "mapped-model"}},
+		domain.Channel{
 			ID:       "first",
 			BaseURL:  first.URL,
 			Enabled:  true,
 			Priority: 20,
 			Weight:   1,
 		},
-		{
-			ID:           "second",
-			BaseURL:      second.URL,
-			APIKey:       "second-key",
-			Enabled:      true,
-			Priority:     10,
-			Weight:       1,
-			ModelMapping: map[string]string{"gpt-*": "mapped-model"},
+		domain.Channel{
+			ID:       "second",
+			BaseURL:  second.URL,
+			APIKey:   "second-key",
+			Enabled:  true,
+			Priority: 10,
+			Weight:   1,
 		},
-	})
+	))
 	observer := &recordingObserver{}
 	engine := Engine{
 		Selector: selector,
@@ -157,10 +170,10 @@ func TestEngineReturnsNonRetryableResponseWithoutFailover(t *testing.T) {
 	defer second.Close()
 
 	engine := Engine{
-		Selector: router.NewMemorySelector([]domain.Channel{
-			{ID: "first", BaseURL: first.URL, Enabled: true, Priority: 20, Weight: 1},
-			{ID: "second", BaseURL: second.URL, Enabled: true, Priority: 10, Weight: 1},
-		}),
+		Selector: router.NewMemorySelector(routeFor(nil,
+			domain.Channel{ID: "first", BaseURL: first.URL, Enabled: true, Priority: 20, Weight: 1},
+			domain.Channel{ID: "second", BaseURL: second.URL, Enabled: true, Priority: 10, Weight: 1},
+		)),
 		Policy: domain.RetryPolicy{
 			MaxAttempts:           4,
 			MaxAttemptsPerChannel: 1,
@@ -197,9 +210,9 @@ func TestEngineStopsAtGlobalAttemptLimit(t *testing.T) {
 	defer upstream.Close()
 
 	engine := Engine{
-		Selector: router.NewMemorySelector([]domain.Channel{
-			{ID: "only", BaseURL: upstream.URL, Enabled: true, Priority: 1, Weight: 1},
-		}),
+		Selector: router.NewMemorySelector(routeFor(nil,
+			domain.Channel{ID: "only", BaseURL: upstream.URL, Enabled: true, Priority: 1, Weight: 1},
+		)),
 		Policy: domain.RetryPolicy{
 			MaxAttempts:           3,
 			MaxAttemptsPerChannel: 5,
@@ -231,13 +244,13 @@ func TestEngineAppliesChannelRequestTimeout(t *testing.T) {
 	})}
 
 	engine := Engine{
-		Selector: router.NewMemorySelector([]domain.Channel{{
+		Selector: router.NewMemorySelector(routeFor(nil, domain.Channel{
 			ID:             "slow",
 			BaseURL:        "http://upstream.test",
 			Enabled:        true,
 			Weight:         1,
 			RequestTimeout: 25 * time.Millisecond,
-		}}),
+		})),
 		Client: client,
 		Policy: domain.RetryPolicy{MaxAttempts: 1, MaxAttemptsPerChannel: 1},
 		Sleep:  noSleep,

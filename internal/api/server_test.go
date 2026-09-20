@@ -52,15 +52,13 @@ func TestOpenAICompatibleForwarding(t *testing.T) {
 	defer upstream.Close()
 
 	engine := &proxy.Engine{
-		Selector: router.NewMemorySelector([]domain.Channel{
-			{
-				ID:       "channel-one",
-				BaseURL:  upstream.URL,
-				Enabled:  true,
-				Priority: 10,
-				Weight:   1,
-			},
-		}),
+		Selector: router.NewMemorySelector(testRoutes(domain.Channel{
+			ID:       "channel-one",
+			BaseURL:  upstream.URL,
+			Enabled:  true,
+			Priority: 10,
+			Weight:   1,
+		})),
 		Policy: domain.RetryPolicy{
 			MaxAttempts:           1,
 			MaxAttemptsPerChannel: 1,

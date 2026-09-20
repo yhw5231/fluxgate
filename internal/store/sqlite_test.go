@@ -8,7 +8,12 @@ import (
 	"time"
 
 	"github.com/yhw5231/fluxgate/internal/breaker"
+	"github.com/yhw5231/fluxgate/internal/domain"
 )
+
+func int64Pointer(value int64) *int64 {
+	return &value
+}
 
 func openTestStore(t *testing.T) *SQLiteStore {
 	t.Helper()
@@ -64,7 +69,7 @@ func TestAuthenticateDownstreamKeyAcceptsValidCredentialAndDecodesRestrictions(t
 		`[1,2]`,
 		`{"7":1.5}`,
 		`[9]`,
-		`[{"accountId":11,"reference":"account-11"}]`,
+		`[{"kind":"account_token","siteId":1,"accountId":11,"tokenId":22}]`,
 	)
 	if err != nil {
 		t.Fatalf("insert downstream key: %v", err)
@@ -89,8 +94,26 @@ func TestAuthenticateDownstreamKeyAcceptsValidCredentialAndDecodesRestrictions(t
 	if len(key.ExcludedSiteIDs) != 1 || key.ExcludedSiteIDs[0] != 9 {
 		t.Fatalf("ExcludedSiteIDs = %#v", key.ExcludedSiteIDs)
 	}
-	if len(key.ExcludedCredentials) != 1 || key.ExcludedCredentials[0].Reference != "account-11" {
+	if len(key.ExcludedCredentials) != 1 {
 		t.Fatalf("ExcludedCredentials = %#v", key.ExcludedCredentials)
+	}
+	credential := key.ExcludedCredentials[0]
+	if credential.Kind != "account_token" || credential.SiteID != 1 || credential.AccountID != 11 || credential.TokenID != 22 {
+		t.Fatalf("ExcludedCredentials[0] = %#v", credential)
+	}
+	// supported_models is an exclusion list, so it becomes the deny patterns.
+	policy := key.Policy()
+	if !policy.DeniesModel("gpt-4.1") || !policy.DeniesModel("claude-sonnet") {
+		t.Fatalf("deny patterns = %#v, want both configured models denied", policy.DeniedModelPatterns)
+	}
+	if policy.DeniesModel("claude-opus") {
+		t.Fatal("policy denied a model that is not on the exclusion list")
+	}
+	if !policy.ExcludesCredential(domain.Channel{SiteID: 1, AccountID: 11, TokenID: int64Pointer(22)}) {
+		t.Fatal("excluded credential did not match its channel")
+	}
+	if policy.ExcludesCredential(domain.Channel{SiteID: 1, AccountID: 11}) {
+		t.Fatal("a channel without a token matched a token-scoped exclusion")
 	}
 }
 
@@ -171,7 +194,8 @@ func TestLoadConfigurationModelsChannelPolicyAndProxyPrecedence(t *testing.T) {
 			proxy_url TEXT,
 			use_system_proxy INTEGER DEFAULT 0,
 			custom_headers TEXT,
-			status TEXT NOT NULL DEFAULT 'active'
+			status TEXT NOT NULL DEFAULT 'active',
+			global_weight REAL DEFAULT 1
 		)`,
 		`CREATE TABLE accounts (
 			id INTEGER PRIMARY KEY,
@@ -194,7 +218,9 @@ func TestLoadConfigurationModelsChannelPolicyAndProxyPrecedence(t *testing.T) {
 			model_pattern TEXT NOT NULL,
 			model_mapping TEXT,
 			routing_strategy TEXT DEFAULT 'weighted',
-			enabled INTEGER DEFAULT 1
+			enabled INTEGER DEFAULT 1,
+			display_name TEXT,
+			route_mode TEXT DEFAULT 'pattern'
 		)`,
 		`CREATE TABLE route_channels (
 			id INTEGER PRIMARY KEY,
@@ -206,16 +232,30 @@ func TestLoadConfigurationModelsChannelPolicyAndProxyPrecedence(t *testing.T) {
 			weight INTEGER DEFAULT 10,
 			enabled INTEGER DEFAULT 1
 		)`,
-		`INSERT INTO sites (id, name, url, platform, proxy_url, use_system_proxy, custom_headers, status)
-		 VALUES (1, 'site', 'https://API.Example.com/v1', 'openai', 'http://site-proxy.example:8080', 1, '{}', 'active')`,
+		`CREATE TABLE route_group_sources (
+			id INTEGER PRIMARY KEY,
+			group_route_id INTEGER NOT NULL,
+			source_route_id INTEGER NOT NULL
+		)`,
+		`INSERT INTO sites (id, name, url, platform, proxy_url, use_system_proxy, custom_headers, status, global_weight)
+		 VALUES (1, 'site', 'https://API.Example.com/v1', 'openai', 'http://site-proxy.example:8080', 1, '{}', 'active', 2.5)`,
 		`INSERT INTO accounts (id, site_id, access_token, api_token, extra_config, status)
 		 VALUES (10, 1, 'account-access', 'account-api', '{"proxyUrl":"http://account-proxy.example:8080","useSystemProxy":true}', 'active')`,
 		`INSERT INTO account_tokens (id, account_id, token, proxy_url, use_system_proxy, enabled)
 		 VALUES (20, 10, 'token-key', 'http://token-proxy.example:8080', 0, 1)`,
+		// Declared order matters: the first matching pattern must win.
 		`INSERT INTO token_routes (id, model_pattern, model_mapping, routing_strategy, enabled)
-		 VALUES (30, 'gpt-*', '{"gpt-*":"mapped-model"}', 'round_robin', 1)`,
+		 VALUES (30, 'gpt-*', '{"gpt-*":"mapped-model","gpt-4.1":"exact-target"}', 'round_robin', 1)`,
 		`INSERT INTO route_channels (id, route_id, account_id, token_id, source_model, priority, weight, enabled)
 		 VALUES (40, 30, 10, 20, NULL, 5, 7, 1)`,
+		// An exact route, and a group that covers it through route_group_sources.
+		`INSERT INTO token_routes (id, model_pattern, routing_strategy, enabled, display_name, route_mode)
+		 VALUES (31, 'claude-opus-4-5', 'weighted', 1, NULL, 'pattern')`,
+		`INSERT INTO route_channels (id, route_id, account_id, token_id, source_model, priority, weight, enabled)
+		 VALUES (41, 31, 10, 20, NULL, 0, 10, 1)`,
+		`INSERT INTO token_routes (id, model_pattern, routing_strategy, enabled, display_name, route_mode)
+		 VALUES (32, '', 'weighted', 1, 'claude-opus-4-6', 'explicit_group')`,
+		`INSERT INTO route_group_sources (group_route_id, source_route_id) VALUES (32, 31)`,
 	}
 	for _, statement := range statements {
 		if _, err := store.db.Exec(statement); err != nil {
@@ -227,11 +267,34 @@ func TestLoadConfigurationModelsChannelPolicyAndProxyPrecedence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfiguration() error = %v", err)
 	}
-	if len(configuration.Channels) != 1 {
-		t.Fatalf("channel count = %d, want 1", len(configuration.Channels))
+	if len(configuration.Routes) != 3 {
+		t.Fatalf("route count = %d, want 3", len(configuration.Routes))
+	}
+	if len(configuration.Channels) != 2 {
+		t.Fatalf("channel count = %d, want 2", len(configuration.Channels))
 	}
 
-	channel := configuration.Channels[0]
+	globRoute := configuration.Routes[0]
+	if globRoute.ID != 30 || globRoute.Mode != domain.RouteModePattern {
+		t.Fatalf("route = %#v", globRoute)
+	}
+	if len(globRoute.ModelMapping) != 2 {
+		t.Fatalf("model mapping = %#v, want two ordered entries", globRoute.ModelMapping)
+	}
+	if globRoute.ModelMapping[0].Pattern != "gpt-*" || globRoute.ModelMapping[1].Pattern != "gpt-4.1" {
+		t.Fatalf("model mapping order = %#v, want declaration order preserved", globRoute.ModelMapping)
+	}
+	if got := globRoute.ModelMapping.Resolve("gpt-4.1"); got != "exact-target" {
+		t.Fatalf("Resolve(gpt-4.1) = %q, want exact-target", got)
+	}
+	if got := globRoute.ModelMapping.Resolve("gpt-4o"); got != "mapped-model" {
+		t.Fatalf("Resolve(gpt-4o) = %q, want mapped-model", got)
+	}
+	if got := globRoute.ModelMapping.Resolve("claude-3"); got != "claude-3" {
+		t.Fatalf("Resolve(claude-3) = %q, want the requested model", got)
+	}
+
+	channel := globRoute.Channels[0]
 	if channel.RoutingStrategy != "round_robin" {
 		t.Fatalf("routing strategy = %q, want round_robin", channel.RoutingStrategy)
 	}
@@ -253,8 +316,54 @@ func TestLoadConfigurationModelsChannelPolicyAndProxyPrecedence(t *testing.T) {
 	if !channel.SiteUseSystemProxy {
 		t.Fatal("site use_system_proxy was not loaded")
 	}
-	if channel.ModelMapping["gpt-4.1"] != "" && channel.ModelMapping["gpt-*"] != "mapped-model" {
-		t.Fatalf("model mapping = %#v", channel.ModelMapping)
+	if channel.SiteID != 1 || channel.AccountID != 10 || channel.TokenID == nil || *channel.TokenID != 20 {
+		t.Fatalf("channel identity = site:%d account:%d token:%v", channel.SiteID, channel.AccountID, channel.TokenID)
+	}
+	if channel.SiteGlobalWeight != 2.5 {
+		t.Fatalf("site global weight = %v, want 2.5", channel.SiteGlobalWeight)
+	}
+
+	// A channel without an explicit source_model inherits its exact route pattern.
+	exactChannel := configuration.Routes[1].Channels[0]
+	if exactChannel.SourceModel != "claude-opus-4-5" {
+		t.Fatalf("source model = %q, want the exact route pattern", exactChannel.SourceModel)
+	}
+	if got := configuration.Routes[0].Channels[0].SourceModel; got != "" {
+		t.Fatalf("glob route source model = %q, want empty", got)
+	}
+
+	group := configuration.Routes[2]
+	if group.Mode != domain.RouteModeExplicitGroup || group.DisplayName != "claude-opus-4-6" {
+		t.Fatalf("group route = %#v", group)
+	}
+	if len(group.SourceRouteIDs) != 1 || group.SourceRouteIDs[0] != 31 {
+		t.Fatalf("group source routes = %#v, want [31]", group.SourceRouteIDs)
+	}
+
+	// The covered exact route is hidden behind the group alias.
+	models := configuration.Models
+	if len(models) != 2 || models[0] != "claude-opus-4-6" || models[1] != "gpt-*" {
+		t.Fatalf("models = %#v, want [claude-opus-4-6 gpt-*]", models)
+	}
+}
+
+func TestParseExcludedCredentialsRejectsMalformedEntries(t *testing.T) {
+	credentials, err := parseExcludedCredentials(`[
+		{"kind":"account_token","siteId":1,"accountId":2,"tokenId":3},
+		{"kind":"account_token","siteId":1,"accountId":2,"tokenId":3},
+		{"kind":"account","siteId":1,"accountId":2,"tokenId":3},
+		{"kind":"account_token","siteId":0,"accountId":2,"tokenId":3},
+		{"kind":"account_token","siteId":1,"accountId":2},
+		{"kind":"account_token","siteId":1.5,"accountId":2,"tokenId":3}
+	]`)
+	if err != nil {
+		t.Fatalf("parseExcludedCredentials() error = %v", err)
+	}
+	if len(credentials) != 1 {
+		t.Fatalf("credentials = %#v, want only the first valid unique entry", credentials)
+	}
+	if credentials[0].TokenID != 3 {
+		t.Fatalf("credentials[0] = %#v", credentials[0])
 	}
 }
 
@@ -354,5 +463,76 @@ func TestCleanupBreakerStatesRemovesOnlyInactiveExpiredRows(t *testing.T) {
 	}
 	if _, exists := states[disabled]; !exists {
 		t.Fatal("disabled breaker state was removed")
+	}
+}
+
+// The upstream schema leaves api_token, extra_config and custom_headers NULL in
+// normal rows, so every nullable column must be scanned through sql.NullString.
+func TestLoadRoutesToleratesNullableAccountAndSiteColumns(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	statements := []string{
+		`CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)`,
+		`CREATE TABLE proxy_profiles (
+			id INTEGER PRIMARY KEY, name TEXT NOT NULL, protocol TEXT NOT NULL,
+			url TEXT NOT NULL, is_default INTEGER DEFAULT 0, enabled INTEGER DEFAULT 1
+		)`,
+		`CREATE TABLE downstream_api_keys (
+			id INTEGER PRIMARY KEY, name TEXT NOT NULL, key TEXT NOT NULL, enabled INTEGER DEFAULT 1,
+			expires_at TEXT, max_cost REAL, used_cost REAL DEFAULT 0, max_requests INTEGER,
+			used_requests INTEGER DEFAULT 0, supported_models TEXT, allowed_route_ids TEXT,
+			site_weight_multipliers TEXT, excluded_site_ids TEXT, excluded_credential_refs TEXT
+		)`,
+		`CREATE TABLE sites (
+			id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, platform TEXT NOT NULL,
+			proxy_url TEXT, use_system_proxy INTEGER DEFAULT 0, custom_headers TEXT,
+			status TEXT DEFAULT 'active', global_weight REAL DEFAULT 1, forced_upstream_endpoint TEXT
+		)`,
+		`CREATE TABLE accounts (
+			id INTEGER PRIMARY KEY, site_id INTEGER NOT NULL, access_token TEXT NOT NULL,
+			api_token TEXT, extra_config TEXT, status TEXT DEFAULT 'active'
+		)`,
+		`CREATE TABLE account_tokens (
+			id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, token TEXT NOT NULL,
+			proxy_url TEXT, use_system_proxy INTEGER DEFAULT 0, enabled INTEGER DEFAULT 1
+		)`,
+		`CREATE TABLE token_routes (
+			id INTEGER PRIMARY KEY, model_pattern TEXT NOT NULL, model_mapping TEXT,
+			routing_strategy TEXT DEFAULT 'weighted', enabled INTEGER DEFAULT 1,
+			display_name TEXT, route_mode TEXT DEFAULT 'pattern'
+		)`,
+		`CREATE TABLE route_channels (
+			id INTEGER PRIMARY KEY, route_id INTEGER NOT NULL, account_id INTEGER NOT NULL,
+			token_id INTEGER, source_model TEXT, priority INTEGER DEFAULT 0,
+			weight INTEGER DEFAULT 10, enabled INTEGER DEFAULT 1
+		)`,
+		`CREATE TABLE route_group_sources (id INTEGER PRIMARY KEY, group_route_id INTEGER NOT NULL, source_route_id INTEGER NOT NULL)`,
+		`INSERT INTO sites (id, name, url, platform) VALUES (1, 'site', 'https://example.test/v1', 'openai')`,
+		// api_token and extra_config deliberately NULL.
+		`INSERT INTO accounts (id, site_id, access_token) VALUES (1, 1, 'account-access')`,
+		`INSERT INTO token_routes (id, model_pattern) VALUES (1, 'model-a')`,
+		// token_id NULL as well.
+		`INSERT INTO route_channels (id, route_id, account_id) VALUES (1, 1, 1)`,
+	}
+	for _, statement := range statements {
+		if _, err := store.db.Exec(statement); err != nil {
+			t.Fatalf("execute test schema statement: %v", err)
+		}
+	}
+
+	configuration, err := store.LoadConfiguration(ctx)
+	if err != nil {
+		t.Fatalf("LoadConfiguration() error = %v", err)
+	}
+	channel := configuration.Routes[0].Channels[0]
+	if channel.APIKey != "account-access" {
+		t.Fatalf("APIKey = %q, want the account access token", channel.APIKey)
+	}
+	if channel.TokenID != nil {
+		t.Fatalf("TokenID = %v, want nil for a token-less channel", channel.TokenID)
+	}
+	if !channel.Enabled {
+		t.Fatal("channel with NULL optional columns was treated as disabled")
 	}
 }

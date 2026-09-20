@@ -45,27 +45,6 @@ func TestApplyHeadersRemovesOverridesAndReplacesAuthorization(t *testing.T) {
 	}
 }
 
-func TestMapModelPrefersCaseInsensitiveExactMapping(t *testing.T) {
-	mappings := map[string]string{
-		"gpt-*":   "wildcard-target",
-		"GPT-4.1": "exact-target",
-	}
-
-	if got := MapModel("gpt-4.1", mappings); got != "exact-target" {
-		t.Fatalf("MapModel() = %q, want exact-target", got)
-	}
-}
-
-func TestMapModelUsesGlobAndFallsBack(t *testing.T) {
-	mappings := map[string]string{"gpt-4*": "mapped-model"}
-	if got := MapModel("GPT-4o", mappings); got != "mapped-model" {
-		t.Fatalf("glob mapping = %q, want mapped-model", got)
-	}
-	if got := MapModel("claude-3", mappings); got != "claude-3" {
-		t.Fatalf("fallback mapping = %q, want original model", got)
-	}
-}
-
 func TestApplyJSONMapsDeletesAndOverrides(t *testing.T) {
 	body := []byte(`{
 		"model":"gpt-4.1",

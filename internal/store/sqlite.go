@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,10 +15,34 @@ import (
 
 	"github.com/yhw5231/fluxgate/internal/breaker"
 	"github.com/yhw5231/fluxgate/internal/domain"
+	"github.com/yhw5231/fluxgate/internal/pattern"
 	_ "modernc.org/sqlite"
 )
 
 var ErrUnauthorized = errors.New("invalid or expired downstream API key")
+
+// routeQuery loads every configured route. Disabled routes and group routes
+// that own no channels directly are included so the configuration snapshot and
+// group resolution see the complete picture.
+const routeQuery = `SELECT
+	id, model_pattern, model_mapping, display_name, route_mode,
+	COALESCE(routing_strategy, 'weighted'), COALESCE(enabled, 1)
+FROM token_routes
+ORDER BY id`
+
+// channelQuery loads every route channel with the account, site and token it
+// dispatches through.
+const channelQuery = `SELECT
+	rc.route_id, rc.id, COALESCE(rc.priority, 0), COALESCE(rc.weight, 10), COALESCE(rc.enabled, 1), rc.source_model, rc.token_id,
+	a.id, a.access_token, a.api_token, a.extra_config, COALESCE(a.status, 'active'),
+	s.id, s.name, s.url, s.platform, s.forced_upstream_endpoint, s.proxy_url,
+	COALESCE(s.use_system_proxy, 0), s.custom_headers, s.status, COALESCE(s.global_weight, 1),
+	at.token, at.proxy_url, COALESCE(at.use_system_proxy, 0), COALESCE(at.enabled, 1)
+FROM route_channels rc
+JOIN accounts a ON a.id = rc.account_id
+JOIN sites s ON s.id = a.site_id
+LEFT JOIN account_tokens at ON at.id = rc.token_id
+ORDER BY rc.route_id, rc.id`
 
 // SQLiteStore reads the existing application configuration and owns only the
 // gateway_breaker_states table. A process-local mutex serializes callback-based
@@ -28,11 +52,22 @@ type SQLiteStore struct {
 	mu sync.Mutex
 }
 
+// sqliteDSN adds a busy timeout so the gateway waits briefly instead of failing
+// outright when another process holds a write lock on the configuration
+// database. Paths that already look like URIs, or that contain characters this
+// builder cannot safely quote, are passed through unchanged.
+func sqliteDSN(path string) string {
+	if strings.HasPrefix(path, "file:") || strings.ContainsAny(path, "?#") {
+		return path
+	}
+	return "file:" + filepath.ToSlash(path) + "?_pragma=busy_timeout(10000)"
+}
+
 func OpenSQLite(path string) (*SQLiteStore, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("SQLite database path is required")
 	}
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("open SQLite database: %w", err)
 	}
@@ -49,6 +84,21 @@ func (s *SQLiteStore) Close() error {
 		return nil
 	}
 	return s.db.Close()
+}
+
+// VerifyIntegrity runs a fast consistency check so a damaged database is
+// reported at startup instead of being served silently. Concurrent writers
+// reaching the same file through a container file share can corrupt SQLite, and
+// the affected indexes would otherwise produce subtly wrong routing.
+func (s *SQLiteStore) VerifyIntegrity(ctx context.Context) error {
+	var result string
+	if err := s.db.QueryRowContext(ctx, `PRAGMA quick_check`).Scan(&result); err != nil {
+		return fmt.Errorf("check SQLite integrity: %w", err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(result), "ok") {
+		return fmt.Errorf("SQLite database failed its integrity check: %s", result)
+	}
+	return nil
 }
 
 func (s *SQLiteStore) EnsureBreakerSchema(ctx context.Context) error {
@@ -217,7 +267,7 @@ func (s *SQLiteStore) LoadConfiguration(ctx context.Context) (Configuration, err
 	if err := s.loadDownstreamKeys(ctx, &configuration); err != nil {
 		return Configuration{}, err
 	}
-	if err := s.loadChannels(ctx, &configuration); err != nil {
+	if err := s.loadRoutes(ctx, &configuration); err != nil {
 		return Configuration{}, err
 	}
 	return configuration, nil
@@ -302,6 +352,7 @@ func scanDownstreamKey(scanner interface{ Scan(...any) error }) (DownstreamAPIKe
 		}
 		key.ExpiresAt = &parsed
 	}
+	// supported_models is an exclusion list of model patterns.
 	if err := decodeJSON(supportedModels.String, &key.SupportedModels); err != nil {
 		return key, fmt.Errorf("parse supported_models: %w", err)
 	}
@@ -311,9 +362,12 @@ func scanDownstreamKey(scanner interface{ Scan(...any) error }) (DownstreamAPIKe
 	if err := decodeJSON(excludedSites.String, &key.ExcludedSiteIDs); err != nil {
 		return key, fmt.Errorf("parse excluded_site_ids: %w", err)
 	}
-	if err := decodeJSON(excludedCredentials.String, &key.ExcludedCredentials); err != nil {
-		return key, fmt.Errorf("parse excluded_credential_refs: %w", err)
+	credentials, err := parseExcludedCredentials(excludedCredentials.String)
+	if err != nil {
+		return key, err
 	}
+	key.ExcludedCredentials = credentials
+
 	var rawMultipliers map[string]float64
 	if err := decodeJSON(multipliers.String, &rawMultipliers); err != nil {
 		return key, fmt.Errorf("parse site_weight_multipliers: %w", err)
@@ -325,44 +379,178 @@ func scanDownstreamKey(scanner interface{ Scan(...any) error }) (DownstreamAPIKe
 			if err != nil {
 				return key, fmt.Errorf("parse site multiplier ID: %w", err)
 			}
+			if id <= 0 || !(multiplier > 0) {
+				continue
+			}
 			key.SiteMultipliers[id] = multiplier
 		}
 	}
 	return key, nil
 }
 
-func (s *SQLiteStore) loadChannels(ctx context.Context, configuration *Configuration) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT
-		rc.id, rc.route_id, rc.account_id, rc.token_id, rc.source_model,
-		COALESCE(rc.priority, 0), COALESCE(rc.weight, 10), COALESCE(rc.enabled, 1),
-		tr.model_pattern, tr.model_mapping, COALESCE(tr.routing_strategy, 'weighted'), COALESCE(tr.enabled, 1),
-		a.access_token, a.api_token, a.extra_config, COALESCE(a.status, 'active'),
-		s.id, s.name, s.url, s.platform, s.forced_upstream_endpoint, s.proxy_url,
-		COALESCE(s.use_system_proxy, 0), s.custom_headers, s.status,
-		at.token, at.proxy_url, COALESCE(at.use_system_proxy, 0), COALESCE(at.enabled, 1)
-	FROM route_channels rc
-	JOIN token_routes tr ON tr.id = rc.route_id
-	JOIN accounts a ON a.id = rc.account_id
-	JOIN sites s ON s.id = a.site_id
-	LEFT JOIN account_tokens at ON at.id = rc.token_id`)
+// parseExcludedCredentials decodes the excluded_credential_refs column. Only
+// account_token references with all three positive identifiers are accepted, so
+// a malformed entry can never widen or narrow selection by accident.
+func parseExcludedCredentials(raw string) ([]domain.ExcludedCredential, error) {
+	type rawCredential struct {
+		Kind      string   `json:"kind"`
+		SiteID    *float64 `json:"siteId"`
+		AccountID *float64 `json:"accountId"`
+		TokenID   *float64 `json:"tokenId"`
+	}
+	var decoded []rawCredential
+	if err := decodeJSON(raw, &decoded); err != nil {
+		return nil, fmt.Errorf("parse excluded_credential_refs: %w", err)
+	}
+	credentials := make([]domain.ExcludedCredential, 0, len(decoded))
+	seen := make(map[domain.ExcludedCredential]struct{}, len(decoded))
+	for _, entry := range decoded {
+		if strings.TrimSpace(entry.Kind) != "account_token" {
+			continue
+		}
+		siteID, siteOK := positiveInt64(entry.SiteID)
+		accountID, accountOK := positiveInt64(entry.AccountID)
+		tokenID, tokenOK := positiveInt64(entry.TokenID)
+		if !siteOK || !accountOK || !tokenOK {
+			continue
+		}
+		credential := domain.ExcludedCredential{
+			Kind:      "account_token",
+			SiteID:    siteID,
+			AccountID: accountID,
+			TokenID:   tokenID,
+		}
+		if _, duplicate := seen[credential]; duplicate {
+			continue
+		}
+		seen[credential] = struct{}{}
+		credentials = append(credentials, credential)
+		if len(credentials) >= 1000 {
+			break
+		}
+	}
+	return credentials, nil
+}
+
+func positiveInt64(value *float64) (int64, bool) {
+	if value == nil {
+		return 0, false
+	}
+	truncated := int64(*value)
+	if truncated <= 0 || float64(truncated) != *value {
+		return 0, false
+	}
+	return truncated, true
+}
+
+// loadRoutes builds one domain.Route per token_routes row, with the channels
+// that route may serve from. Routes and channels are read separately because a
+// group route owns no channels of its own: it draws them from the source routes
+// listed in route_group_sources.
+func (s *SQLiteStore) loadRoutes(ctx context.Context, configuration *Configuration) error {
+	groupSources, err := s.loadGroupSources(ctx)
 	if err != nil {
-		return fmt.Errorf("load route channels: %w", err)
+		return err
+	}
+
+	routes, err := s.loadRouteRows(ctx, groupSources)
+	if err != nil {
+		return err
+	}
+	routeIndex := make(map[int64]int, len(routes))
+	for index, route := range routes {
+		routeIndex[route.ID] = index
+	}
+
+	channels, err := s.loadChannelRows(ctx, routes, routeIndex)
+	if err != nil {
+		return err
+	}
+
+	configuration.Routes = routes
+	configuration.Channels = channels
+	configuration.Models = domain.ExposedModels(routes)
+	return nil
+}
+
+func (s *SQLiteStore) loadRouteRows(ctx context.Context, groupSources map[int64][]int64) ([]domain.Route, error) {
+	rows, err := s.db.QueryContext(ctx, routeQuery)
+	if err != nil {
+		return nil, fmt.Errorf("load routes: %w", err)
 	}
 	defer rows.Close()
-	modelSet := make(map[string]struct{})
+
+	routes := make([]domain.Route, 0)
 	for rows.Next() {
-		var channel domain.Channel
-		var channelID, routeID, accountID, siteID int64
-		var tokenID sql.NullInt64
-		var sourceModel, modelMapping, apiToken, accountExtraConfig, forcedEndpoint, siteProxy, customHeaders, accountToken, tokenProxy sql.NullString
-		var priority, weight, channelEnabled, routeEnabled, siteSystemProxy, tokenSystemProxy, tokenEnabled int
-		var modelPattern, routingStrategy, accessToken, accountStatus, siteName, siteURL, platform, siteStatus string
-		if err := rows.Scan(&channelID, &routeID, &accountID, &tokenID, &sourceModel, &priority, &weight, &channelEnabled,
-			&modelPattern, &modelMapping, &routingStrategy, &routeEnabled, &accessToken, &apiToken, &accountExtraConfig, &accountStatus,
-			&siteID, &siteName, &siteURL, &platform, &forcedEndpoint, &siteProxy, &siteSystemProxy,
-			&customHeaders, &siteStatus, &accountToken, &tokenProxy, &tokenSystemProxy, &tokenEnabled); err != nil {
-			return fmt.Errorf("scan route channel: %w", err)
+		var (
+			routeID                              int64
+			modelPattern, routingStrategy        string
+			modelMapping, displayName, routeMode sql.NullString
+			routeEnabled                         int
+		)
+		if err := rows.Scan(&routeID, &modelPattern, &modelMapping, &displayName, &routeMode, &routingStrategy, &routeEnabled); err != nil {
+			return nil, fmt.Errorf("scan route: %w", err)
 		}
+		mapping, err := parseModelMapping(modelMapping.String)
+		if err != nil {
+			return nil, fmt.Errorf("parse route %d model_mapping: %w", routeID, err)
+		}
+		mode := domain.RouteModePattern
+		if strings.TrimSpace(routeMode.String) == domain.RouteModeExplicitGroup {
+			mode = domain.RouteModeExplicitGroup
+		}
+		routes = append(routes, domain.Route{
+			ID:              routeID,
+			ModelPattern:    modelPattern,
+			DisplayName:     strings.TrimSpace(displayName.String),
+			Mode:            mode,
+			ModelMapping:    mapping,
+			RoutingStrategy: routingStrategy,
+			Enabled:         routeEnabled != 0,
+			SourceRouteIDs:  groupSources[routeID],
+		})
+	}
+	return routes, rows.Err()
+}
+
+func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route, routeIndex map[int64]int) ([]domain.Channel, error) {
+	rows, err := s.db.QueryContext(ctx, channelQuery)
+	if err != nil {
+		return nil, fmt.Errorf("load route channels: %w", err)
+	}
+	defer rows.Close()
+
+	channels := make([]domain.Channel, 0)
+	for rows.Next() {
+		var (
+			routeID, channelID, accountID, siteID     int64
+			tokenID                                   sql.NullInt64
+			priority, weight, channelEnabled          int
+			sourceModel, apiToken, accountExtraConfig sql.NullString
+			accessToken, accountStatus                string
+			siteName, siteURL, platform, siteStatus   string
+			forcedEndpoint, siteProxy, customHeaders  sql.NullString
+			siteSystemProxy                           int
+			siteGlobalWeight                          float64
+			accountToken, tokenProxy                  sql.NullString
+			tokenSystemProxy, tokenEnabled            int
+		)
+		if err := rows.Scan(
+			&routeID, &channelID, &priority, &weight, &channelEnabled, &sourceModel, &tokenID,
+			&accountID, &accessToken, &apiToken, &accountExtraConfig, &accountStatus,
+			&siteID, &siteName, &siteURL, &platform, &forcedEndpoint, &siteProxy,
+			&siteSystemProxy, &customHeaders, &siteStatus, &siteGlobalWeight,
+			&accountToken, &tokenProxy, &tokenSystemProxy, &tokenEnabled,
+		); err != nil {
+			return nil, fmt.Errorf("scan route channel: %w", err)
+		}
+
+		position, known := routeIndex[routeID]
+		if !known {
+			continue
+		}
+		route := routes[position]
+
 		credential := accessToken
 		if apiToken.Valid && apiToken.String != "" {
 			credential = apiToken.String
@@ -370,14 +558,23 @@ func (s *SQLiteStore) loadChannels(ctx context.Context, configuration *Configura
 		if tokenID.Valid && accountToken.Valid && accountToken.String != "" {
 			credential = accountToken.String
 		}
-		channel.ID = strconv.FormatInt(channelID, 10)
-		channel.Name = siteName
-		channel.BaseURL = siteURL
-		channel.APIKey = credential
-		channel.Priority = priority
-		channel.Weight = weight
-		channel.RoutingStrategy = routingStrategy
-		switch routingStrategy {
+
+		channel := domain.Channel{
+			ID:                 strconv.FormatInt(channelID, 10),
+			Name:               siteName,
+			BaseURL:            siteURL,
+			APIKey:             credential,
+			Priority:           priority,
+			Weight:             weight,
+			RoutingStrategy:    route.RoutingStrategy,
+			SiteProxyURL:       siteProxy.String,
+			SiteUseSystemProxy: siteSystemProxy != 0,
+			SiteID:             siteID,
+			AccountID:          accountID,
+			SiteGlobalWeight:   siteGlobalWeight,
+			SourceModel:        resolveSourceModel(sourceModel.String, route.ModelPattern),
+		}
+		switch route.RoutingStrategy {
 		case "round_robin":
 			channel.BreakerMode = string(breaker.ModeKeyModelCooldown)
 		case "stable_first":
@@ -385,21 +582,24 @@ func (s *SQLiteStore) loadChannels(ctx context.Context, configuration *Configura
 		default:
 			channel.BreakerMode = string(breaker.ModeCooldown)
 		}
-		channel.SiteProxyURL = siteProxy.String
-		channel.SiteUseSystemProxy = siteSystemProxy != 0
+		if tokenID.Valid {
+			id := tokenID.Int64
+			channel.TokenID = &id
+		}
+
 		var accountProxy struct {
 			ProxyURL       string `json:"proxyUrl"`
 			UseSystemProxy bool   `json:"useSystemProxy"`
 		}
-		if accountExtraConfig.Valid && strings.TrimSpace(accountExtraConfig.String) != "" {
+		if strings.TrimSpace(accountExtraConfig.String) != "" {
 			if err := json.Unmarshal([]byte(accountExtraConfig.String), &accountProxy); err != nil {
-				return fmt.Errorf("parse account %d extra_config: %w", accountID, err)
+				return nil, fmt.Errorf("parse account %d extra_config: %w", accountID, err)
 			}
 		}
 		channel.ProxyURL = accountProxy.ProxyURL
 		channel.UseSystemProxy = accountProxy.UseSystemProxy
 		if tokenID.Valid {
-			if tokenProxy.Valid && strings.TrimSpace(tokenProxy.String) != "" {
+			if strings.TrimSpace(tokenProxy.String) != "" {
 				channel.ProxyURL = tokenProxy.String
 				channel.UseSystemProxy = false
 			}
@@ -408,40 +608,90 @@ func (s *SQLiteStore) loadChannels(ctx context.Context, configuration *Configura
 				channel.UseSystemProxy = true
 			}
 		}
-		channel.Enabled = channelEnabled != 0 && routeEnabled != 0 && tokenEnabled != 0 && accountStatus == "active" && siteStatus == "active"
-		channel.ModelMapping = make(map[string]string)
-		if modelMapping.Valid && modelMapping.String != "" {
-			if err := json.Unmarshal([]byte(modelMapping.String), &channel.ModelMapping); err != nil {
-				return fmt.Errorf("parse route %d model_mapping: %w", routeID, err)
-			}
-		}
-		if sourceModel.Valid && sourceModel.String != "" {
-			channel.ModelMapping[modelPattern] = sourceModel.String
-		}
-		if customHeaders.Valid && customHeaders.String != "" {
+		channel.Enabled = channelEnabled != 0 && route.Enabled && tokenEnabled != 0 && accountStatus == "active" && siteStatus == "active"
+
+		if strings.TrimSpace(customHeaders.String) != "" {
 			var headers map[string]string
 			if err := json.Unmarshal([]byte(customHeaders.String), &headers); err != nil {
-				return fmt.Errorf("parse site %d custom_headers: %w", siteID, err)
+				return nil, fmt.Errorf("parse site %d custom_headers: %w", siteID, err)
 			}
 			channel.Transform.SetHeaders = make(map[string][]string, len(headers))
 			for name, value := range headers {
 				channel.Transform.SetHeaders.Set(name, value)
 			}
 		}
-		configuration.Channels = append(configuration.Channels, channel)
-		if modelPattern != "" {
-			modelSet[modelPattern] = struct{}{}
+
+		routes[position].Channels = append(routes[position].Channels, channel)
+		channels = append(channels, channel)
+	}
+	return channels, rows.Err()
+}
+
+// resolveSourceModel mirrors the upstream fallback: a channel on an exact-model
+// route inherits that model as its source when the column is empty.
+func resolveSourceModel(raw, modelPattern string) string {
+	if trimmed := strings.TrimSpace(raw); trimmed != "" {
+		return trimmed
+	}
+	if pattern.IsExact(modelPattern) {
+		return strings.TrimSpace(modelPattern)
+	}
+	return ""
+}
+
+func (s *SQLiteStore) loadGroupSources(ctx context.Context) (map[int64][]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT group_route_id, source_route_id FROM route_group_sources ORDER BY group_route_id, source_route_id`)
+	if err != nil {
+		return nil, fmt.Errorf("load route group sources: %w", err)
+	}
+	defer rows.Close()
+	sources := make(map[int64][]int64)
+	for rows.Next() {
+		var groupID, sourceID int64
+		if err := rows.Scan(&groupID, &sourceID); err != nil {
+			return nil, fmt.Errorf("scan route group source: %w", err)
 		}
+		sources[groupID] = append(sources[groupID], sourceID)
 	}
-	if err := rows.Err(); err != nil {
-		return err
+	return sources, rows.Err()
+}
+
+// parseModelMapping decodes model_mapping while preserving key order, so
+// overlapping patterns resolve deterministically.
+func parseModelMapping(raw string) (domain.ModelMapping, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == "null" {
+		return nil, nil
 	}
-	configuration.Models = make([]string, 0, len(modelSet))
-	for model := range modelSet {
-		configuration.Models = append(configuration.Models, model)
+	decoder := json.NewDecoder(strings.NewReader(trimmed))
+	opening, err := decoder.Token()
+	if err != nil {
+		return nil, err
 	}
-	sort.Strings(configuration.Models)
-	return nil
+	if delimiter, ok := opening.(json.Delim); !ok || delimiter != '{' {
+		return nil, errors.New("model_mapping must be a JSON object")
+	}
+	mapping := make(domain.ModelMapping, 0)
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, errors.New("model_mapping keys must be strings")
+		}
+		var value any
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		target, ok := value.(string)
+		if !ok || strings.TrimSpace(target) == "" {
+			continue
+		}
+		mapping = append(mapping, domain.ModelMappingEntry{Pattern: key, Target: target})
+	}
+	return mapping, nil
 }
 
 func decodeJSON(value string, destination any) error {
