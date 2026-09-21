@@ -418,8 +418,8 @@ func TestConsoleIsServedWithoutManagementToken(t *testing.T) {
 	if got := response.Header().Get("Content-Type"); !strings.Contains(got, "text/html") {
 		t.Fatalf("Content-Type = %q, want text/html", got)
 	}
-	if !strings.Contains(response.Body.String(), "Fluxgate Console") {
-		t.Fatal("console index did not contain the expected title")
+	if !strings.Contains(response.Body.String(), `id="auth-overlay"`) {
+		t.Fatal("console index did not contain the expected shell")
 	}
 }
 

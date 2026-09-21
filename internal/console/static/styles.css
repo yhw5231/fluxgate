@@ -225,37 +225,52 @@ code {
 
 #auth-form { margin-top: 26px; text-align: left; }
 
-.auth-label {
+/* ===== Form fields =====
+   One definition shared by the auth gate, the settings view, and the forced
+   password change. Styling an input by its id instead let a renamed field go
+   unstyled and fall back to the browser default, so the forms build every
+   field from these classes. */
+
+.field { margin-bottom: 16px; }
+
+.field-label {
   display: block;
   margin-bottom: 8px;
   font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.05em;
-  text-transform: uppercase;
   color: var(--text-muted);
 }
 
-#auth-token {
+.field-input {
+  display: block;
   width: 100%;
   padding: 11px 14px;
   background: var(--bg-input);
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-sm);
   color: var(--text-primary);
-  font-family: var(--font-mono);
+  font-family: inherit;
   font-size: 13px;
+  /* A unitless line-height keeps every field the same height; the monospace
+     face used by password inputs is otherwise a couple of pixels shorter. */
+  line-height: 1.35;
   transition: border-color 0.18s ease, box-shadow 0.18s ease;
 }
 
-#auth-token::placeholder { color: var(--text-faint); }
+.field-input::placeholder { color: var(--text-faint); }
 
-#auth-token:focus {
+.field-input:focus {
   outline: none;
   border-color: var(--border-accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
-#auth-form .btn { margin-top: 16px; }
+/* Password fields keep the monospace face the credential displays use. */
+input[type="password"].field-input { font-family: var(--font-mono); }
+
+/* The submit button matches the field height above it. */
+#auth-form .btn { margin-top: 6px; padding-block: 11px; line-height: 1.35; }
 
 .auth-error {
   margin-top: 14px;
@@ -725,34 +740,9 @@ code {
 
 .settings-form { max-width: 420px; }
 
-.settings-label {
-  display: block;
-  margin: 0 0 8px;
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  color: var(--text-muted);
-}
-
-#password-form input[type="password"] {
-  width: 100%;
-  padding: 11px 14px;
-  margin-bottom: 16px;
-  background: var(--bg-input);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-sm);
-  color: var(--text-primary);
-  font-family: var(--font-mono);
-  font-size: 13px;
-  transition: border-color 0.18s ease, box-shadow 0.18s ease;
-}
-
-#password-form input[type="password"]:focus {
-  outline: none;
-  border-color: var(--border-accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
-}
+/* The forced-change card is the first thing a fresh deployment shows, so its
+   fields use the same shared primitives as the auth gate. */
+#password-required .settings-form { max-width: none; }
 
 .settings-feedback {
   margin: 0 0 16px;

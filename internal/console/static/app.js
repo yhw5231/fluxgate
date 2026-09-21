@@ -1,6 +1,6 @@
-/* Fluxgate Console — vanilla ES2020, no external dependencies.
- * All gateway data is rendered through textContent/DOM APIs so upstream
- * configuration values can never be interpreted as markup. */
+/* Fluxgate 管理台 — 原生 ES2020 实现，不依赖任何外部库。
+ * 所有网关数据都通过 textContent/DOM API 渲染，因此上游配置值永远不会被
+ * 当作标记解析。 */
 
 (function () {
   'use strict';
@@ -100,6 +100,7 @@
 
     els.modelsCloud = document.querySelector('[data-models-cloud]');
     els.modelsEmpty = document.querySelector('[data-models-empty]');
+    els.modelsEmptyText = document.querySelector('[data-models-empty-text]');
     els.modelsMeta = document.querySelector('[data-panel="models"] [data-meta]');
     els.modelFilter = $('model-filter');
 
@@ -110,6 +111,40 @@
 
   /* ===== Formatting helpers ===== */
 
+  /* 上游配置里的枚举值按中文显示；未知值原样保留，这样新值不会因为管理台
+   * 还没有对应的翻译就消失。 */
+  var ENUM_LABELS = {
+    routing_strategy: {
+      weighted: '加权轮询',
+      round_robin: '轮询',
+      stable_first: '固定优先'
+    },
+    breaker_mode: {
+      cooldown: '通道冷却',
+      disable: '通道禁用',
+      key_cooldown: '密钥冷却',
+      key_model_cooldown: '密钥+模型冷却'
+    },
+    proxy_source: {
+      direct: '直连',
+      key: '密钥代理',
+      system: '系统代理',
+      site: '站点代理'
+    },
+    scope: {
+      channel: '通道',
+      key: '密钥',
+      key_model: '密钥+模型'
+    }
+  };
+
+  function enumLabel(kind, value, fallback) {
+    var raw = text(value, fallback);
+    var labels = ENUM_LABELS[kind];
+    if (labels && labels[raw]) { return labels[raw]; }
+    return raw;
+  }
+
   function formatDuration(ms) {
     if (typeof ms !== 'number' || !isFinite(ms) || ms < 0) { return '—'; }
     var totalSeconds = Math.floor(ms / 1000);
@@ -117,10 +152,10 @@
     var hours = Math.floor((totalSeconds % 86400) / 3600);
     var minutes = Math.floor((totalSeconds % 3600) / 60);
     var seconds = totalSeconds % 60;
-    if (days > 0) { return days + 'd ' + hours + 'h'; }
-    if (hours > 0) { return hours + 'h ' + minutes + 'm'; }
-    if (minutes > 0) { return minutes + 'm ' + seconds + 's'; }
-    return seconds + 's';
+    if (days > 0) { return days + ' 天 ' + hours + ' 小时'; }
+    if (hours > 0) { return hours + ' 小时 ' + minutes + ' 分'; }
+    if (minutes > 0) { return minutes + ' 分 ' + seconds + ' 秒'; }
+    return seconds + ' 秒';
   }
 
   function formatTimestamp(value) {
@@ -131,8 +166,8 @@
   }
 
   function formatCountdown(seconds) {
-    if (seconds <= 0) { return 'refreshing…'; }
-    return 'in ' + seconds + 's';
+    if (seconds <= 0) { return '刷新中…'; }
+    return seconds + ' 秒后';
   }
 
   function relativeUntil(value) {
@@ -140,8 +175,8 @@
     var parsed = new Date(value);
     if (isNaN(parsed.getTime())) { return ''; }
     var delta = parsed.getTime() - Date.now();
-    if (delta <= 0) { return 'expired'; }
-    return 'resumes in ' + formatDuration(delta);
+    if (delta <= 0) { return '已过期'; }
+    return '恢复还需 ' + formatDuration(delta);
   }
 
   function text(value, fallback) {
@@ -191,7 +226,7 @@
     els.authError.hidden = !message;
     els.authError.textContent = message || '';
     els.authSubmit.disabled = false;
-    els.authSubmit.querySelector('.btn-label').textContent = 'Sign in';
+    els.authSubmit.querySelector('.btn-label').textContent = '登录';
     els.authPassword.value = '';
     els.authUsername.focus();
   }
@@ -227,8 +262,8 @@
     els.dashboardView.hidden = true;
     els.settingsView.hidden = false;
     els.settingsAccount.textContent = state.username
-      ? 'Signed in as ' + state.username + '.'
-      : 'Signed in.';
+      ? '当前登录账号：' + state.username + '。'
+      : '已登录。';
     resetPasswordForm(els.passwordForm, els.currentPassword, els.newPassword,
       els.confirmPassword, els.passwordFeedback);
     els.currentPassword.focus();
@@ -272,9 +307,33 @@
     });
   }
 
+  /* 网关返回的错误码到中文提示的映射。网关的 code 字段是自动化依赖的契约，
+   * 所以这里只做显示层翻译，不改动接口本身；未知错误码仍回退到网关的原文，
+   * 新错误码不会因此被吞掉。 */
+  var CODE_MESSAGES = {
+    // 登录与会话
+    invalid_credentials: '用户名或密码错误。',
+    missing_credentials: '请输入用户名和密码。',
+    too_many_attempts: '失败次数过多，请稍后重试。',
+    unauthorized: '登录状态已失效，请重新登录。',
+    console_auth_not_configured: '本网关未配置管理台登录。',
+    management_auth_not_configured: '本网关未配置管理接口认证。',
+    authentication_failed: '网关在处理登录时出错。',
+    password_change_required: '请先修改默认密码，之后才能读取数据。',
+    // 修改密码
+    password_unchanged: '新密码不能与当前密码相同。',
+    password_empty: '新密码不能为空，否则将无法再次登录。',
+    invalid_password: '密码不符合要求（最长 4096 字节，且必须是有效的 UTF-8 文本）。',
+    password_change_failed: '新密码保存失败。',
+    invalid_json: '请求格式不正确。'
+  };
+
   function errorMessage(body, fallback) {
     if (body && body.error) {
       if (typeof body.error === 'string') { return body.error; }
+      if (body.error.code && CODE_MESSAGES[body.error.code]) {
+        return CODE_MESSAGES[body.error.code];
+      }
       if (body.error.message) { return body.error.message; }
       if (body.error.code) { return body.error.code; }
     }
@@ -294,7 +353,7 @@
       var snapshot = results[1];
 
       if (status.status === 401 || snapshot.status === 401) {
-        showAuth('Your session expired. Sign in again to continue.');
+        showAuth('登录状态已过期，请重新登录后继续。');
         return;
       }
       // The gateway refuses data to an account that still holds the default
@@ -305,12 +364,12 @@
       }
       if (status.status === 503 || snapshot.status === 503) {
         hideBanner();
-        renderUnavailable(errorMessage(status.body, 'Console sign-in is not configured on this gateway.'));
+        renderUnavailable(errorMessage(status.body, '本网关未配置管理台登录。'));
         return;
       }
       if (!status.ok || !snapshot.ok) {
-        showBanner('Gateway request failed',
-          errorMessage(!status.ok ? status.body : snapshot.body, 'Unexpected response from the gateway.'));
+        showBanner('网关请求失败',
+          errorMessage(!status.ok ? status.body : snapshot.body, '网关返回了预期之外的响应。'));
         return;
       }
 
@@ -318,7 +377,7 @@
       state.snapshot = snapshot.body || {};
       render(status.body || {}, state.snapshot);
     }).catch(function (err) {
-      showBanner('Cannot reach the gateway', String(err && err.message ? err.message : err));
+      showBanner('无法连接网关', String(err && err.message ? err.message : err));
     }).then(function () {
       state.loading = false;
       els.refresh.classList.remove('spinning');
@@ -327,11 +386,11 @@
   }
 
   function renderUnavailable(message) {
-    setStatus('unknown', 'Unavailable');
-    setStat('service', '—', 'management disabled', '');
-    setStat('models', '—', 'unknown', '');
-    setStat('channels', '—', 'unknown', '');
-    setStat('breakers', '—', 'unknown', '');
+    setStatus('unknown', '不可用');
+    setStat('service', '—', '管理接口已关闭', '');
+    setStat('models', '—', '未知', '');
+    setStat('channels', '—', '未知', '');
+    setStat('breakers', '—', '未知', '');
     els.breakersBody.textContent = '';
     els.channelsBody.textContent = '';
     els.modelsCloud.textContent = '';
@@ -341,7 +400,7 @@
     els.breakersMeta.textContent = '';
     els.channelsMeta.textContent = '';
     els.modelsMeta.textContent = '';
-    showBanner('Management endpoints unavailable', message);
+    showBanner('管理接口不可用', message);
   }
 
   /* ===== Rendering ===== */
@@ -363,11 +422,11 @@
 
   function render(status, snapshot) {
     var ready = status.ready === true;
-    setStatus(ready ? 'ok' : 'bad', ready ? 'Ready' : 'Not ready');
-    setStat('service', ready ? 'Online' : 'Degraded', status.service ? text(status.service) : 'gateway service',
+    setStatus(ready ? 'ok' : 'bad', ready ? '就绪' : '未就绪');
+    setStat('service', ready ? '在线' : '降级', status.service ? text(status.service) : '网关服务',
       ready ? 'ok' : 'bad');
-    els.uptime.textContent = 'up ' + formatDuration(status.uptime_ms);
-    els.uptime.title = 'Process uptime';
+    els.uptime.textContent = '已运行 ' + formatDuration(status.uptime_ms);
+    els.uptime.title = '进程运行时长';
 
     var channels = Array.isArray(snapshot.channels) ? snapshot.channels : [];
     var breakers = Array.isArray(snapshot.breakers) ? snapshot.breakers : [];
@@ -382,17 +441,17 @@
     var openCount = breakers.filter(isBreakerOpen).length;
 
     var modelCount = typeof status.model_count === 'number' ? status.model_count : models.length;
-    setStat('models', String(modelCount), models.length + ' from channels', '');
-    setStat('channels', String(channels.length), enabled + ' enabled', '');
-    setStat('breakers', String(openCount), 'open of ' + breakers.length + ' tracked',
+    setStat('models', String(modelCount), '来自通道 ' + models.length + ' 个', '');
+    setStat('channels', String(channels.length), '已启用 ' + enabled + ' 个', '');
+    setStat('breakers', String(openCount), '熔断 ' + openCount + ' / 跟踪 ' + breakers.length,
       openCount > 0 ? 'bad' : 'ok');
 
     renderBreakers(breakers);
     renderChannels(channels);
     renderModels(models, els.modelFilter.value);
 
-    els.footerGenerated.textContent = 'snapshot: ' + formatTimestamp(snapshot.generated_at);
-    els.footerLoaded.textContent = 'config loaded: ' + formatTimestamp(snapshot.loaded_at);
+    els.footerGenerated.textContent = '快照时间：' + formatTimestamp(snapshot.generated_at);
+    els.footerLoaded.textContent = '配置加载：' + formatTimestamp(snapshot.loaded_at);
   }
 
   function isBreakerOpen(entry) {
@@ -405,7 +464,7 @@
 
   function renderBreakers(breakers) {
     els.breakersBody.textContent = '';
-    els.breakersMeta.textContent = breakers.length + ' tracked';
+    els.breakersMeta.textContent = '跟踪 ' + breakers.length + ' 项';
 
     if (breakers.length === 0) {
       els.breakersEmpty.hidden = false;
@@ -419,7 +478,7 @@
       var row = document.createElement('tr');
       var open = isBreakerOpen(entry);
 
-      cell(row, badge(text(entry.scope, 'channel'), open ? 'warning' : 'muted'));
+      cell(row, badge(enumLabel('scope', entry.scope, 'channel'), open ? 'warning' : 'muted'));
 
       var channelID = entry.channel_id || '';
       var channelName = state.channelNames[channelID] || channelID || '—';
@@ -431,14 +490,14 @@
       cell(row, String(entry.cooldown_level || 0), 'num');
 
       var stateCell = document.createElement('td');
-      var label = 'Closed';
+      var label = '正常';
       var variant = 'success';
       if (entry.disabled) {
-        label = 'Disabled';
+        label = '已禁用';
         variant = 'danger';
       } else if (open) {
         var remaining = relativeUntil(entry.blocked_until);
-        label = remaining ? 'Open (' + remaining + ')' : 'Open';
+        label = remaining ? '熔断（' + remaining + '）' : '熔断';
         variant = 'danger';
       }
       stateCell.appendChild(badge(label, variant));
@@ -450,7 +509,7 @@
 
   function renderChannels(channels) {
     els.channelsBody.textContent = '';
-    els.channelsMeta.textContent = channels.length + ' configured';
+    els.channelsMeta.textContent = '已配置 ' + channels.length + ' 个';
 
     if (channels.length === 0) {
       els.channelsEmpty.hidden = false;
@@ -468,14 +527,14 @@
       nameCell.appendChild(element('span', 'cell-id', '#' + text(channel.id)));
       row.appendChild(nameCell);
 
-      cell(row, badge(channel.enabled ? 'Enabled' : 'Disabled', channel.enabled ? 'success' : 'danger'));
+      cell(row, badge(channel.enabled ? '已启用' : '已禁用', channel.enabled ? 'success' : 'danger'));
       cell(row, String(channel.priority === undefined ? 0 : channel.priority), 'num');
       cell(row, String(channel.weight === undefined ? 0 : channel.weight), 'num');
-      cell(row, element('span', 'tag', text(channel.routing_strategy, 'weighted')));
-      cell(row, element('span', 'tag', text(channel.breaker_mode, 'cooldown')));
+      cell(row, element('span', 'tag', enumLabel('routing_strategy', channel.routing_strategy, 'weighted')));
+      cell(row, element('span', 'tag', enumLabel('breaker_mode', channel.breaker_mode, 'cooldown')));
 
       var proxyVariant = channel.proxy_source === 'direct' ? 'muted' : 'info';
-      cell(row, badge(text(channel.proxy_source, 'direct'), proxyVariant));
+      cell(row, badge(enumLabel('proxy_source', channel.proxy_source, 'direct'), proxyVariant));
 
       var mappings = Array.isArray(channel.model_mappings) ? channel.model_mappings : [];
       var mappingCell = document.createElement('td');
@@ -498,7 +557,7 @@
 
   function renderModels(models, filter) {
     els.modelsCloud.textContent = '';
-    els.modelsMeta.textContent = models.length + ' routable';
+    els.modelsMeta.textContent = models.length + ' 个可路由';
 
     var needle = (filter || '').trim().toLowerCase();
     var visible = needle
@@ -506,9 +565,16 @@
       : models;
 
     els.modelsEmpty.hidden = visible.length !== 0;
+    // With no filter the panel is empty because nothing is configured, which is
+    // a different situation from a filter that matched nothing.
+    if (els.modelsEmptyText) {
+      els.modelsEmptyText.textContent = needle
+        ? '没有符合筛选条件的模型'
+        : '没有可路由的模型';
+    }
     els.modelsMeta.textContent = needle
-      ? visible.length + ' / ' + models.length + ' routable'
-      : models.length + ' routable';
+      ? visible.length + ' / ' + models.length + ' 个可路由'
+      : models.length + ' 个可路由';
 
     var fragment = document.createDocumentFragment();
     visible.forEach(function (model) {
@@ -568,7 +634,7 @@
     if (submit) {
       submit.disabled = false;
       submit.querySelector('.btn-label').textContent =
-        form.id === 'required-password-form' ? 'Set password' : 'Change password';
+        form.id === 'required-password-form' ? '设置密码' : '修改密码';
     }
   }
 
@@ -591,17 +657,17 @@
     feedback.hidden = true;
 
     if (!current.value || !next.value) {
-      passwordFeedback(feedback, 'Enter the current password and the new password.', 'error');
+      passwordFeedback(feedback, '请输入当前密码和新密码。', 'error');
       return;
     }
     if (next.value !== confirm.value) {
-      passwordFeedback(feedback, 'The two new passwords do not match.', 'error');
+      passwordFeedback(feedback, '两次输入的新密码不一致。', 'error');
       confirm.focus();
       return;
     }
 
     submit.disabled = true;
-    label.textContent = 'Saving…';
+    label.textContent = '保存中…';
 
     post('/management/password', {
       current_password: current.value,
@@ -618,26 +684,26 @@
       submit.disabled = false;
       label.textContent = original;
       if (result.status === 401) {
-        passwordFeedback(feedback, 'The current password is incorrect.', 'error');
+        passwordFeedback(feedback, '当前密码不正确。', 'error');
         current.value = '';
         current.focus();
         return;
       }
       if (result.status === 400 && result.body && result.body.error) {
-        passwordFeedback(feedback, result.body.error.message || 'The new password was rejected.', 'error');
+        passwordFeedback(feedback, errorMessage(result.body, '新密码未被接受。'), 'error');
         return;
       }
       if (result.status === 403) {
         // The session is authenticated but still gated: refresh so the forced
         // screen reappears rather than silently failing.
-        passwordFeedback(feedback, 'Sign in again to change the password.', 'error');
+        passwordFeedback(feedback, '请重新登录后再修改密码。', 'error');
         return;
       }
-      passwordFeedback(feedback, errorMessage(result.body, 'Unexpected gateway response.'), 'error');
+      passwordFeedback(feedback, errorMessage(result.body, '网关返回了预期之外的响应。'), 'error');
     }).catch(function (err) {
       submit.disabled = false;
       label.textContent = original;
-      passwordFeedback(feedback, 'Cannot reach the gateway: ' +
+      passwordFeedback(feedback, '无法连接网关：' +
         String(err && err.message ? err.message : err), 'error');
     });
   }
@@ -646,7 +712,7 @@
 
   function setSubmitting(submitting) {
     els.authSubmit.disabled = submitting;
-    els.authSubmit.querySelector('.btn-label').textContent = submitting ? 'Signing in…' : 'Sign in';
+    els.authSubmit.querySelector('.btn-label').textContent = submitting ? '登录中…' : '登录';
   }
 
   function signInError(message) {
@@ -662,7 +728,7 @@
       var password = els.authPassword.value;
       if (!username || !password) {
         els.authError.hidden = false;
-        els.authError.textContent = 'Enter both the username and the password.';
+        els.authError.textContent = '请输入用户名和密码。';
         return;
       }
       els.authError.hidden = true;
@@ -683,20 +749,20 @@
           return;
         }
         if (result.status === 429) {
-          signInError('Too many failed attempts. Wait a few minutes and try again.');
+          signInError('失败次数过多，请等待几分钟后重试。');
           return;
         }
         if (result.status === 503) {
-          signInError('Console sign-in is not configured on this gateway.');
+          signInError('本网关未配置管理台登录。');
           return;
         }
         if (result.status === 401) {
-          signInError('Invalid username or password.');
+          signInError('用户名或密码错误。');
           return;
         }
-        signInError(errorMessage(result.body, 'Unexpected gateway response.'));
+        signInError(errorMessage(result.body, '网关返回了预期之外的响应。'));
       }).catch(function (err) {
-        signInError('Cannot reach the gateway: ' + String(err && err.message ? err.message : err));
+        signInError('无法连接网关：' + String(err && err.message ? err.message : err));
       });
     });
 
@@ -712,7 +778,7 @@
     els.passwordForm.addEventListener('submit', function (event) {
       event.preventDefault();
       submitPasswordChange(els.passwordForm, els.passwordFeedback, function () {
-        passwordFeedback(els.passwordFeedback, 'Password updated.', 'success');
+        passwordFeedback(els.passwordFeedback, '密码已更新。', 'success');
         refresh();
       });
     });
@@ -735,7 +801,11 @@
     });
 
     document.addEventListener('visibilitychange', function () {
-      if (!document.hidden && !els.dashboardView.hidden) { refresh(); }
+      // Only the live dashboard refreshes. Its container carries no hidden
+      // attribute before sign-in, so asking whether the app and the dashboard
+      // are both visible is what keeps a returning tab from firing an
+      // unauthenticated request and reporting a session that never existed.
+      if (!document.hidden && !els.app.hidden && !els.dashboardView.hidden) { refresh(); }
     });
   }
 
@@ -757,12 +827,12 @@
         return;
       }
       if (result.ok && result.body && result.body.configured === false) {
-        showAuth('Console sign-in is not configured on this gateway.');
+        showAuth('本网关未配置管理台登录。');
         return;
       }
       showAuth('');
     }).catch(function () {
-      showAuth('Cannot reach the gateway.');
+      showAuth('无法连接网关。');
     });
   }
 

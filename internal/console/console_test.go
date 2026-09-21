@@ -17,7 +17,9 @@ func TestHandlerServesIndexAndAssets(t *testing.T) {
 		wantType    string
 		wantSnippet string
 	}{
-		{name: "index", path: "/console/", wantType: "text/html", wantSnippet: "Fluxgate Console"},
+		// The index is identified by a structural marker rather than by wording,
+		// so a copy change does not read as a missing page.
+		{name: "index", path: "/console/", wantType: "text/html", wantSnippet: `id="auth-overlay"`},
 		{name: "stylesheet", path: "/console/styles.css", wantType: "text/css", wantSnippet: "--bg-base"},
 		{name: "script", path: "/console/app.js", wantType: "text/javascript", wantSnippet: "management/snapshot"},
 	}
@@ -190,6 +192,124 @@ func TestConsoleLoginFormCollectsUsernameAndPassword(t *testing.T) {
 	if strings.Contains(page, "auth-token") {
 		t.Error("login form still has a management token input")
 	}
+}
+
+// Every text field must carry the shared field classes. The login inputs once
+// relied on an id-based rule (a leftover #auth-token selector) that no longer
+// matched them after the form changed, so they silently fell back to the
+// browser default box. A class-based style cannot drift away like that, and
+// this test fails if a field is added without it.
+func TestEveryFieldInputCarriesTheSharedClasses(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/console/", nil)
+	response := httptest.NewRecorder()
+	Handler().ServeHTTP(response, request)
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	page := string(body)
+
+	fields := []struct {
+		id   string
+		kind string
+	}{
+		{id: "auth-username", kind: "text"},
+		{id: "auth-password", kind: "password"},
+		{id: "current-password", kind: "password"},
+		{id: "new-password", kind: "password"},
+		{id: "confirm-password", kind: "password"},
+		{id: "required-current-password", kind: "password"},
+		{id: "required-new-password", kind: "password"},
+		{id: "required-confirm-password", kind: "password"},
+	}
+	for _, field := range fields {
+		tag := openingTagOf(t, page, `id="`+field.id+`"`)
+		if !strings.Contains(tag, `class="field-input"`) {
+			t.Errorf("input %s does not carry the shared field-input class: %s", field.id, tag)
+		}
+		if !strings.Contains(tag, `type="`+field.kind+`"`) {
+			t.Errorf("input %s is not type %s: %s", field.id, field.kind, tag)
+		}
+	}
+
+	// Each input needs a real label, which is also what keeps the field and its
+	// caption in one block so the spacing cannot collapse.
+	for _, id := range []string{
+		"auth-username", "auth-password",
+		"current-password", "new-password", "confirm-password",
+		"required-current-password", "required-new-password", "required-confirm-password",
+	} {
+		if !strings.Contains(page, `for="`+id+`"`) {
+			t.Errorf("input %s has no label bound to it", id)
+		}
+	}
+
+	// Every field must sit inside the wrapper that supplies its spacing, or the
+	// inputs run together with no gap.
+	for _, field := range fields {
+		if !hasAncestorIn(page, `id="`+field.id+`"`, `class="field"`) {
+			t.Errorf("input %s is not wrapped in the shared field block", field.id)
+		}
+	}
+}
+
+// The stylesheet must not style a form input by an id that the page no longer
+// has, which is how the login fields lost their box in the first place.
+func TestStylesheetHasNoStaleAuthSelectors(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/console/styles.css", nil)
+	response := httptest.NewRecorder()
+	Handler().ServeHTTP(response, request)
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	stylesheet := string(body)
+
+	// #auth-token was the single management-token input the login form used
+	// before it collected a username and a password.
+	if strings.Contains(stylesheet, "#auth-token") {
+		t.Error("stylesheet still styles the removed #auth-token input")
+	}
+	// The shared rules the fields depend on have to exist, since removing them
+	// while the classes stay in the markup is a silent regression.
+	for _, wanted := range []string{".field-input", ".field-input:focus", ".field-label"} {
+		if !strings.Contains(stylesheet, wanted) {
+			t.Errorf("stylesheet is missing the shared rule %q", wanted)
+		}
+	}
+}
+
+// openingTagOf returns the markup of the opening tag containing marker.
+func openingTagOf(t *testing.T, page, marker string) string {
+	t.Helper()
+	start := strings.Index(page, marker)
+	if start == -1 {
+		t.Fatalf("marker %q not found", marker)
+	}
+	open := strings.LastIndex(page[:start], "<")
+	end := strings.Index(page[start:], ">")
+	if open == -1 || end == -1 {
+		t.Fatalf("marker %q is not inside an opening tag", marker)
+	}
+	return page[open : start+end]
+}
+
+// hasAncestorIn reports whether an opening tag for ancestor appears before
+// marker and is still open at that point. The console markup keeps each field
+// in its own block, so the nearest preceding ancestor tag is enough.
+func hasAncestorIn(page, marker, ancestor string) bool {
+	start := strings.Index(page, marker)
+	if start == -1 {
+		return false
+	}
+	ancestorStart := strings.LastIndex(page[:start], ancestor)
+	if ancestorStart == -1 {
+		return false
+	}
+	// The ancestor must not have been closed again before the marker.
+	return strings.LastIndex(page[:start], "</div>") < ancestorStart
 }
 
 // A credential must not be persisted by the console itself: the session is an

@@ -277,7 +277,9 @@ The management console is a self-contained, embedded web UI served directly by t
 gateway binary. It requires no separate build step, static file directory, or Node
 runtime. Open it in a browser, sign in with the administrator account, and the
 dashboard shows gateway readiness and uptime, circuit-breaker state, upstream
-channels, and routable models, refreshing itself every ten seconds.
+channels, and routable models, refreshing itself every ten seconds. The interface is
+in Simplified Chinese; the endpoints it calls are unchanged, and the gateway's own
+error codes stay stable for automation while the console renders them in Chinese.
 
 The console page itself is unauthenticated so it can render the sign-in form; every
 data request it makes goes to the authenticated management endpoints below. Sign-in
@@ -302,7 +304,7 @@ SHA-256 of the password first and the full value stays significant.
 
 ### Change or recover the password
 
-Change it from **Settings** (the gear in the top bar) inside the console. The form
+Change it from the account page, reached from the gear (设置) in the top bar. The form
 requires the current password, so a stolen session cookie alone cannot lock the
 operator out, and it disables autofill so a password manager cannot silently rotate
 the stored credential. Sessions survive the change, so you stay signed in.

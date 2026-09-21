@@ -1,11 +1,11 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <meta name="robots" content="noindex, nofollow">
-  <title>Fluxgate Console</title>
+  <title>Fluxgate 管理台</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 1.8 20.4 6.7v9.8L12 21.4 3.6 16.5V6.7L12 1.8z' fill='%230b1220' stroke='%2338bdf8' stroke-width='1.6'/%3E%3Cpath d='M13.1 6.2 8.4 13h3.2l-.7 4.8 4.7-6.8h-3.2l.7-4.8z' fill='%2338bdf8'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="styles.css">
 </head>
@@ -16,7 +16,7 @@
     <div class="grid-overlay"></div>
   </div>
 
-  <!-- Shared paint server for the brand mark -->
+  <!-- 品牌图标共用的渐变定义 -->
   <svg class="sprite" aria-hidden="true" focusable="false">
     <defs>
       <linearGradient id="logo-gradient" x1="0" y1="0" x2="24" y2="24" gradientUnits="userSpaceOnUse">
@@ -26,7 +26,7 @@
     </defs>
   </svg>
 
-  <!-- Authentication gate -->
+  <!-- 登录验证 -->
   <div id="auth-overlay" class="auth-overlay">
     <div class="auth-card" role="dialog" aria-labelledby="auth-title">
       <div class="auth-logo">
@@ -35,26 +35,30 @@
           <path class="logo-bolt" d="M13.1 6.2 8.4 13h3.2l-.7 4.8 4.7-6.8h-3.2l.7-4.8z"/>
         </svg>
       </div>
-      <h1 id="auth-title">Gateway Console</h1>
-      <p class="auth-subtitle">Fluxgate &middot; management access</p>
+      <h1 id="auth-title">网关管理台</h1>
+      <p class="auth-subtitle">Fluxgate &middot; 管理入口</p>
       <form id="auth-form" autocomplete="on">
-        <label class="auth-label" for="auth-username">Username</label>
-        <input id="auth-username" type="text" name="username" spellcheck="false"
-               autocomplete="username" placeholder="admin" required>
-        <label class="auth-label" for="auth-password">Password</label>
-        <input id="auth-password" type="password" name="password" spellcheck="false"
-               autocomplete="current-password" placeholder="••••••••••••" required>
+        <div class="field">
+          <label class="field-label" for="auth-username">用户名</label>
+          <input id="auth-username" class="field-input" type="text" name="username" spellcheck="false"
+                 autocomplete="username" placeholder="admin" required>
+        </div>
+        <div class="field">
+          <label class="field-label" for="auth-password">密码</label>
+          <input id="auth-password" class="field-input" type="password" name="password" spellcheck="false"
+                 autocomplete="current-password" placeholder="••••••••••••" required>
+        </div>
         <button id="auth-submit" type="submit" class="btn btn-primary btn-block">
-          <span class="btn-label">Sign in</span>
+          <span class="btn-label">登录</span>
         </button>
         <p id="auth-error" class="auth-error" role="alert" hidden></p>
-        <p class="auth-hint">A fresh deployment starts with <code>admin</code> /
-          <code>admin</code> and asks for a new password at first sign-in.</p>
+        <p class="auth-hint">全新部署的初始账号为 <code>admin</code> /
+          <code>admin</code>，首次登录时会要求设置新密码。</p>
       </form>
     </div>
   </div>
 
-  <!-- Console -->
+  <!-- 管理台 -->
   <div id="app" class="app" hidden>
     <header class="topbar">
       <div class="topbar-inner">
@@ -65,26 +69,26 @@
           </svg>
           <div class="brand-text">
             <span class="brand-name">Fluxgate</span>
-            <span class="brand-sub">Management Console</span>
+            <span class="brand-sub">管理台</span>
           </div>
         </div>
         <div class="topbar-actions">
-          <span id="topbar-uptime" class="uptime" data-uptime title="Process uptime">&mdash;</span>
+          <span id="topbar-uptime" class="uptime" data-uptime title="进程运行时长">&mdash;</span>
           <span id="topbar-status" class="status-pill status-unknown" data-status>
-            <span class="status-dot" aria-hidden="true"></span><span data-status-label>Connecting</span>
+            <span class="status-dot" aria-hidden="true"></span><span data-status-label>连接中</span>
           </span>
-          <button id="settings-button" class="btn btn-ghost btn-icon" type="button" title="Settings" aria-label="Settings">
+          <button id="settings-button" class="btn btn-ghost btn-icon" type="button" title="设置" aria-label="设置">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z" fill="none" stroke="currentColor" stroke-width="1.7"/>
               <path d="M19.4 13a7.6 7.6 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7.6 7.6 0 0 0-1.7-1L15 3.4h-4l-.3 2.6a7.6 7.6 0 0 0-1.7 1l-2.4-1-2 3.4L6.6 11a7.6 7.6 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7.6 7.6 0 0 0 1.7 1l.3 2.6h4l.3-2.6a7.6 7.6 0 0 0 1.7-1l2.4 1 2-3.4-2-1.6z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
             </svg>
           </button>
-          <button id="refresh-button" class="btn btn-ghost btn-icon" type="button" title="Refresh now" aria-label="Refresh now">
+          <button id="refresh-button" class="btn btn-ghost btn-icon" type="button" title="立即刷新" aria-label="立即刷新">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M20 12a8 8 0 1 1-2.34-5.66M20 3v5h-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
             </svg>
           </button>
-          <button id="signout-button" class="btn btn-ghost btn-icon" type="button" title="Sign out" aria-label="Sign out">
+          <button id="signout-button" class="btn btn-ghost btn-icon" type="button" title="退出登录" aria-label="退出登录">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M15 3h4a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1h-4M10 17l5-5-5-5M15 12H3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
             </svg>
@@ -100,21 +104,21 @@
           <path d="M12 2.5 22 20H2L12 2.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
         </svg>
         <div class="banner-body">
-          <strong data-banner-title>Request failed</strong>
+          <strong data-banner-title>请求失败</strong>
           <span data-banner-detail></span>
         </div>
-        <button id="banner-retry" class="btn btn-ghost" type="button">Retry</button>
+        <button id="banner-retry" class="btn btn-ghost" type="button">重试</button>
       </div>
 
-      <section class="stats-grid" aria-label="Overview">
+      <section class="stats-grid" aria-label="概览">
         <article class="stat-card" data-stat="service">
           <div class="stat-icon">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l2.5-6 4 12L16 12h5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </div>
           <div class="stat-body">
-            <span class="stat-label">Gateway</span>
+            <span class="stat-label">网关</span>
             <span class="stat-value" data-value>&mdash;</span>
-            <span class="stat-sub" data-sub>service status</span>
+            <span class="stat-sub" data-sub>服务状态</span>
           </div>
         </article>
         <article class="stat-card" data-stat="models">
@@ -122,9 +126,9 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
           </div>
           <div class="stat-body">
-            <span class="stat-label">Models</span>
+            <span class="stat-label">模型</span>
             <span class="stat-value" data-value>&mdash;</span>
-            <span class="stat-sub" data-sub>routable</span>
+            <span class="stat-sub" data-sub>可路由</span>
           </div>
         </article>
         <article class="stat-card" data-stat="channels">
@@ -132,9 +136,9 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.5" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="18" cy="6" r="2.5" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="18" r="2.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M6 8.5v1a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3v-1M12 12.5v3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
           </div>
           <div class="stat-body">
-            <span class="stat-label">Channels</span>
+            <span class="stat-label">通道</span>
             <span class="stat-value" data-value>&mdash;</span>
-            <span class="stat-sub" data-sub>upstream routes</span>
+            <span class="stat-sub" data-sub>上游路由</span>
           </div>
         </article>
         <article class="stat-card" data-stat="breakers">
@@ -142,9 +146,9 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.8 20 6.3v5.2c0 5-3.4 8.1-8 9.7-4.6-1.6-8-4.7-8-9.7V6.3l8-3.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="m8.8 12 2.2 2.2 4.2-4.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </div>
           <div class="stat-body">
-            <span class="stat-label">Breakers</span>
+            <span class="stat-label">熔断器</span>
             <span class="stat-value" data-value>&mdash;</span>
-            <span class="stat-sub" data-sub>open / tracked</span>
+            <span class="stat-sub" data-sub>熔断 / 跟踪</span>
           </div>
         </article>
       </section>
@@ -153,22 +157,22 @@
         <header class="panel-header">
           <div class="panel-title">
             <span class="title-tick" aria-hidden="true"></span>
-            <h2>Circuit Breakers</h2>
+            <h2>熔断状态</h2>
             <span class="panel-meta" data-meta></span>
           </div>
-          <span class="panel-note">auto-refreshes every 10s &middot; <span data-next-refresh>&mdash;</span></span>
+          <span class="panel-note">每 10 秒自动刷新 &middot; <span data-next-refresh>&mdash;</span></span>
         </header>
         <div class="table-wrap">
           <table class="data-table" data-breakers-table>
             <thead>
               <tr>
-                <th>Scope</th>
-                <th>Channel</th>
-                <th>Key</th>
-                <th>Model</th>
-                <th class="num">Failures</th>
-                <th class="num">Level</th>
-                <th>State</th>
+                <th>作用域</th>
+                <th>通道</th>
+                <th>密钥</th>
+                <th>模型</th>
+                <th class="num">失败次数</th>
+                <th class="num">熔断级别</th>
+                <th>状态</th>
               </tr>
             </thead>
             <tbody data-breakers-body></tbody>
@@ -176,7 +180,7 @@
         </div>
         <div class="empty-state" data-breakers-empty hidden>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.8 20 6.3v5.2c0 5-3.4 8.1-8 9.7-4.6-1.6-8-4.7-8-9.7V6.3l8-3.5z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="m8.8 12 2.2 2.2 4.2-4.4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          <p>All circuits healthy &mdash; no open breakers</p>
+          <p>所有线路正常 &mdash; 没有熔断的通道</p>
         </div>
       </section>
 
@@ -184,23 +188,23 @@
         <header class="panel-header">
           <div class="panel-title">
             <span class="title-tick" aria-hidden="true"></span>
-            <h2>Upstream Channels</h2>
+            <h2>上游通道</h2>
             <span class="panel-meta" data-meta></span>
           </div>
-          <span class="panel-note">sorted by priority</span>
+          <span class="panel-note">按优先级排序</span>
         </header>
         <div class="table-wrap">
           <table class="data-table" data-channels-table>
             <thead>
               <tr>
-                <th>Channel</th>
-                <th>Status</th>
-                <th class="num">Priority</th>
-                <th class="num">Weight</th>
-                <th>Strategy</th>
-                <th>Breaker</th>
-                <th>Proxy</th>
-                <th class="num">Mappings</th>
+                <th>通道</th>
+                <th>状态</th>
+                <th class="num">优先级</th>
+                <th class="num">权重</th>
+                <th>路由策略</th>
+                <th>熔断模式</th>
+                <th>代理</th>
+                <th class="num">映射数</th>
               </tr>
             </thead>
             <tbody data-channels-body></tbody>
@@ -208,7 +212,7 @@
         </div>
         <div class="empty-state" data-channels-empty hidden>
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.5" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="18" cy="6" r="2.5" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="12" cy="18" r="2.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M6 8.5v1a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3v-1M12 12.5v3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-          <p>No upstream channels configured</p>
+          <p>尚未配置上游通道</p>
         </div>
       </section>
 
@@ -216,120 +220,124 @@
         <header class="panel-header">
           <div class="panel-title">
             <span class="title-tick" aria-hidden="true"></span>
-            <h2>Models</h2>
+            <h2>模型</h2>
             <span class="panel-meta" data-meta></span>
           </div>
-          <input id="model-filter" class="filter-input" type="search" placeholder="Filter models&hellip;" aria-label="Filter models">
+          <input id="model-filter" class="filter-input" type="search" placeholder="筛选模型…" aria-label="筛选模型">
         </header>
         <div class="chip-cloud" data-models-cloud></div>
         <div class="empty-state" data-models-empty hidden>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
-          <p>No models match the filter</p>
+          <p data-models-empty-text>没有可路由的模型</p>
         </div>
       </section>
 
       <footer class="console-footer">
-        <span data-footer-generated>snapshot: &mdash;</span>
-        <span data-footer-loaded>config loaded: &mdash;</span>
-        <span class="footer-brand">fluxgate console</span>
+        <span data-footer-generated>快照时间：&mdash;</span>
+        <span data-footer-loaded>配置加载：&mdash;</span>
+        <span class="footer-brand">fluxgate 管理台</span>
       </footer>
     </main>
 
-    <!-- Settings: a separate view inside the signed-in app, reached from the
-         gear in the top bar. The password form opts out of autofill because a
-         password manager filling it silently would rotate the stored credential
-         without the operator noticing. -->
+    <!-- 设置：已登录应用内的第二个视图，从顶栏的齿轮进入。密码表单显式关闭
+         自动填充，否则密码管理器静默填入会直接改掉存储的凭据。 -->
     <main id="settings-view" class="container" hidden>
       <section class="panel">
         <header class="panel-header">
           <div class="panel-title">
             <span class="title-tick" aria-hidden="true"></span>
-            <h2>Account</h2>
+            <h2>账号</h2>
           </div>
-          <button id="settings-back" class="btn btn-ghost" type="button">Back to dashboard</button>
+          <button id="settings-back" class="btn btn-ghost" type="button">返回概览</button>
         </header>
         <div class="settings-body">
           <p class="settings-note" id="settings-account"></p>
 
           <form id="password-form" class="settings-form"
                 action="about:blank" autocomplete="off" autocapitalize="off" spellcheck="false">
-            <!-- A dummy pair absorbs a password manager that ignores the form's
-                 autocomplete="off" and fills the first fields it finds. -->
+            <!-- 一对占位字段用于吸收忽略 autocomplete="off" 的密码管理器。 -->
             <input type="text" name="fake-username" autocomplete="username" hidden tabindex="-1" aria-hidden="true">
             <input type="password" name="fake-password" autocomplete="current-password" hidden tabindex="-1" aria-hidden="true">
 
-            <label class="settings-label" for="current-password">Current password</label>
-            <input id="current-password" name="current_password" type="password"
-                   autocomplete="new-password" data-1p-ignore data-lpignore="true"
-                   data-bwignore="true" data-form-type="other" required>
+            <div class="field">
+              <label class="field-label" for="current-password">当前密码</label>
+              <input id="current-password" class="field-input" name="current_password" type="password"
+                     autocomplete="new-password" data-1p-ignore data-lpignore="true"
+                     data-bwignore="true" data-form-type="other" required>
+            </div>
 
-            <label class="settings-label" for="new-password">New password</label>
-            <input id="new-password" name="new_password" type="password"
-                   autocomplete="new-password" data-1p-ignore data-lpignore="true"
-                   data-bwignore="true" data-form-type="other" required>
+            <div class="field">
+              <label class="field-label" for="new-password">新密码</label>
+              <input id="new-password" class="field-input" name="new_password" type="password"
+                     autocomplete="new-password" data-1p-ignore data-lpignore="true"
+                     data-bwignore="true" data-form-type="other" required>
+            </div>
 
-            <label class="settings-label" for="confirm-password">Confirm new password</label>
-            <input id="confirm-password" name="confirm_password" type="password"
-                   autocomplete="new-password" data-1p-ignore data-lpignore="true"
-                   data-bwignore="true" data-form-type="other" required>
+            <div class="field">
+              <label class="field-label" for="confirm-password">确认新密码</label>
+              <input id="confirm-password" class="field-input" name="confirm_password" type="password"
+                     autocomplete="new-password" data-1p-ignore data-lpignore="true"
+                     data-bwignore="true" data-form-type="other" required>
+            </div>
 
             <p id="password-feedback" class="settings-feedback" role="alert" hidden></p>
 
             <div class="settings-actions">
               <button id="password-submit" type="submit" class="btn btn-primary">
-                <span class="btn-label">Change password</span>
+                <span class="btn-label">修改密码</span>
               </button>
-              <button id="password-cancel" type="button" class="btn btn-ghost">Cancel</button>
+              <button id="password-cancel" type="button" class="btn btn-ghost">取消</button>
             </div>
-            <p class="settings-hint">There is no minimum length: choose whatever
-              your deployment needs. Changing the password keeps you signed in on
-              this browser.</p>
+            <p class="settings-hint">密码没有最小长度限制，按你的部署需要设置即可。修改密码后，当前浏览器会保持登录状态。</p>
           </form>
         </div>
       </section>
     </main>
   </div>
 
-  <!-- Forced password change. Shown when the account still holds the built-in
-       default password, which the gateway refuses to serve data to. It is a
-       modal over the whole app because nothing behind it is reachable yet. -->
+  <!-- 强制修改密码。当账号仍在使用内置默认密码时显示，此时网关拒绝提供任何
+       数据。因为它覆盖整个应用，所以采用模态形式。 -->
   <div id="password-required" hidden>
     <div class="settings-card" role="dialog" aria-labelledby="password-required-title">
       <div class="settings-card-body">
-        <h2 id="password-required-title" class="settings-title">Set a new password</h2>
-        <p class="settings-note">This gateway still uses the default password, so
-          no gateway data is served until it is changed.</p>
+        <h2 id="password-required-title" class="settings-title">设置新密码</h2>
+        <p class="settings-note">本网关仍在使用默认密码，在修改之前不会提供任何网关数据。</p>
 
         <form id="required-password-form" class="settings-form"
               action="about:blank" autocomplete="off" autocapitalize="off" spellcheck="false">
           <input type="text" name="fake-username" autocomplete="username" hidden tabindex="-1" aria-hidden="true">
           <input type="password" name="fake-password" autocomplete="current-password" hidden tabindex="-1" aria-hidden="true">
 
-          <label class="settings-label" for="required-current-password">Current password</label>
-          <input id="required-current-password" name="current_password" type="password"
-                 autocomplete="new-password" data-1p-ignore data-lpignore="true"
-                 data-bwignore="true" data-form-type="other" required>
+          <div class="field">
+            <label class="field-label" for="required-current-password">当前密码</label>
+            <input id="required-current-password" class="field-input" name="current_password" type="password"
+                   autocomplete="new-password" data-1p-ignore data-lpignore="true"
+                   data-bwignore="true" data-form-type="other" required>
+          </div>
 
-          <label class="settings-label" for="required-new-password">New password</label>
-          <input id="required-new-password" name="new_password" type="password"
-                 autocomplete="new-password" data-1p-ignore data-lpignore="true"
-                 data-bwignore="true" data-form-type="other" required>
+          <div class="field">
+            <label class="field-label" for="required-new-password">新密码</label>
+            <input id="required-new-password" class="field-input" name="new_password" type="password"
+                   autocomplete="new-password" data-1p-ignore data-lpignore="true"
+                   data-bwignore="true" data-form-type="other" required>
+          </div>
 
-          <label class="settings-label" for="required-confirm-password">Confirm new password</label>
-          <input id="required-confirm-password" name="confirm_password" type="password"
-                 autocomplete="new-password" data-1p-ignore data-lpignore="true"
-                 data-bwignore="true" data-form-type="other" required>
+          <div class="field">
+            <label class="field-label" for="required-confirm-password">确认新密码</label>
+            <input id="required-confirm-password" class="field-input" name="confirm_password" type="password"
+                   autocomplete="new-password" data-1p-ignore data-lpignore="true"
+                   data-bwignore="true" data-form-type="other" required>
+          </div>
 
           <p id="required-password-feedback" class="settings-feedback" role="alert" hidden></p>
 
           <div class="settings-actions">
             <button id="required-password-submit" type="submit" class="btn btn-primary">
-              <span class="btn-label">Set password</span>
+              <span class="btn-label">设置密码</span>
             </button>
-            <button id="required-signout" type="button" class="btn btn-ghost">Sign out</button>
+            <button id="required-signout" type="button" class="btn btn-ghost">退出登录</button>
           </div>
-          <p class="settings-hint">There is no minimum length: choose whatever
-            your deployment needs.</p>
+          <p class="settings-hint">密码没有最小长度限制，按你的部署需要设置即可。</p>
         </form>
       </div>
     </div>
