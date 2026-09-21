@@ -318,77 +318,92 @@
       </section>
     </main>
 
-    <!-- ===== 设置：账号、运行策略与代理 ===== -->
+    <!-- ===== 设置：按功能分成账号、运行策略、代理三个子页 =====
+         每个子页是一个 data-settings-panel，只有一个可见；子页导航由脚本切换。 -->
     <main class="container" data-view-panel="settings" id="settings-view" hidden>
-      <section class="panel">
-        <header class="panel-header">
-          <div class="panel-title">
-            <span class="title-tick" aria-hidden="true"></span>
-            <h2>账号</h2>
+      <nav class="settings-nav" id="settings-nav" aria-label="设置分类">
+        <button class="settings-tab is-active" type="button" data-settings-view="account" aria-current="page">账号</button>
+        <button class="settings-tab" type="button" data-settings-view="policy">运行策略</button>
+        <button class="settings-tab" type="button" data-settings-view="proxies">代理</button>
+      </nav>
+
+      <!-- 子页：账号 -->
+      <div data-settings-panel="account">
+        <section class="panel">
+          <header class="panel-header">
+            <div class="panel-title">
+              <span class="title-tick" aria-hidden="true"></span>
+              <h2>账号</h2>
+            </div>
+          </header>
+          <div class="settings-body">
+            <p class="settings-note" id="settings-account"></p>
+
+            <form id="password-form" class="settings-form"
+                  action="about:blank" autocomplete="off" autocapitalize="off" spellcheck="false">
+              <!-- 一对占位字段用于吸收忽略 autocomplete="off" 的密码管理器。 -->
+              <input type="text" name="fake-username" autocomplete="username" hidden tabindex="-1" aria-hidden="true">
+              <input type="password" name="fake-password" autocomplete="current-password" hidden tabindex="-1" aria-hidden="true">
+
+              <div class="field">
+                <label class="field-label" for="current-password">当前密码</label>
+                <input id="current-password" class="field-input" name="current_password" type="password"
+                       autocomplete="new-password" data-1p-ignore data-lpignore="true"
+                       data-bwignore="true" data-form-type="other" required>
+              </div>
+
+              <div class="field">
+                <label class="field-label" for="new-password">新密码</label>
+                <input id="new-password" class="field-input" name="new_password" type="password"
+                       autocomplete="new-password" data-1p-ignore data-lpignore="true"
+                       data-bwignore="true" data-form-type="other" required>
+              </div>
+
+              <div class="field">
+                <label class="field-label" for="confirm-password">确认新密码</label>
+                <input id="confirm-password" class="field-input" name="confirm_password" type="password"
+                       autocomplete="new-password" data-1p-ignore data-lpignore="true"
+                       data-bwignore="true" data-form-type="other" required>
+              </div>
+
+              <p id="password-feedback" class="settings-feedback" role="alert" hidden></p>
+
+              <div class="settings-actions">
+                <button id="password-submit" type="submit" class="btn btn-primary">
+                  <span class="btn-label">修改密码</span>
+                </button>
+                <button id="password-cancel" type="button" class="btn btn-ghost">取消</button>
+              </div>
+              <p class="settings-hint">密码没有最小长度限制，按你的部署需要设置即可。修改密码后，当前浏览器会保持登录状态。</p>
+            </form>
           </div>
-        </header>
-        <div class="settings-body">
-          <p class="settings-note" id="settings-account"></p>
+        </section>
+      </div>
 
-          <form id="password-form" class="settings-form"
-                action="about:blank" autocomplete="off" autocapitalize="off" spellcheck="false">
-            <!-- 一对占位字段用于吸收忽略 autocomplete="off" 的密码管理器。 -->
-            <input type="text" name="fake-username" autocomplete="username" hidden tabindex="-1" aria-hidden="true">
-            <input type="password" name="fake-password" autocomplete="current-password" hidden tabindex="-1" aria-hidden="true">
-
-            <div class="field">
-              <label class="field-label" for="current-password">当前密码</label>
-              <input id="current-password" class="field-input" name="current_password" type="password"
-                     autocomplete="new-password" data-1p-ignore data-lpignore="true"
-                     data-bwignore="true" data-form-type="other" required>
-            </div>
-
-            <div class="field">
-              <label class="field-label" for="new-password">新密码</label>
-              <input id="new-password" class="field-input" name="new_password" type="password"
-                     autocomplete="new-password" data-1p-ignore data-lpignore="true"
-                     data-bwignore="true" data-form-type="other" required>
-            </div>
-
-            <div class="field">
-              <label class="field-label" for="confirm-password">确认新密码</label>
-              <input id="confirm-password" class="field-input" name="confirm_password" type="password"
-                     autocomplete="new-password" data-1p-ignore data-lpignore="true"
-                     data-bwignore="true" data-form-type="other" required>
-            </div>
-
-            <p id="password-feedback" class="settings-feedback" role="alert" hidden></p>
-
-            <div class="settings-actions">
-              <button id="password-submit" type="submit" class="btn btn-primary">
-                <span class="btn-label">修改密码</span>
-              </button>
-              <button id="password-cancel" type="button" class="btn btn-ghost">取消</button>
-            </div>
-            <p class="settings-hint">密码没有最小长度限制，按你的部署需要设置即可。修改密码后，当前浏览器会保持登录状态。</p>
-          </form>
-        </div>
-      </section>
-
-      <!-- 运行策略：故障转移、重试与熔断冷却。字段由网关返回的定义生成，
+      <!-- 子页：运行策略。故障转移、重试与熔断冷却。字段由网关返回的定义生成，
            这里只提供容器，所以新增一个策略项不必改页面。 -->
-      <div id="policy-panels"></div>
+      <div data-settings-panel="policy" hidden>
+        <div id="policy-panels"></div>
+      </div>
 
-      <section class="panel" data-management="proxies">
-        <header class="panel-header">
-          <div class="panel-title">
-            <span class="title-tick" aria-hidden="true"></span>
-            <h2>代理</h2>
-            <span class="panel-meta" data-meta></span>
+      <!-- 子页：代理 -->
+      <div data-settings-panel="proxies" hidden>
+        <section class="panel" data-management="proxies">
+          <header class="panel-header">
+            <div class="panel-title">
+              <span class="title-tick" aria-hidden="true"></span>
+              <h2>代理</h2>
+              <span class="panel-meta" data-meta></span>
+            </div>
+            <button class="btn btn-primary" type="button" data-create="proxies">添加代理</button>
+          </header>
+          <p class="panel-help">网关到上游的出口代理。上游自己的代理地址优先，其次是这里标记为默认的代理，最后才是直连。</p>
+          <div class="table-wrap">
+            <table class="data-table" data-table="proxies"><tbody data-body="proxies"></tbody></table>
           </div>
-          <button class="btn btn-primary" type="button" data-create="proxies">添加代理</button>
-        </header>
-        <p class="panel-help">网关到上游的出口代理。上游自己的代理地址优先，其次是这里标记为默认的代理，最后才是直连。</p>
-        <div class="table-wrap">
-          <table class="data-table" data-table="proxies"><tbody data-body="proxies"></tbody></table>
-        </div>
-        <div class="empty-state" data-empty="proxies" hidden><p data-empty-text>还没有代理。</p></div>
-      </section>
+          <div class="empty-state" data-empty="proxies" hidden><p data-empty-text>还没有代理。</p></div>
+        </section>
+      </div>
     </main>
   </div>
 

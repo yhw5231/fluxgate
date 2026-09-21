@@ -363,6 +363,70 @@ func TestConsoleHasSettingsViewWithPasswordForm(t *testing.T) {
 	}
 }
 
+// The settings view is grouped by function: the account, the runtime policy and
+// the proxies are separate panels, and the bar inside the view switches between
+// them, so no single page carries all three at once.
+func TestConsoleGroupsSettingsByFunction(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/console/", nil)
+	response := httptest.NewRecorder()
+	Handler().ServeHTTP(response, request)
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	page := string(body)
+
+	if !strings.Contains(page, `id="settings-nav"`) {
+		t.Error("console settings view has no sub navigation")
+	}
+	for _, group := range []string{"account", "policy", "proxies"} {
+		for _, wanted := range []string{
+			`data-settings-panel="` + group + `"`,
+			`data-settings-view="` + group + `"`,
+		} {
+			if !strings.Contains(page, wanted) {
+				t.Errorf("console settings view is missing %q", wanted)
+			}
+		}
+	}
+	// Only the first group is open before the script runs, so the others have to
+	// carry the hidden attribute in the markup rather than relying on the script.
+	for _, group := range []string{"policy", "proxies"} {
+		if !strings.Contains(page, `data-settings-panel="`+group+`" hidden`) {
+			t.Errorf("console settings group %q is not closed in the markup", group)
+		}
+	}
+	if strings.Contains(page, `data-settings-panel="account" hidden`) {
+		t.Error("console settings opens on a group the script has to reveal")
+	}
+}
+
+// The settings sub navigation is switched by the script, so the script has to
+// know the groups and carry the function that shows one.
+func TestConsoleScriptSwitchesSettingsGroups(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/console/app.js", nil)
+	response := httptest.NewRecorder()
+	Handler().ServeHTTP(response, request)
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	script := string(body)
+
+	for _, wanted := range []string{
+		"SETTINGS_VIEWS",
+		"showSettingsView(",
+		"'[data-settings-panel]'",
+		"'settings-nav'",
+	} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("console script is missing %q", wanted)
+		}
+	}
+}
+
 // Adding and editing configuration is the console's second job, so the page has
 // to carry a view and a create button per managed resource, and the dialog the
 // editor form renders into.

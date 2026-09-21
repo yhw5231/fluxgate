@@ -29,8 +29,14 @@
   var VIEWS = ['overview', 'upstream', 'routes', 'keys', 'settings'];
   var MANAGEMENT_VIEWS = { upstream: true, routes: true, keys: true, settings: true };
 
+  /* The settings view groups its panels by function and shows one group at a
+   * time, so no single page carries the account, the runtime policy and the
+   * proxies at once. */
+  var SETTINGS_VIEWS = ['account', 'policy', 'proxies'];
+
   var state = {
     view: 'overview',
+    settingsView: 'account',
     snapshot: null,
     configuration: null,
     configurationError: null,
@@ -69,6 +75,8 @@
     // views, because the settings page is a sibling of the dashboard rather than
     // a separate page load.
     els.settingsView = $('settings-view');
+    els.settingsNav = $('settings-nav');
+    els.settingsPanels = document.querySelectorAll('[data-settings-panel]');
     els.settingsAccount = $('settings-account');
     els.passwordForm = $('password-form');
     els.currentPassword = $('current-password');
@@ -624,6 +632,7 @@
         : '已登录。';
       resetPasswordForm(els.passwordForm, els.currentPassword, els.newPassword,
         els.confirmPassword, els.passwordFeedback);
+      showSettingsView(state.settingsView);
       els.currentPassword.focus();
     }
     // Only the overview is a live view: a management form must not be repainted
@@ -634,6 +643,26 @@
       stopAutoRefresh();
     }
     if (MANAGEMENT_VIEWS[name] && !state.configuration) { refresh(); }
+  }
+
+  /* showSettingsView switches the group of settings on screen. The password
+   * form is not reset here: an operator who steps over to the proxies and comes
+   * back finds what they had typed, and only entering the settings view afresh
+   * starts the form over. */
+  function showSettingsView(name) {
+    if (SETTINGS_VIEWS.indexOf(name) === -1) { name = 'account'; }
+    state.settingsView = name;
+    for (var index = 0; index < els.settingsPanels.length; index++) {
+      var panel = els.settingsPanels[index];
+      panel.hidden = panel.getAttribute('data-settings-panel') !== name;
+    }
+    var buttons = els.settingsNav.querySelectorAll('[data-settings-view]');
+    for (var buttonIndex = 0; buttonIndex < buttons.length; buttonIndex++) {
+      var button = buttons[buttonIndex];
+      var active = button.getAttribute('data-settings-view') === name;
+      button.classList.toggle('is-active', active);
+      button.setAttribute('aria-current', active ? 'page' : 'false');
+    }
   }
 
   function signOut() {
@@ -2652,6 +2681,12 @@
       if (!button) { return; }
       showView(button.getAttribute('data-view'));
       refresh();
+    });
+
+    els.settingsNav.addEventListener('click', function (event) {
+      var button = event.target.closest('[data-settings-view]');
+      if (!button) { return; }
+      showSettingsView(button.getAttribute('data-settings-view'));
     });
 
     document.querySelectorAll('[data-create]').forEach(function (button) {

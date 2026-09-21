@@ -292,8 +292,9 @@ configuration and hands the result to the routing engine, so an upstream added i
 the console serves traffic on the next request.
 
 The views are 概览 (the live dashboard), 上游 (upstreams), 路由 (the routing table
-the gateway derived, shown read-only), 客户端密钥 (client keys), and 设置 (the
-administrator account, the runtime policy, and proxy profiles).
+the gateway derived, shown read-only), 客户端密钥 (client keys), and 设置. The
+settings view is grouped by function and shows one group at a time: 账号 (the
+administrator account), 运行策略 (the runtime policy), and 代理 (proxy profiles).
 
 The upstream form is built around the four things that actually vary between
 upstreams:
@@ -371,10 +372,10 @@ SHA-256 of the password first and the full value stays significant.
 
 ### Change or recover the password
 
-Change it from the account page, reached from the gear (设置) in the top bar. The form
-requires the current password, so a stolen session cookie alone cannot lock the
-operator out, and it disables autofill so a password manager cannot silently rotate
-the stored credential. Sessions survive the change, so you stay signed in.
+Change it from 设置 → 账号 in the top bar. The form requires the current password,
+so a stolen session cookie alone cannot lock the operator out, and it disables
+autofill so a password manager cannot silently rotate the stored credential.
+Sessions survive the change, so you stay signed in.
 
 To set the password without the console — before first use, or to recover a lost one —
 use the CLI on the host that holds the database:
@@ -669,7 +670,7 @@ Channel-specific breaker modes loaded from the existing configuration can overri
 ### Runtime policy
 
 The retry, failover, and circuit-breaker settings above can be changed while the
-gateway runs, from the console's 设置 page. A change is stored in the configuration
+gateway runs, from 设置 → 运行策略 in the console. A change is stored in the configuration
 database's `settings` table under a `gateway.`-prefixed key, is additive to whatever
 else that shared table holds, and takes effect for the next request rather than at the
 next restart. Clearing a value removes its row, which puts the environment's value
