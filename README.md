@@ -137,13 +137,21 @@ On Linux or macOS:
 cp .env.example .env
 ```
 
-Then edit `.env` and set `FLUXGATE_MANAGEMENT_TOKEN` to a strong random secret. Generate one with OpenSSL (available in Git Bash on Windows and on Linux):
+Then edit `.env` and set `FLUXGATE_ADMIN_PASSWORD` to the console administrator password
+(at least 12 characters). The container entrypoint creates the account with it on first
+start, so the console is usable as soon as the gateway is up. Remove the variable from
+`.env` afterwards; it has no effect once the account exists.
+
+`FLUXGATE_MANAGEMENT_TOKEN` is optional and no longer used for console sign-in. Set it
+only if scripts or automation need to call the management endpoints directly. Generate
+one with OpenSSL (available in Git Bash on Windows and on Linux):
 
 ```bash
 openssl rand -hex 32
 ```
 
-The token is required: management endpoints and the console answer `503 management_auth_not_configured` while it is empty. Adjust `FLUXGATE_HOST_PORT` (default `8081`) and `FLUXGATE_DATA_DIR` (default `./data`) only if the defaults do not fit.
+Adjust `FLUXGATE_HOST_PORT` (default `8081`) and `FLUXGATE_DATA_DIR` (default `./data`)
+only if the defaults do not fit.
 
 ### Deploy with Docker Compose
 
@@ -168,7 +176,8 @@ curl http://127.0.0.1:8081/readyz
 ```
 
 Open the management console at `http://127.0.0.1:8081/console/` and sign in with the
-management token from `.env`.
+administrator password from `.env` (the account is created on first start when
+`FLUXGATE_ADMIN_PASSWORD` is set).
 
 Stop the service without deleting the mounted database:
 
@@ -213,7 +222,7 @@ docker run -d \
   --cap-add SETGID \
   -p 8081:8081 \
   -v "$(pwd)/data:/data" \
-  -e FLUXGATE_MANAGEMENT_TOKEN="replace-with-a-strong-secret" \
+  -e FLUXGATE_ADMIN_PASSWORD="replace-with-a-strong-password" \
   fluxgate:local
 ```
 
@@ -265,25 +274,109 @@ Management console:
 
 The management console is a self-contained, embedded web UI served directly by the
 gateway binary. It requires no separate build step, static file directory, or Node
-runtime. Open it in a browser and enter the configured management token to unlock
-the dashboard, which shows gateway readiness and uptime, circuit-breaker state,
-upstream channels, and routable models, and refreshes itself every ten seconds.
+runtime. Open it in a browser, sign in with the administrator account, and the
+dashboard shows gateway readiness and uptime, circuit-breaker state, upstream
+channels, and routable models, refreshing itself every ten seconds.
 
-The console page itself is unauthenticated so it can render the token prompt; every
-data request it makes goes to the token-protected management endpoints below. The
-token is held in the browser session only, and the panel is served with a strict
-Content-Security-Policy, `nosniff`, and framing protection.
+The console page itself is unauthenticated so it can render the sign-in form; every
+data request it makes goes to the authenticated management endpoints below. Sign-in
+issues an HTTP-only session cookie, so no credential is kept in JavaScript-accessible
+storage, and the panel is served with a strict Content-Security-Policy, `nosniff`,
+and framing protection.
+
+### Create the administrator account
+
+The console requires a single administrator account. Create it once, on the host that
+holds the database:
+
+```bash
+docker compose exec gateway /app/fluxgate admin create
+```
+
+Or for a binary deployment:
+
+```bash
+./fluxgate admin create --database ./data/hub.db
+```
+
+The password is read from a terminal prompt with echo disabled, so it never appears in
+the process list or your shell history. It must be at least 12 characters; bcrypt
+ignores input past 72 bytes, so longer passwords are rejected rather than silently
+truncated. Related commands:
+
+```bash
+./fluxgate admin status   # report whether an account exists
+./fluxgate admin reset    # replace the credential and revoke all sessions
+```
+
+Set `FLUXGATE_ADMIN_PASSWORD` to supply the password non-interactively. The container
+entrypoint uses it to create the account on first start, which is the convenient path
+for Compose; remove it from `.env` once the account exists. Until an account is
+created, sign-in answers `503 console_auth_not_configured` and the console says so.
+
+Sign-in is rate limited per client address: after 5 failed attempts further attempts
+are refused with `429` for 15 minutes, including attempts with the correct password.
+Every attempt is logged as `console_login_succeeded`, `console_login_failed`, or
+`console_login_locked`; passwords and session tokens are never logged.
 
 Management endpoints:
 
 - `GET /management/status`
 - `GET /management/snapshot`
+- `GET /management/session`
+- `POST /management/login`
+- `POST /management/logout`
 
-Management endpoints require the token configured through `FLUXGATE_MANAGEMENT_TOKEN`. Send it as either `Authorization: Bearer YOUR_MANAGEMENT_TOKEN` or `X-Management-Token: YOUR_MANAGEMENT_TOKEN`.
+`/management/session`, `/management/login`, and `/management/logout` manage the console
+session itself and are therefore not themselves protected by one. `/management/status`
+and `/management/snapshot` accept either a console session cookie or the configured
+management token, so existing automation keeps working. Send the token as either
+`Authorization: Bearer YOUR_MANAGEMENT_TOKEN` or `X-Management-Token: YOUR_MANAGEMENT_TOKEN`.
 
 When exposing the console through a reverse proxy, forward `/console/` alongside the
 management endpoints. The console is optional: gateways that only need the API surface
 can block the path entirely without affecting any other route.
+
+Any `GET` the gateway does not otherwise serve redirects to the console, so a bare domain
+(`https://gateway.example/`) and an unknown path such as `/admin` both open the console
+instead of returning a bare `404`. Requests under the API namespaces (`/v1/`,
+`/management/`, `/console/`) keep their `404`, because a mistyped endpoint is a client
+mistake rather than a browser navigation.
+
+The console is built to survive a proxy that mounts it under a path prefix and strips
+that prefix before forwarding: the redirect target is relative, and the console loads
+its assets and calls `/management/*` relative to the URL the page was served from. With
+this nginx configuration:
+
+```nginx
+location /gateway/ {
+    proxy_pass http://127.0.0.1:8081/;   # trailing slash strips the /gateway prefix
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    # Needed so https://host/gateway (no trailing slash) keeps the prefix.
+    proxy_set_header X-Forwarded-Prefix /gateway;
+}
+```
+
+`https://host/gateway/` redirects to `/gateway/console/`, which then loads
+`/gateway/console/styles.css`, `/gateway/console/app.js`, and `/gateway/management/*`.
+Because the redirect is resolved by the browser against the public URL, no
+`proxy_redirect` rewriting is needed, and the `/v1/...` and `/management/...` routes stay
+reachable as long as the proxy forwards them to the gateway.
+
+`X-Forwarded-Prefix` matters for the slash-less form. When a visitor opens `https://host/gateway`
+without the trailing slash, the browser treats `gateway` as a file name and resolves a
+relative redirect against the parent directory, which would drop the prefix and land on
+`/console/`. The proxy is the only party that still knows the public prefix, so it
+reports it in `X-Forwarded-Prefix` and the gateway uses it. A value that is not a plain
+absolute path (an absolute URL, a `..` segment, a backslash, or a CR/LF) is ignored and
+the relative form is used instead, so a forged header cannot redirect off-origin or
+inject a response header.
+
+Streaming responses (server-sent events) require proxy buffering to be off. Add
+`proxy_buffering off;` to the locations serving `/v1/chat/completions`,
+`/v1/responses`, or `/v1/messages` when clients send `stream: true`.
 
 Authenticated model and proxy endpoints:
 
@@ -401,6 +494,9 @@ models and minus models with no channel the key may use.
 
 - `FLUXGATE_ADDRESS`: HTTP listen address. Default: `:8081`.
 - `FLUXGATE_DATABASE_PATH`: Existing upstream SQLite database path. Default: `../data/hub.db`.
+- `FLUXGATE_MANAGEMENT_TOKEN`: Optional bearer token accepted by the management endpoints alongside a console session. Empty by default; console sign-in does not use it.
+- `FLUXGATE_ADMIN_PASSWORD`: Password for the console administrator account, at least 12 characters. The container entrypoint uses it with `admin create` on first start. Ignored once the account exists.
+- `FLUXGATE_ADMIN_USERNAME`: Username for the console administrator account. Default: `admin`.
 - `FLUXGATE_MAX_BODY_BYTES`: Maximum accepted JSON request body size. Default: 8 MiB.
 - `FLUXGATE_INTEGRITY_CHECK`: Run `PRAGMA quick_check` against the configuration database at startup and refuse to start when it fails. Default: `true`. Disable it only if start-up time on a very large database matters more than detecting a damaged file.
 
@@ -473,8 +569,11 @@ go test -race ./...
 
 - Do not place downstream or upstream API keys in URLs, command histories, logs, or screenshots.
 - The gateway does not return upstream API keys or authenticated proxy URLs through its operational endpoints.
-- The console HTML shell is served without authentication but contains no gateway data; channel names, priorities, and breaker state are only returned by the token-protected management endpoints.
-- Use a reverse proxy with TLS when exposing the gateway outside a trusted network.
+- The console HTML shell is served without authentication but contains no gateway data; channel names, priorities, and breaker state are only returned by the authenticated management endpoints.
+- The administrator password is stored as a bcrypt hash and never in plaintext; session tokens are stored only as SHA-256 hashes, so a leaked database cannot be replayed as a live session. Console sign-in is rate limited per client address and every attempt is logged.
+- Console sessions last 12 hours and are revoked by `admin reset` and by signing out. Set `FLUXGATE_MANAGEMENT_TOKEN` only when automation needs to call the management endpoints; leaving it unset means a console session is the only way in.
+- Use a reverse proxy with TLS when exposing the gateway outside a trusted network. Forward `X-Forwarded-Proto` so the session cookie is marked `Secure` behind TLS termination.
+- The gateway trusts `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Prefix` from its peer. Only place it behind a proxy that overwrites those headers, or the login rate limiter can be evaded by spoofing `X-Forwarded-For`. A forged `X-Forwarded-Prefix` cannot escape the origin — unsafe values are rejected — but an accepted one steers where the console redirect lands.
 - Restrict filesystem access to the SQLite database because it contains sensitive account and credential configuration.
 - Keep operational health endpoints separate from authenticated AI proxy endpoints when applying external access-control rules.
 

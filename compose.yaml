@@ -26,8 +26,12 @@ services:
       FLUXGATE_ADDRESS: ":8081"
       # 容器内 SQLite 数据库文件路径（对应下方挂载到 /data 的宿主机目录）
       FLUXGATE_DATABASE_PATH: "/data/hub.db"
-      # 管理端点/控制台的访问令牌，必填；为空时管理接口返回 503
+      # 管理端点/控制台的访问令牌，供脚本和自动化调用管理接口；留空则只接受账号会话
       FLUXGATE_MANAGEMENT_TOKEN: "${FLUXGATE_MANAGEMENT_TOKEN:-}"
+      # 首次启动自动创建控制台管理员账号的密码（至少 12 个字符）；
+      # 账号创建后此变量不再生效，可从 .env 移除
+      FLUXGATE_ADMIN_PASSWORD: "${FLUXGATE_ADMIN_PASSWORD:-}"
+      FLUXGATE_ADMIN_USERNAME: "${FLUXGATE_ADMIN_USERNAME:-admin}"
       # 启动时对共享 SQLite 数据库做完整性检查，发现损坏即拒绝启动（默认开启）
       FLUXGATE_INTEGRITY_CHECK: "${FLUXGATE_INTEGRITY_CHECK:-true}"
       # 请求体大小上限（字节），默认 8 MiB

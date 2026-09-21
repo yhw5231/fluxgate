@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -35,9 +36,12 @@ type BreakerSnapshotter interface {
 
 // Server exposes OpenAI-compatible proxy routes and operational endpoints.
 type Server struct {
-	Engine              *proxy.Engine
-	Authenticator       Authenticator
-	ManagementToken     string
+	Engine          *proxy.Engine
+	Authenticator   Authenticator
+	ManagementToken string
+	// Sessions backs console sign-in. When nil, the console and management
+	// endpoints accept only the management token.
+	Sessions            SessionStore
 	Configuration       store.Configuration
 	Routes              []domain.Route
 	BreakerSnapshotter  BreakerSnapshotter
@@ -46,21 +50,145 @@ type Server struct {
 	Logger              *slog.Logger
 	StartedAt           time.Time
 	Ready               atomic.Bool
+
+	// loginLimiter throttles console sign-in attempts per client address. It is
+	// created on first use so a Server assembled by tests needs no constructor.
+	loginLimiterOnce sync.Once
+	loginLimiter     *loginLimiter
+}
+
+// limiter returns the per-server sign-in limiter, creating it on first use.
+func (s *Server) limiter() *loginLimiter {
+	s.loginLimiterOnce.Do(func() {
+		s.loginLimiter = newLoginLimiter(time.Now)
+	})
+	return s.loginLimiter
 }
 
 // Handler returns an isolated HTTP handler without modifying the TypeScript server.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	// A bare root hit is someone looking for the console, so send it there
+	// instead of answering Go's default plain-text 404.
+	mux.HandleFunc("GET /{$}", handleConsoleRedirect)
+	// Redirected here rather than by the mux so the Location header stays
+	// correct when the gateway is mounted behind a path prefix.
+	mux.HandleFunc("GET /console", handleConsoleRedirect)
 	mux.Handle("GET /console/", console.Handler())
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /readyz", s.handleReady)
+	// Console sign-in. These are unauthenticated by necessity: they are what
+	// hands out a session in the first place. The login route is rate limited.
+	mux.HandleFunc("GET /management/session", s.handleSession)
+	mux.HandleFunc("POST /management/login", s.handleLogin)
+	mux.HandleFunc("POST /management/logout", s.handleLogout)
 	mux.HandleFunc("GET /management/status", s.handleStatus)
 	mux.HandleFunc("GET /management/snapshot", s.handleManagementSnapshot)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleProxy)
 	mux.HandleFunc("POST /v1/responses", s.handleProxy)
 	mux.HandleFunc("POST /v1/messages", s.handleProxy)
+	// Anything else that a browser navigated to is a visitor looking for the
+	// console, so unknown pages redirect to it. The API namespaces keep their
+	// 404s: a mistyped endpoint must not answer with a login page.
+	mux.HandleFunc("GET /{path...}", handleConsoleRedirect)
 	return s.loggingMiddleware(mux)
+}
+
+// apiNamespaces are the path prefixes that belong to the API surface. A request
+// under one of them is an endpoint call rather than a browser navigation, so an
+// unknown path there is a 404 instead of a console redirect.
+var apiNamespaces = []string{"/v1/", "/management/", "/console/"}
+
+// isAPIPath reports whether a path is part of the API surface rather than a
+// page a browser navigated to.
+func isAPIPath(path string) bool {
+	for _, namespace := range apiNamespaces {
+		if strings.HasPrefix(path, namespace) {
+			return true
+		}
+	}
+	return false
+}
+
+// handleConsoleRedirect sends any browser navigation the gateway does not
+// otherwise serve to the console index. This is what makes a bare domain
+// (https://gateway.example/) open the console, and it covers unknown paths such
+// as /admin so a visitor lands somewhere useful instead of on a bare 404.
+//
+// API namespaces are excluded: a mistyped endpoint must keep answering 404, both
+// because a client is not a browser and because returning a login page there
+// would hide the real mistake.
+func handleConsoleRedirect(w http.ResponseWriter, r *http.Request) {
+	if isAPIPath(r.URL.Path) {
+		http.NotFound(w, r)
+		return
+	}
+	// A proxy that strips a path prefix knows the public prefix and can report it
+	// in X-Forwarded-Prefix. That is the only way to recover it for a visitor who
+	// arrived at a slash-less path such as https://host/gateway, because the
+	// browser treats the last segment as a file there and resolves a relative
+	// reference against the parent directory.
+	if prefix := forwardedPrefix(r); prefix != "" {
+		w.Header().Set("Location", prefix+"/console/")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+		return
+	}
+	// Without that header the Location stays a relative reference, which the
+	// browser resolves against the public URL it requested. http.Redirect cannot
+	// be used here because it rewrites the target into an absolute path derived
+	// from the path the gateway received, which is the prefix-stripped one.
+	w.Header().Set("Location", consoleRedirectTarget(r.URL.Path))
+	w.WriteHeader(http.StatusTemporaryRedirect)
+}
+
+// forwardedPrefix returns a sanitized X-Forwarded-Prefix value, or an empty
+// string when the header is absent or unusable. The value is echoed into a
+// Location header, so anything that could escape the intended origin — a
+// relative value, a traversal segment, or a scheme — is rejected rather than
+// normalized.
+func forwardedPrefix(r *http.Request) string {
+	value := strings.TrimSpace(r.Header.Get("X-Forwarded-Prefix"))
+	if value == "" || !strings.HasPrefix(value, "/") {
+		return ""
+	}
+	if strings.Contains(value, "\\") || strings.Contains(value, "//") {
+		return ""
+	}
+	if strings.ContainsAny(value, "\r\n") {
+		return ""
+	}
+	for _, segment := range strings.Split(value, "/") {
+		if segment == ".." || segment == "." {
+			return ""
+		}
+	}
+	trimmed := strings.TrimSuffix(value, "/")
+	if trimmed == "" {
+		return ""
+	}
+	return trimmed
+}
+
+// consoleRedirectTarget builds a relative reference to the console index from
+// the path the gateway received. The path is normalized first, because Go's mux
+// redirects a request for "/a/../b" before matching and the target must not be
+// computed from the unnormalized form.
+//
+// Depth is the number of segments that would have to be removed for the browser
+// to arrive at the console: a leaf path climbs one level per segment, while a
+// trailing slash means the last segment is a directory the browser is already
+// inside and must be climbed too.
+func consoleRedirectTarget(requestPath string) string {
+	trimmed := strings.Trim(requestPath, "/")
+	if trimmed == "" {
+		return "console/"
+	}
+	depth := len(strings.Split(trimmed, "/"))
+	if !strings.HasSuffix(requestPath, "/") {
+		depth--
+	}
+	return strings.Repeat("../", depth) + "console/"
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -78,25 +206,35 @@ func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
-func (s *Server) authenticateManagement(w http.ResponseWriter, r *http.Request) bool {
+// verifyManagementToken reports whether the request carries the configured
+// management token. It performs no authorization itself and writes no response,
+// so callers can combine it with other credential sources.
+func (s *Server) verifyManagementToken(r *http.Request) bool {
 	expected := strings.TrimSpace(s.ManagementToken)
 	if expected == "" {
-		writeError(w, http.StatusServiceUnavailable, "management_auth_not_configured", "management authentication is not configured")
 		return false
 	}
 	credential := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 	if credential == "" {
 		credential = strings.TrimSpace(r.Header.Get("X-Management-Token"))
 	}
-	if len(credential) != len(expected) || subtle.ConstantTimeCompare([]byte(credential), []byte(expected)) != 1 {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "valid management credentials are required")
+	return len(credential) == len(expected) && subtle.ConstantTimeCompare([]byte(credential), []byte(expected)) == 1
+}
+
+func (s *Server) authenticateManagement(w http.ResponseWriter, r *http.Request) bool {
+	if s.verifyManagementToken(r) {
+		return true
+	}
+	if strings.TrimSpace(s.ManagementToken) == "" && s.Sessions == nil {
+		writeError(w, http.StatusServiceUnavailable, "management_auth_not_configured", "management authentication is not configured")
 		return false
 	}
-	return true
+	writeError(w, http.StatusUnauthorized, "unauthorized", "valid management credentials are required")
+	return false
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	if !s.authenticateManagement(w, r) {
+	if !s.authenticateConsole(w, r) {
 		return
 	}
 	started := s.StartedAt
@@ -112,7 +250,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request) {
-	if !s.authenticateManagement(w, r) {
+	if !s.authenticateConsole(w, r) {
 		return
 	}
 

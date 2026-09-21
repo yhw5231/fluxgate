@@ -19,7 +19,7 @@ func TestHandlerServesIndexAndAssets(t *testing.T) {
 	}{
 		{name: "index", path: "/console/", wantType: "text/html", wantSnippet: "Fluxgate Console"},
 		{name: "stylesheet", path: "/console/styles.css", wantType: "text/css", wantSnippet: "--bg-base"},
-		{name: "script", path: "/console/app.js", wantType: "text/javascript", wantSnippet: "/management/snapshot"},
+		{name: "script", path: "/console/app.js", wantType: "text/javascript", wantSnippet: "management/snapshot"},
 	}
 
 	for _, testCase := range cases {
@@ -116,5 +116,101 @@ func TestHandlerBlocksPathTraversal(t *testing.T) {
 		if response.Code == http.StatusOK {
 			t.Errorf("%s returned 200; traversal was not blocked", path)
 		}
+	}
+}
+
+// The console has to keep working when a reverse proxy mounts it under a path
+// prefix, so no asset may be referenced from the server root and the management
+// calls must be resolved against the page URL at runtime.
+func TestConsoleReferencesEverythingRelatively(t *testing.T) {
+	cases := []struct {
+		assetPath string
+		unwanted  []string
+		wanted    []string
+	}{
+		{
+			assetPath: "/console/",
+			unwanted:  []string{`href="/console/`, `src="/console/`},
+			wanted:    []string{`href="styles.css"`, `src="app.js"`},
+		},
+		{
+			assetPath: "/console/app.js",
+			unwanted:  []string{`fetch('/management`, `fetch("/management`},
+			wanted:    []string{"apiPath(", "lastIndexOf('/console/')"},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.assetPath, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, testCase.assetPath, nil)
+			response := httptest.NewRecorder()
+
+			Handler().ServeHTTP(response, request)
+
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			for _, unwanted := range testCase.unwanted {
+				if strings.Contains(string(body), unwanted) {
+					t.Errorf("%s contains root-absolute reference %q", testCase.assetPath, unwanted)
+				}
+			}
+			for _, wanted := range testCase.wanted {
+				if !strings.Contains(string(body), wanted) {
+					t.Errorf("%s is missing %q", testCase.assetPath, wanted)
+				}
+			}
+		})
+	}
+}
+
+// The console signs in with an account, not a pasted token, so the form must
+// collect both fields and must not carry a token input any more.
+func TestConsoleLoginFormCollectsUsernameAndPassword(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/console/", nil)
+	response := httptest.NewRecorder()
+	Handler().ServeHTTP(response, request)
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	page := string(body)
+
+	for _, wanted := range []string{
+		`id="auth-username"`,
+		`id="auth-password"`,
+		`autocomplete="username"`,
+		`autocomplete="current-password"`,
+	} {
+		if !strings.Contains(page, wanted) {
+			t.Errorf("login form is missing %q", wanted)
+		}
+	}
+	if strings.Contains(page, "auth-token") {
+		t.Error("login form still has a management token input")
+	}
+}
+
+// A credential must not be persisted by the console itself: the session is an
+// HTTP-only cookie, so no token may be written to web storage.
+func TestConsoleDoesNotPersistCredentialsInWebStorage(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/console/app.js", nil)
+	response := httptest.NewRecorder()
+	Handler().ServeHTTP(response, request)
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	script := string(body)
+
+	for _, unwanted := range []string{"sessionStorage", "localStorage"} {
+		if strings.Contains(script, unwanted) {
+			t.Errorf("console script uses %s to persist credentials", unwanted)
+		}
+	}
+	if !strings.Contains(script, "credentials: 'same-origin'") {
+		t.Error("console requests do not send the session cookie")
 	}
 }

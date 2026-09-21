@@ -5,11 +5,27 @@
 (function () {
   'use strict';
 
-  var TOKEN_KEY = 'fluxgate.console.token';
   var REFRESH_MS = 10000;
 
+  /* The console may be mounted under a path prefix by a reverse proxy (for
+   * example /gateway/console/), so management calls are resolved against the
+   * directory the page was actually served from instead of the server root.
+   * The last /console/ marker wins so a prefix that itself contains the
+   * segment still resolves correctly. */
+  var API_BASE = (function () {
+    var path = window.location.pathname || '/console/';
+    var marker = path.lastIndexOf('/console/');
+    if (marker === -1) {
+      return path.replace(/[^/]*$/, '');
+    }
+    return path.slice(0, marker + 1);
+  })();
+
+  function apiPath(suffix) {
+    return API_BASE + suffix.replace(/^\//, '');
+  }
+
   var state = {
-    token: '',
     snapshot: null,
     channelNames: {},
     timer: null,
@@ -24,7 +40,8 @@
   function cacheElements() {
     els.authOverlay = $('auth-overlay');
     els.authForm = $('auth-form');
-    els.authToken = $('auth-token');
+    els.authUsername = $('auth-username');
+    els.authPassword = $('auth-password');
     els.authError = $('auth-error');
     els.authSubmit = $('auth-submit');
     els.app = $('app');
@@ -134,19 +151,11 @@
     return element('span', 'badge badge-' + variant, label);
   }
 
-  /* ===== Session handling ===== */
-
-  function loadToken() {
-    try { return window.sessionStorage.getItem(TOKEN_KEY) || ''; } catch (err) { return ''; }
-  }
-
-  function saveToken(token) {
-    try { window.sessionStorage.setItem(TOKEN_KEY, token); } catch (err) { /* storage unavailable */ }
-  }
-
-  function clearToken() {
-    try { window.sessionStorage.removeItem(TOKEN_KEY); } catch (err) { /* storage unavailable */ }
-  }
+  /* ===== Session handling =====
+   * The session lives in an HTTP-only cookie set by the gateway, so this script
+   * never holds a credential it could leak. It asks the gateway who it is
+   * instead of remembering, which also means a session revoked elsewhere
+   * (a password reset, an expiry) is noticed on the next request. */
 
   function showAuth(message) {
     stopAutoRefresh();
@@ -155,8 +164,9 @@
     els.authError.hidden = !message;
     els.authError.textContent = message || '';
     els.authSubmit.disabled = false;
-    els.authSubmit.querySelector('.btn-label').textContent = 'Unlock console';
-    els.authToken.focus();
+    els.authSubmit.querySelector('.btn-label').textContent = 'Sign in';
+    els.authPassword.value = '';
+    els.authUsername.focus();
   }
 
   function showConsole() {
@@ -166,25 +176,40 @@
   }
 
   function signOut() {
-    clearToken();
-    state.token = '';
+    stopAutoRefresh();
     state.snapshot = null;
-    els.authToken.value = '';
-    showAuth('');
+    els.authUsername.value = '';
+    els.authPassword.value = '';
+    post('/management/logout').catch(function () { /* the cookie is cleared server-side */ })
+      .then(function () { showAuth(''); });
   }
 
   /* ===== Data access ===== */
 
-  function request(path, token) {
-    return fetch(path, {
+  function request(path) {
+    return fetch(apiPath(path), {
       method: 'GET',
-      headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' },
+      headers: { 'Accept': 'application/json' },
       cache: 'no-store',
-      credentials: 'omit'
-    }).then(function (response) {
-      return response.json().catch(function () { return null; }).then(function (body) {
-        return { status: response.status, ok: response.ok, body: body };
-      });
+      credentials: 'same-origin'
+    }).then(readResponse);
+  }
+
+  function post(path, payload) {
+    return fetch(apiPath(path), {
+      method: 'POST',
+      headers: payload
+        ? { 'Content-Type': 'application/json', 'Accept': 'application/json' }
+        : { 'Accept': 'application/json' },
+      body: payload ? JSON.stringify(payload) : undefined,
+      cache: 'no-store',
+      credentials: 'same-origin'
+    }).then(readResponse);
+  }
+
+  function readResponse(response) {
+    return response.json().catch(function () { return null; }).then(function (body) {
+      return { status: response.status, ok: response.ok, body: body };
     });
   }
 
@@ -198,27 +223,24 @@
   }
 
   function refresh() {
-    if (state.loading || !state.token) { return; }
+    if (state.loading) { return; }
     state.loading = true;
     els.refresh.classList.add('spinning');
 
-    var token = state.token;
     Promise.all([
-      request('/management/status', token),
-      request('/management/snapshot', token)
+      request('/management/status'),
+      request('/management/snapshot')
     ]).then(function (results) {
       var status = results[0];
       var snapshot = results[1];
 
       if (status.status === 401 || snapshot.status === 401) {
-        clearToken();
-        state.token = '';
-        showAuth('Management token was rejected. Enter a valid token to continue.');
+        showAuth('Your session expired. Sign in again to continue.');
         return;
       }
       if (status.status === 503 || snapshot.status === 503) {
         hideBanner();
-        renderUnavailable(errorMessage(status.body, 'Management authentication is not configured on this gateway.'));
+        renderUnavailable(errorMessage(status.body, 'Console sign-in is not configured on this gateway.'));
         return;
       }
       if (!status.ok || !snapshot.ok) {
@@ -469,55 +491,52 @@
 
   /* ===== Wiring ===== */
 
+  function setSubmitting(submitting) {
+    els.authSubmit.disabled = submitting;
+    els.authSubmit.querySelector('.btn-label').textContent = submitting ? 'Signing in…' : 'Sign in';
+  }
+
+  function signInError(message) {
+    setSubmitting(false);
+    els.authError.hidden = false;
+    els.authError.textContent = message;
+  }
+
   function bind() {
     els.authForm.addEventListener('submit', function (event) {
       event.preventDefault();
-      var candidate = els.authToken.value.trim();
-      if (!candidate) {
+      var username = els.authUsername.value.trim();
+      var password = els.authPassword.value;
+      if (!username || !password) {
         els.authError.hidden = false;
-        els.authError.textContent = 'Enter the management token configured for this gateway.';
+        els.authError.textContent = 'Enter both the username and the password.';
         return;
       }
-      state.token = candidate;
       els.authError.hidden = true;
-      els.authSubmit.disabled = true;
-      els.authSubmit.querySelector('.btn-label').textContent = 'Verifying…';
+      setSubmitting(true);
 
-      request('/management/status', candidate).then(function (result) {
-        if (result.status === 401) {
-          state.token = '';
-          els.authSubmit.disabled = false;
-          els.authSubmit.querySelector('.btn-label').textContent = 'Unlock console';
-          els.authError.hidden = false;
-          els.authError.textContent = 'That token was rejected by the gateway.';
+      post('/management/login', { username: username, password: password }).then(function (result) {
+        if (result.ok) {
+          els.authPassword.value = '';
+          showConsole();
+          refresh();
+          return;
+        }
+        if (result.status === 429) {
+          signInError('Too many failed attempts. Wait a few minutes and try again.');
           return;
         }
         if (result.status === 503) {
-          state.token = '';
-          els.authSubmit.disabled = false;
-          els.authSubmit.querySelector('.btn-label').textContent = 'Unlock console';
-          els.authError.hidden = false;
-          els.authError.textContent = 'Management authentication is not configured on this gateway.';
+          signInError('No administrator account exists yet. Run "fluxgate admin create" on the gateway host.');
           return;
         }
-        if (!result.ok) {
-          state.token = '';
-          els.authSubmit.disabled = false;
-          els.authSubmit.querySelector('.btn-label').textContent = 'Unlock console';
-          els.authError.hidden = false;
-          els.authError.textContent = errorMessage(result.body, 'Unexpected gateway response.');
+        if (result.status === 401) {
+          signInError('Invalid username or password.');
           return;
         }
-        saveToken(candidate);
-        els.authToken.value = '';
-        showConsole();
-        refresh();
+        signInError(errorMessage(result.body, 'Unexpected gateway response.'));
       }).catch(function (err) {
-        state.token = '';
-        els.authSubmit.disabled = false;
-        els.authSubmit.querySelector('.btn-label').textContent = 'Unlock console';
-        els.authError.hidden = false;
-        els.authError.textContent = 'Cannot reach the gateway: ' + String(err && err.message ? err.message : err);
+        signInError('Cannot reach the gateway: ' + String(err && err.message ? err.message : err));
       });
     });
 
@@ -529,21 +548,30 @@
     });
 
     document.addEventListener('visibilitychange', function () {
-      if (!document.hidden && state.token) { refresh(); }
+      if (!document.hidden && !els.app.hidden) { refresh(); }
     });
   }
 
+  /* boot asks the gateway who we are instead of trusting local storage: the
+   * session cookie is HTTP-only, so only the server can answer that. */
   function boot() {
     cacheElements();
     bind();
-    var stored = loadToken();
-    if (stored) {
-      state.token = stored;
-      showConsole();
-      refresh();
-      return;
-    }
-    showAuth('');
+
+    request('/management/session').then(function (result) {
+      if (result.ok && result.body && result.body.authenticated) {
+        showConsole();
+        refresh();
+        return;
+      }
+      if (result.ok && result.body && result.body.configured === false) {
+        showAuth('No administrator account exists yet. Run "fluxgate admin create" on the gateway host.');
+        return;
+      }
+      showAuth('');
+    }).catch(function () {
+      showAuth('Cannot reach the gateway.');
+    });
   }
 
   if (document.readyState === 'loading') {

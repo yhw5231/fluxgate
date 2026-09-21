@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -23,6 +24,17 @@ import (
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	// The admin subcommand manages the console credential and exits without
+	// starting the gateway.
+	if len(os.Args) > 1 && os.Args[1] == "admin" {
+		if err := runAdmin(context.Background(), os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if err := run(context.Background(), logger); err != nil {
 		logger.Error("gateway_stopped", "error", err.Error())
 		os.Exit(1)
@@ -48,6 +60,10 @@ func run(parent context.Context, logger *slog.Logger) error {
 	}
 
 	if err := persistentStore.EnsureBreakerSchema(parent); err != nil {
+		return err
+	}
+
+	if err := persistentStore.EnsureAdminSchema(parent); err != nil {
 		return err
 	}
 
@@ -98,6 +114,7 @@ func run(parent context.Context, logger *slog.Logger) error {
 		Engine:              engine,
 		Authenticator:       persistentStore,
 		ManagementToken:     cfg.ManagementToken,
+		Sessions:            persistentStore,
 		Configuration:       configuration,
 		Routes:              configuration.Routes,
 		BreakerSnapshotter:  breakerStore,

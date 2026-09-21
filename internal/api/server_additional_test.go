@@ -433,7 +433,184 @@ func TestConsoleRedirectsBarePrefix(t *testing.T) {
 	if response.Code != http.StatusMovedPermanently && response.Code != http.StatusTemporaryRedirect {
 		t.Fatalf("status = %d, want a redirect", response.Code)
 	}
-	if got := response.Header().Get("Location"); got != "/console/" {
-		t.Fatalf("Location = %q, want /console/", got)
+	if got := response.Header().Get("Location"); got != "console/" {
+		t.Fatalf("Location = %q, want %q", got, "console/")
+	}
+}
+
+// A bare root request is a visitor looking for the console. It must not fall
+// through to Go's default plain-text 404, and the redirect target stays relative
+// so it resolves against the public URL when a reverse proxy strips a prefix.
+func TestRootRedirectsToConsole(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		path string
+	}{
+		{name: "root", path: "/"},
+		{name: "console prefix", path: "/console"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := &Server{}
+			request := httptest.NewRequest(http.MethodGet, testCase.path, nil)
+			response := httptest.NewRecorder()
+
+			server.Handler().ServeHTTP(response, request)
+
+			if response.Code != http.StatusTemporaryRedirect {
+				t.Fatalf("status = %d, want 307", response.Code)
+			}
+			location := response.Header().Get("Location")
+			if location != "console/" {
+				t.Fatalf("Location = %q, want a relative %q", location, "console/")
+			}
+		})
+	}
+}
+
+// The console must work when mounted under a path prefix: its assets are
+// referenced relatively and its management calls are derived from the page URL.
+func TestConsoleAssetsUseRelativePaths(t *testing.T) {
+	server := &Server{}
+	request := httptest.NewRequest(http.MethodGet, "/console/", nil)
+	response := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(response, request)
+
+	body := response.Body.String()
+	for _, unwanted := range []string{`href="/console/`, `src="/console/`} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("console index contains root-absolute asset reference %q", unwanted)
+		}
+	}
+	for _, wanted := range []string{`href="styles.css"`, `src="app.js"`} {
+		if !strings.Contains(body, wanted) {
+			t.Errorf("console index is missing relative asset reference %q", wanted)
+		}
+	}
+}
+
+// A browser navigation the gateway does not serve lands on the console rather
+// than a bare 404, so a bare domain and a mistyped page both stay useful.
+func TestUnknownPageRedirectsToConsole(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		path string
+		want string
+	}{
+		{name: "root", path: "/", want: "console/"},
+		{name: "single segment", path: "/admin", want: "console/"},
+		{name: "nested", path: "/a/b", want: "../console/"},
+		{name: "deeply nested", path: "/a/b/c", want: "../../console/"},
+		{name: "directory", path: "/a/b/", want: "../../console/"},
+		{name: "index html", path: "/index.html", want: "console/"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := &Server{}
+			request := httptest.NewRequest(http.MethodGet, testCase.path, nil)
+			response := httptest.NewRecorder()
+
+			server.Handler().ServeHTTP(response, request)
+
+			if response.Code != http.StatusTemporaryRedirect {
+				t.Fatalf("status = %d, want 307", response.Code)
+			}
+			if got := response.Header().Get("Location"); got != testCase.want {
+				t.Fatalf("Location = %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+// A proxy that strips a path prefix reports it in X-Forwarded-Prefix. Using it
+// is the only way to keep the prefix for a visitor who arrived at a slash-less
+// path such as https://host/gateway, where the browser would otherwise resolve a
+// relative target against the parent directory and drop the prefix.
+func TestConsoleRedirectUsesForwardedPrefix(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		prefix string
+		want   string
+	}{
+		{name: "simple", prefix: "/gateway", want: "/gateway/console/"},
+		{name: "trailing slash", prefix: "/gateway/", want: "/gateway/console/"},
+		{name: "nested", prefix: "/tools/gateway", want: "/tools/gateway/console/"},
+		{name: "whitespace", prefix: "  /gateway  ", want: "/gateway/console/"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := &Server{}
+			request := httptest.NewRequest(http.MethodGet, "/", nil)
+			request.Header.Set("X-Forwarded-Prefix", testCase.prefix)
+			response := httptest.NewRecorder()
+
+			server.Handler().ServeHTTP(response, request)
+
+			if response.Code != http.StatusTemporaryRedirect {
+				t.Fatalf("status = %d, want 307", response.Code)
+			}
+			if got := response.Header().Get("Location"); got != testCase.want {
+				t.Fatalf("Location = %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+// The prefix is echoed into a Location header, so a value that could redirect
+// off-origin or smuggle a header must be ignored in favour of the relative form.
+func TestConsoleRedirectRejectsUnsafeForwardedPrefix(t *testing.T) {
+	for _, prefix := range []string{
+		"https://evil.example",  // absolute URL
+		"//evil.example",        // protocol-relative
+		"/gateway/../admin",     // traversal segment
+		"/gateway/./admin",      // current-directory segment
+		"/gateway//admin",       // empty segment
+		"/gateway\\admin",       // backslash escaping
+		"/gateway\r\nX-Evil: 1", // header injection
+		"gateway",               // not rooted
+		"/",                     // no prefix at all
+		"",                      // absent
+	} {
+		t.Run(prefix, func(t *testing.T) {
+			server := &Server{}
+			request := httptest.NewRequest(http.MethodGet, "/", nil)
+			if prefix != "" {
+				request.Header.Set("X-Forwarded-Prefix", prefix)
+			}
+			response := httptest.NewRecorder()
+
+			server.Handler().ServeHTTP(response, request)
+
+			location := response.Header().Get("Location")
+			if location != "console/" {
+				t.Fatalf("Location = %q, want the relative fallback %q", location, "console/")
+			}
+			if strings.Contains(location, "evil.example") || strings.Contains(location, "X-Evil") {
+				t.Fatalf("Location = %q, the header was echoed unsafely", location)
+			}
+		})
+	}
+}
+
+// A mistyped endpoint must keep answering 404: an API client is not a browser,
+// and a login page would hide the real mistake.
+func TestUnknownAPIPathStillReturns404(t *testing.T) {
+	for _, path := range []string{
+		"/v1/typo",
+		"/management/typo",
+		"/console/missing.js",
+	} {
+		t.Run(path, func(t *testing.T) {
+			server := &Server{}
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			response := httptest.NewRecorder()
+
+			server.Handler().ServeHTTP(response, request)
+
+			if response.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", response.Code)
+			}
+			if location := response.Header().Get("Location"); location != "" {
+				t.Fatalf("Location = %q, want no redirect from an API path", location)
+			}
+		})
 	}
 }
