@@ -41,9 +41,19 @@ type Server struct {
 	ManagementToken string
 	// Sessions backs console sign-in. When nil, the console and management
 	// endpoints accept only the management token.
-	Sessions            SessionStore
-	Configuration       store.Configuration
-	Routes              []domain.Route
+	Sessions SessionStore
+	// Configuration is the snapshot the management views report. It is replaced
+	// by SetConfiguration after a console write, so it is read through the
+	// accessors below rather than directly.
+	Configuration store.Configuration
+	Routes        []domain.Route
+	// ConfigStore performs configuration writes. When nil, the console is
+	// read-only and every write endpoint answers 503.
+	ConfigStore ConfigurationStore
+	// Applier installs a reloaded snapshot in the routing engine. When nil, a
+	// change is reported by the API and applied to proxied traffic at the next
+	// restart.
+	Applier             ConfigurationApplier
 	BreakerSnapshotter  BreakerSnapshotter
 	Models              []string
 	MaxRequestBodyBytes int64
@@ -51,10 +61,46 @@ type Server struct {
 	StartedAt           time.Time
 	Ready               atomic.Bool
 
+	// configMu guards the snapshot fields above, which the console replaces
+	// while request handlers read them.
+	configMu sync.RWMutex
+
 	// loginLimiter throttles console sign-in attempts per client address. It is
 	// created on first use so a Server assembled by tests needs no constructor.
 	loginLimiterOnce sync.Once
 	loginLimiter     *loginLimiter
+}
+
+// SetConfiguration replaces the configuration snapshot the management endpoints
+// report and the proxy endpoints authorize against. The routing engine is
+// updated separately by the ConfigurationApplier the process supplies.
+func (s *Server) SetConfiguration(configuration store.Configuration) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	s.Configuration = configuration
+	s.Routes = configuration.Routes
+	s.Models = configuration.Models
+}
+
+// currentConfiguration returns the snapshot under the read lock. The returned
+// value shares its slices with the stored one, which is safe because a snapshot
+// is never mutated after it is installed.
+func (s *Server) currentConfiguration() store.Configuration {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.Configuration
+}
+
+func (s *Server) currentRoutes() []domain.Route {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.Routes
+}
+
+func (s *Server) currentModels() []string {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.Models
 }
 
 // limiter returns the per-server sign-in limiter, creating it on first use.
@@ -87,6 +133,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /management/password", s.handleChangePassword)
 	mux.HandleFunc("GET /management/status", s.handleStatus)
 	mux.HandleFunc("GET /management/snapshot", s.handleManagementSnapshot)
+	// Console configuration management. Every write is authenticated on its own,
+	// bounded, validated against the tables it touches, and followed by a reload
+	// so the gateway routes with what the console just saved.
+	mux.HandleFunc("GET /management/configuration", s.handleConfiguration)
+	mux.HandleFunc("POST /management/configuration/{resource}", s.handleConfigurationCreate)
+	mux.HandleFunc("PUT /management/configuration/{resource}/{id}", s.handleConfigurationUpdate)
+	mux.HandleFunc("DELETE /management/configuration/{resource}/{id}", s.handleConfigurationDelete)
+	mux.HandleFunc("POST /management/configuration/keys/{id}/rotate", s.handleConfigurationKeyRotate)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleProxy)
 	mux.HandleFunc("POST /v1/responses", s.handleProxy)
@@ -247,7 +301,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"service":     "fluxgate",
 		"ready":       s.Engine != nil && s.Ready.Load(),
-		"model_count": len(s.Models),
+		"model_count": len(s.currentModels()),
 		"uptime_ms":   time.Since(started).Milliseconds(),
 	})
 }
@@ -283,8 +337,9 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 		Disabled            bool   `json:"disabled"`
 	}
 
-	channels := make([]channelSnapshot, 0, len(s.Configuration.Channels))
-	for _, route := range s.Configuration.Routes {
+	configuration := s.currentConfiguration()
+	channels := make([]channelSnapshot, 0, len(configuration.Channels))
+	for _, route := range configuration.Routes {
 		mappings := make([]modelMappingSnapshot, 0, len(route.ModelMapping))
 		for _, entry := range route.ModelMapping {
 			mappings = append(mappings, modelMappingSnapshot{Pattern: entry.Pattern, Target: entry.Target})
@@ -366,11 +421,11 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 		})
 	}
 
-	models := append([]string(nil), s.Models...)
+	models := append([]string(nil), s.currentModels()...)
 	sort.Strings(models)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"generated_at": time.Now().UTC().Format(time.RFC3339Nano),
-		"loaded_at":    s.Configuration.LoadedAt.UTC().Format(time.RFC3339Nano),
+		"loaded_at":    configuration.LoadedAt.UTC().Format(time.RFC3339Nano),
 		"channels":     channels,
 		"models":       models,
 		"breakers":     breakers,
@@ -384,9 +439,11 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	policy := key.Policy()
-	data := make([]map[string]any, 0, len(s.Models))
-	for _, model := range s.Models {
-		if !domain.AllowsModel(s.Routes, policy, model) {
+	models := s.currentModels()
+	routes := s.currentRoutes()
+	data := make([]map[string]any, 0, len(models))
+	for _, model := range models {
+		if !domain.AllowsModel(routes, policy, model) {
 			continue
 		}
 		if !s.hasRoutableChannel(model, policy) {
@@ -449,7 +506,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	policy := key.Policy()
-	if !domain.AllowsModel(s.Routes, policy, envelope.Model) {
+	if !domain.AllowsModel(s.currentRoutes(), policy, envelope.Model) {
 		writeError(w, http.StatusForbidden, "model_not_allowed", "requested model is not allowed for this API key")
 		return
 	}

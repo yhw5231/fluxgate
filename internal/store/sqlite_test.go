@@ -516,6 +516,39 @@ func TestLoadRoutesToleratesNullableAccountAndSiteColumns(t *testing.T) {
 	}
 }
 
+// The site and account status columns declare a default rather than a
+// constraint, so a row written without one holds NULL. Reading such a
+// configuration has to keep working: treating the missing status as the schema's
+// own default is what lets the gateway read a file another writer produced.
+func TestLoadRoutesTreatsNullStatusAsTheSchemaDefault(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	createUpstreamTables(t, store)
+	statements := []string{
+		`INSERT INTO sites (id, name, url, platform, status) VALUES (11, 'site', 'https://example.test/v1', 'openai', NULL)`,
+		`INSERT INTO accounts (id, site_id, access_token, status) VALUES (11, 11, 'account-access', NULL)`,
+		`INSERT INTO token_routes (id, model_pattern) VALUES (11, 'model-null-status')`,
+		`INSERT INTO route_channels (id, route_id, account_id) VALUES (11, 11, 11)`,
+	}
+	for _, statement := range statements {
+		if _, err := store.db.Exec(statement); err != nil {
+			t.Fatalf("execute test schema statement: %v", err)
+		}
+	}
+
+	configuration, err := store.LoadConfiguration(ctx)
+	if err != nil {
+		t.Fatalf("LoadConfiguration() error = %v", err)
+	}
+	if len(configuration.Channels) != 1 {
+		t.Fatalf("loaded channels = %d, want 1", len(configuration.Channels))
+	}
+	if !configuration.Channels[0].Enabled {
+		t.Fatal("a NULL status was treated as disabled instead of as the default active")
+	}
+}
+
 // A fresh deployment points the gateway at ../data/hub.db without creating the
 // directory first, so OpenSQLite must create it instead of surfacing the opaque
 // SQLite "unable to open database file" error.

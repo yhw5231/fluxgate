@@ -52,35 +52,59 @@ func (r ResolvedProxy) CacheKey() string {
 }
 
 // Resolver applies key, site, default, system, and direct precedence.
+//
+// Config is replaced by a management-console write while requests are in
+// flight, so it is read through a snapshot taken under mu rather than directly.
 type Resolver struct {
-	Config      ProxyConfig
 	SystemProxy func(*http.Request) (*url.URL, error)
+
+	mu     sync.RWMutex
+	Config ProxyConfig
 }
 
-func (r Resolver) Resolve(request ProxyRequest) (ResolvedProxy, error) {
-	if value := strings.TrimSpace(r.Config.Keys[request.KeyID]); value != "" {
+// SetConfig replaces the proxy configuration in place. The resolver object is
+// never swapped, so an in-flight request finishes with the decisions it started
+// with.
+func (r *Resolver) SetConfig(config ProxyConfig) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.Config = config
+}
+
+// config returns the current configuration. The maps are shared rather than
+// copied, which is safe because a caller only ever reads them and SetConfig
+// replaces the whole struct instead of mutating one in place.
+func (r *Resolver) config() ProxyConfig {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.Config
+}
+
+func (r *Resolver) Resolve(request ProxyRequest) (ResolvedProxy, error) {
+	config := r.config()
+	if value := strings.TrimSpace(config.Keys[request.KeyID]); value != "" {
 		return r.resolveConfiguredProxy(ProxySourceKey, value, request.TargetURL)
 	}
 	if request.TargetURL != nil {
 		host := strings.ToLower(request.TargetURL.Hostname())
-		if value := strings.TrimSpace(r.Config.Sites[host]); value != "" {
+		if value := strings.TrimSpace(config.Sites[host]); value != "" {
 			return r.resolveConfiguredProxy(ProxySourceSite, value, request.TargetURL)
 		}
 	}
-	if value := strings.TrimSpace(r.Config.Default); value != "" {
+	if value := strings.TrimSpace(config.Default); value != "" {
 		return r.resolveConfiguredProxy(ProxySourceDefault, value, request.TargetURL)
 	}
 	return r.resolveSystemProxy(request.TargetURL)
 }
 
-func (r Resolver) resolveConfiguredProxy(source ProxySource, value string, targetURL *url.URL) (ResolvedProxy, error) {
+func (r *Resolver) resolveConfiguredProxy(source ProxySource, value string, targetURL *url.URL) (ResolvedProxy, error) {
 	if strings.EqualFold(value, "system") {
 		return r.resolveSystemProxy(targetURL)
 	}
 	return parseResolvedProxy(source, value)
 }
 
-func (r Resolver) resolveSystemProxy(targetURL *url.URL) (ResolvedProxy, error) {
+func (r *Resolver) resolveSystemProxy(targetURL *url.URL) (ResolvedProxy, error) {
 	systemProxy := r.SystemProxy
 	if systemProxy == nil {
 		systemProxy = http.ProxyFromEnvironment

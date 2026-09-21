@@ -99,11 +99,7 @@ func run(parent context.Context, logger *slog.Logger) error {
 		Store:  breakerStore,
 	}
 
-	for index := range configuration.Channels {
-		if configuration.Channels[index].RequestTimeout <= 0 {
-			configuration.Channels[index].RequestTimeout = cfg.RequestTimeout
-		}
-	}
+	applyRequestTimeout(&configuration, cfg.RequestTimeout)
 
 	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
 	baseTransport.DialContext = (&net.Dialer{
@@ -115,11 +111,16 @@ func run(parent context.Context, logger *slog.Logger) error {
 	baseTransport.IdleConnTimeout = cfg.IdleConnTimeout
 
 	transportPool := proxy.NewTransportPool(baseTransport)
+	// The selector and the resolver are updated in place by a console write
+	// rather than replaced, so a request already in flight finishes with the
+	// configuration it started with.
+	selector := router.NewMemorySelectorWithFilter(configuration.Routes, circuitBreaker)
+	proxyResolver := buildProxyResolver(configuration)
 	engine := &proxy.Engine{
-		Selector:      router.NewMemorySelectorWithFilter(configuration.Routes, circuitBreaker),
+		Selector:      selector,
 		Observer:      circuitBreaker,
 		Client:        &http.Client{Transport: baseTransport},
-		ProxyResolver: buildProxyResolver(configuration),
+		ProxyResolver: proxyResolver,
 		TransportPool: transportPool,
 		Policy:        cfg.Retry,
 	}
@@ -129,13 +130,20 @@ func run(parent context.Context, logger *slog.Logger) error {
 		Authenticator:       persistentStore,
 		ManagementToken:     cfg.ManagementToken,
 		Sessions:            persistentStore,
-		Configuration:       configuration,
-		Routes:              configuration.Routes,
+		ConfigStore:         persistentStore,
 		BreakerSnapshotter:  breakerStore,
-		Models:              configuration.Models,
 		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,
 		Logger:              logger,
 		StartedAt:           time.Now().UTC(),
+	}
+	gatewayAPI.SetConfiguration(configuration)
+	// A configuration written from the console is reloaded and installed here, so
+	// an added channel or a changed weight serves traffic immediately instead of
+	// at the next restart.
+	gatewayAPI.Applier = func(updated store.Configuration) {
+		applyRequestTimeout(&updated, cfg.RequestTimeout)
+		selector.SetRoutes(updated.Routes)
+		proxyResolver.SetConfig(proxyConfiguration(updated))
 	}
 	gatewayAPI.Ready.Store(true)
 
@@ -186,7 +194,40 @@ func run(parent context.Context, logger *slog.Logger) error {
 	}
 }
 
+// applyRequestTimeout fills in the configured request timeout for every channel
+// that does not carry one of its own.
+//
+// Both views of the channels are updated: the flat list the management snapshot
+// reports, and the per-route lists the selector actually hands to the engine.
+// They are independent copies of the same rows, so filling in only one of them
+// would leave the request path without the configured timeout.
+func applyRequestTimeout(configuration *store.Configuration, fallback time.Duration) {
+	for index := range configuration.Routes {
+		for channelIndex := range configuration.Routes[index].Channels {
+			channel := &configuration.Routes[index].Channels[channelIndex]
+			if channel.RequestTimeout <= 0 {
+				channel.RequestTimeout = fallback
+			}
+		}
+	}
+	for index := range configuration.Channels {
+		if configuration.Channels[index].RequestTimeout <= 0 {
+			configuration.Channels[index].RequestTimeout = fallback
+		}
+	}
+}
+
 func buildProxyResolver(configuration store.Configuration) *proxy.Resolver {
+	return &proxy.Resolver{
+		Config:      proxyConfiguration(configuration),
+		SystemProxy: http.ProxyFromEnvironment,
+	}
+}
+
+// proxyConfiguration derives the proxy decisions from a configuration snapshot.
+// The site entry is keyed by host because that is what a request knows, and the
+// key entry by credential because that is what identifies the upstream account.
+func proxyConfiguration(configuration store.Configuration) proxy.ProxyConfig {
 	proxyConfig := proxy.ProxyConfig{
 		Sites: make(map[string]string),
 		Keys:  make(map[string]string),
@@ -216,8 +257,5 @@ func buildProxyResolver(configuration store.Configuration) *proxy.Resolver {
 			proxyConfig.Keys[channel.APIKey] = "system"
 		}
 	}
-	return &proxy.Resolver{
-		Config:      proxyConfig,
-		SystemProxy: http.ProxyFromEnvironment,
-	}
+	return proxyConfig
 }

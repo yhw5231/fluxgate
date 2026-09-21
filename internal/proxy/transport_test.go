@@ -18,19 +18,23 @@ func mustURL(t *testing.T, value string) *url.URL {
 func TestResolverPrecedence(t *testing.T) {
 	target := mustURL(t, "https://api.example.com/v1/responses")
 	systemURL := mustURL(t, "http://system-proxy.example:8080")
-	resolver := Resolver{
-		Config: ProxyConfig{
-			Default: "http://default-proxy.example:8080",
-			Sites: map[string]string{
-				"api.example.com": "https://site-proxy.example:8443",
+	// A resolver guards its configuration with a lock, so every case builds its
+	// own instead of copying a shared one.
+	newResolver := func() *Resolver {
+		return &Resolver{
+			Config: ProxyConfig{
+				Default: "http://default-proxy.example:8080",
+				Sites: map[string]string{
+					"api.example.com": "https://site-proxy.example:8443",
+				},
+				Keys: map[string]string{
+					"key-a": "socks5://key-proxy.example:1080",
+				},
 			},
-			Keys: map[string]string{
-				"key-a": "socks5://key-proxy.example:1080",
+			SystemProxy: func(*http.Request) (*url.URL, error) {
+				return systemURL, nil
 			},
-		},
-		SystemProxy: func(*http.Request) (*url.URL, error) {
-			return systemURL, nil
-		},
+		}
 	}
 
 	tests := []struct {
@@ -80,9 +84,9 @@ func TestResolverPrecedence(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			candidate := resolver
+			candidate := newResolver()
 			if test.mutate != nil {
-				test.mutate(&candidate)
+				test.mutate(candidate)
 			}
 			resolved, err := candidate.Resolve(test.request)
 			if err != nil {

@@ -349,7 +349,7 @@ func TestConsoleHasSettingsViewWithPasswordForm(t *testing.T) {
 	page := string(body)
 
 	for _, wanted := range []string{
-		`id="settings-button"`,
+		`data-view="settings"`,
 		`id="settings-view"`,
 		`id="password-form"`,
 		`id="current-password"`,
@@ -359,6 +359,79 @@ func TestConsoleHasSettingsViewWithPasswordForm(t *testing.T) {
 	} {
 		if !strings.Contains(page, wanted) {
 			t.Errorf("console is missing %q", wanted)
+		}
+	}
+}
+
+// Adding and editing configuration is the console's second job, so the page has
+// to carry a view and a create button per managed resource, and the dialog the
+// editor form renders into.
+func TestConsoleCarriesTheManagementViewsAndEditor(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/console/", nil)
+	response := httptest.NewRecorder()
+	Handler().ServeHTTP(response, request)
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	page := string(body)
+
+	for _, resource := range []string{"channels", "routes", "sites", "accounts", "tokens", "proxies", "keys"} {
+		for _, wanted := range []string{
+			`data-management="` + resource + `"`,
+			`data-create="` + resource + `"`,
+		} {
+			if !strings.Contains(page, wanted) {
+				t.Errorf("console is missing %q for %s", wanted, resource)
+			}
+		}
+	}
+	// Each view toggles as a whole, so the container and its navigation entry
+	// have to exist even before the script runs.
+	for _, view := range []string{"overview", "channels", "routes", "upstream", "keys", "settings"} {
+		if !strings.Contains(page, `data-view="`+view+`"`) {
+			t.Errorf("console navigation has no %q entry", view)
+		}
+	}
+	for _, wanted := range []string{
+		`id="editor-overlay"`,
+		`id="editor-form"`,
+		`id="editor-fields"`,
+		`id="confirm-overlay"`,
+		`id="secret-overlay"`,
+	} {
+		if !strings.Contains(page, wanted) {
+			t.Errorf("console is missing %q", wanted)
+		}
+	}
+}
+
+// The management script must write through the same origin-relative paths it
+// reads, and it must never fall back to storing a credential in the browser.
+func TestConsoleScriptWritesConfigurationThroughTheApi(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/console/app.js", nil)
+	response := httptest.NewRecorder()
+	Handler().ServeHTTP(response, request)
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	script := string(body)
+
+	// Writes reach the API through the relative helper, so a mounted prefix
+	// keeps working.
+	for _, wanted := range []string{"apiPath(", "'/management/configuration'", "'/management/configuration/keys/'"} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("console script is missing %q", wanted)
+		}
+	}
+	// A stored secret arrives as a mask and the field itself submits empty, so
+	// the only credential the script ever holds is one it just created.
+	for _, wanted := range []string{"openSecret(", "留空保持不变", "当前值："} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("console script is missing %q", wanted)
 		}
 	}
 }

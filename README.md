@@ -1,6 +1,6 @@
 # Fluxgate
 
-Fluxgate is a lightweight, independently deployable Go gateway that reads the existing upstream SQLite configuration and provides OpenAI-compatible proxy endpoints, bounded server-side retries, weighted routing, proxy selection, and persistent circuit-breaker state.
+Fluxgate is a lightweight, independently deployable Go gateway that reads the existing upstream SQLite configuration and provides OpenAI-compatible proxy endpoints, bounded server-side retries, weighted routing, proxy selection, and persistent circuit-breaker state. It ships with an embedded management console that both shows the running state and edits that configuration: upstream sites, accounts, tokens, routes, channels, client keys, and proxy profiles.
 
 ## Requirements
 
@@ -281,11 +281,54 @@ channels, and routable models, refreshing itself every ten seconds. The interfac
 in Simplified Chinese; the endpoints it calls are unchanged, and the gateway's own
 error codes stay stable for automation while the console renders them in Chinese.
 
+### Managing the configuration from the console
+
+The console is also where the configuration is edited: sites, accounts, account
+tokens, routes, channels, client keys, and proxy profiles can all be added,
+changed, and removed without touching the database by hand or restarting the
+gateway. Every accepted write reloads the configuration and hands the result to
+the routing engine, so a channel added in the console serves traffic on the next
+request.
+
+The views are 概览 (the live dashboard), 通道 (channels), 路由 (routes), 上游
+(sites, accounts, tokens, and proxies), 客户端密钥 (client keys), and 设置 (the
+administrator account). Each editable table has an 添加 button, and every row has
+编辑 and 删除 actions; client keys additionally have 轮换, which mints a new value
+and invalidates the old one immediately.
+
+A few rules the console enforces, all of them on the server rather than in the
+browser:
+
+- **Secrets are write-only.** An upstream access token or client key is stored as
+  written but returned as a mask showing its last four characters. The form for an
+  existing row starts empty and leaves the stored value alone unless a new value is
+  typed, so a mask can never be saved back over a credential. A key is shown in
+  full exactly once, when it is created or rotated.
+- **References are checked.** A channel must name a route, an account, and — when
+  it names one — a token that belongs to that account. A delete is refused while
+  other rows still point at it, and the refusal says how many and of which kind.
+  Deleting a route does take its channels with it, and the console reports how many
+  went.
+- **Values are typed and bounded.** Model mappings, custom headers, exclusion
+  lists, and weight multipliers are validated as JSON of the expected shape; a URL
+  has to be one the transport can actually use; text has a byte bound. A rejected
+  field is answered with `400 invalid_configuration` carrying the field name, a
+  stable `reason` code, and its parameters, which the console renders in Chinese
+  and highlights on the form.
+- **A write is same-origin.** The console authenticates with a cookie, so a
+  state-changing request is only accepted from the gateway's own origin. The
+  management token remains accepted, because a script carries it in a header a
+  page cannot set.
+
+Every write is logged as `console_configuration_created`, `…_updated`, `…_deleted`,
+or `…_key_rotated` with the resource, the row id, and the client address. Values
+are never logged, because a write carries credentials.
+
 The console page itself is unauthenticated so it can render the sign-in form; every
-data request it makes goes to the authenticated management endpoints below. Sign-in
-issues an HTTP-only session cookie, so no credential is kept in JavaScript-accessible
-storage, and the panel is served with a strict Content-Security-Policy, `nosniff`,
-and framing protection.
+data request it makes — reads and writes alike — goes to the authenticated management
+endpoints below. Sign-in issues an HTTP-only session cookie, so no credential is kept
+in JavaScript-accessible storage, and the panel is served with a strict
+Content-Security-Policy, `nosniff`, and framing protection.
 
 ### Sign in and the default password
 
@@ -348,16 +391,38 @@ Management endpoints:
 
 - `GET /management/status`
 - `GET /management/snapshot`
+- `GET /management/configuration`
+- `POST /management/configuration/{resource}`
+- `PUT /management/configuration/{resource}/{id}`
+- `DELETE /management/configuration/{resource}/{id}`
+- `POST /management/configuration/keys/{id}/rotate`
 - `GET /management/session`
 - `POST /management/login`
 - `POST /management/logout`
 - `POST /management/password`
 
+`{resource}` is one of `sites`, `accounts`, `tokens`, `routes`, `channels`, `keys`, or
+`proxies`. `GET /management/configuration` returns every row of each resource with
+secrets masked, the writable field list of each resource, and the models the gateway
+currently routes, so the console builds its tables and forms from one payload. A
+successful write answers with the stored row and the reloaded payload, so the console
+repaints from a single round trip; when a key value was minted it is returned once as
+`generated.key`. A create needs the fields the resource marks as required and takes
+the schema default for the rest; an update applies only the fields the request
+carries, so a partial update from automation never clears what it did not mention.
+
+The write endpoints refuse a request that changes nothing valid: `400` with
+`invalid_configuration` for a bad value (the body names the `field` and a stable
+`reason`), `404 unknown_resource` or `configuration_not_found`, `409
+configuration_referenced` when a delete would orphan other rows, `409
+configuration_conflict` for a duplicate value such as a client key, and `403
+cross_origin_rejected` for a state-changing request from another origin.
+
 `/management/session`, `/management/login`, and `/management/logout` manage the console
 session itself and are therefore not themselves protected by one. `/management/password`
 requires a session but works while a password change is pending, which is the only way
-out of that state. `/management/status` and `/management/snapshot` accept either a
-console session cookie or the configured management token, so existing automation keeps
+out of that state. Every other management endpoint accepts either a console session
+cookie or the configured management token, so existing automation keeps
 working. Send the token as either `Authorization: Bearer YOUR_MANAGEMENT_TOKEN` or
 `X-Management-Token: YOUR_MANAGEMENT_TOKEN`.
 
@@ -596,8 +661,10 @@ go test -race ./...
 ## Security notes
 
 - Do not place downstream or upstream API keys in URLs, command histories, logs, or screenshots.
-- The gateway does not return upstream API keys or authenticated proxy URLs through its operational endpoints.
+- The gateway does not return upstream API keys or authenticated proxy URLs through its operational endpoints. The console's configuration listing masks every stored secret to its last four characters, and a client key is returned in full only in the response that created or rotated it.
 - The console HTML shell is served without authentication but contains no gateway data; channel names, priorities, and breaker state are only returned by the authenticated management endpoints.
+- Configuration writes are authenticated like any other management request, validated field by field against the tables they touch, and refused from a foreign origin. Because the console authenticates with a cookie, `SameSite=Lax` and the origin check are what keep a cross-site page from driving a write; a request that carries the management token in a header sends no `Origin` and is accepted, which is the automation path.
+- Writes are audited by event with the resource, the row id, and the client address, and never with the values, because a request body carries credentials.
 - The administrator password is stored as a bcrypt hash and never in plaintext; session tokens are stored only as SHA-256 hashes, so a leaked database cannot be replayed as a live session. Console sign-in is rate limited per client address and every attempt is logged.
 - A gateway with no administrator starts with `admin` / `admin`. That credential cannot read anything until it is changed, because the data endpoints answer `403 password_change_required` to an account holding it. Someone who finds the console before you sign in can therefore still claim the account by setting its password, so on a publicly reachable deployment sign in and change it promptly, or set `FLUXGATE_ADMIN_PASSWORD` to a value only you know before the first start.
 - There is no password strength requirement by design: the gateway will accept a one-character password. Strength is the operator's decision, and the rate limiter plus the audit log are the compensating controls.
@@ -609,4 +676,16 @@ go test -race ./...
 
 ## Current integration boundary
 
-The Go gateway is an independent service and does not replace the existing TypeScript management server. It reuses the existing SQLite configuration, owns only its circuit-breaker persistence table, and can run alongside the current React and TypeScript application during gradual migration.
+The Go gateway is an independent service that can run alongside the existing React
+and TypeScript application during gradual migration. It reads the same SQLite
+configuration and owns two additional tables of its own: `gateway_breaker_states`
+for circuit-breaker persistence and the `gateway_admin_*` tables for the console
+credential and its sessions.
+
+The console can also edit that configuration, which makes the gateway a writer of
+the shared file. SQLite requires every writer of one database to share the same host
+and locking primitives, so when both applications are in use, run each against its
+own database copy or retire one of them as a writer; the warning in
+[Prepare the database](#prepare-the-database) explains the corruption this prevents.
+A write replaces only the columns the request names, so a column the other
+application owns is left as it is.

@@ -34,11 +34,17 @@ ORDER BY id`
 
 // channelQuery loads every route channel with the account, site and token it
 // dispatches through.
+//
+// The two status columns are coalesced because the upstream schema declares a
+// default rather than a constraint: a row written without one holds NULL, and
+// the gateway has to keep reading a configuration another writer produced. An
+// unspecified status therefore reads as the schema's own default, active, which
+// is what every other column of these tables already does.
 const channelQuery = `SELECT
 	rc.route_id, rc.id, COALESCE(rc.priority, 0), COALESCE(rc.weight, 10), COALESCE(rc.enabled, 1), rc.source_model, rc.token_id,
 	a.id, a.access_token, a.api_token, a.extra_config, COALESCE(a.status, 'active'),
 	s.id, s.name, s.url, s.platform, s.forced_upstream_endpoint, s.proxy_url,
-	COALESCE(s.use_system_proxy, 0), s.custom_headers, s.status, COALESCE(s.global_weight, 1),
+	COALESCE(s.use_system_proxy, 0), s.custom_headers, COALESCE(s.status, 'active'), COALESCE(s.global_weight, 1),
 	at.token, at.proxy_url, COALESCE(at.use_system_proxy, 0), COALESCE(at.enabled, 1)
 FROM route_channels rc
 JOIN accounts a ON a.id = rc.account_id

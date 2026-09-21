@@ -77,12 +77,6 @@
           <span id="topbar-status" class="status-pill status-unknown" data-status>
             <span class="status-dot" aria-hidden="true"></span><span data-status-label>连接中</span>
           </span>
-          <button id="settings-button" class="btn btn-ghost btn-icon" type="button" title="设置" aria-label="设置">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z" fill="none" stroke="currentColor" stroke-width="1.7"/>
-              <path d="M19.4 13a7.6 7.6 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7.6 7.6 0 0 0-1.7-1L15 3.4h-4l-.3 2.6a7.6 7.6 0 0 0-1.7 1l-2.4-1-2 3.4L6.6 11a7.6 7.6 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7.6 7.6 0 0 0 1.7 1l.3 2.6h4l.3-2.6a7.6 7.6 0 0 0 1.7-1l2.4 1 2-3.4-2-1.6z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
-            </svg>
-          </button>
           <button id="refresh-button" class="btn btn-ghost btn-icon" type="button" title="立即刷新" aria-label="立即刷新">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M20 12a8 8 0 1 1-2.34-5.66M20 3v5h-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
@@ -95,9 +89,19 @@
           </button>
         </div>
       </div>
+
+      <!-- 应用内视图切换。每个按钮对应一个 main，只有一个可见。 -->
+      <nav class="console-nav" id="console-nav" aria-label="管理台视图">
+        <button class="nav-item is-active" type="button" data-view="overview">概览</button>
+        <button class="nav-item" type="button" data-view="channels">通道</button>
+        <button class="nav-item" type="button" data-view="routes">路由</button>
+        <button class="nav-item" type="button" data-view="upstream">上游</button>
+        <button class="nav-item" type="button" data-view="keys">客户端密钥</button>
+        <button class="nav-item" type="button" data-view="settings">设置</button>
+      </nav>
     </header>
 
-    <main class="container">
+    <div class="container banner-holder">
       <div id="error-banner" class="banner banner-error" hidden>
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <path d="M12 8v5M12 16.5v.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
@@ -110,6 +114,17 @@
         <button id="banner-retry" class="btn btn-ghost" type="button">重试</button>
       </div>
 
+      <div id="notice" class="banner banner-success" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="m6 12.5 4 4 8-9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <div class="banner-body"><span data-notice></span></div>
+        <button id="notice-dismiss" class="btn btn-ghost" type="button">关闭</button>
+      </div>
+    </div>
+
+    <!-- ===== 概览：只读的运行时快照 ===== -->
+    <main class="container" data-view-panel="overview">
       <section class="stats-grid" aria-label="概览">
         <article class="stat-card" data-stat="service">
           <div class="stat-icon">
@@ -212,7 +227,7 @@
         </div>
         <div class="empty-state" data-channels-empty hidden>
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.5" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="18" cy="6" r="2.5" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="12" cy="18" r="2.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M6 8.5v1a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3v-1M12 12.5v3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-          <p>尚未配置上游通道</p>
+          <p>尚未配置上游通道，到「通道」页添加</p>
         </div>
       </section>
 
@@ -239,16 +254,144 @@
       </footer>
     </main>
 
-    <!-- 设置：已登录应用内的第二个视图，从顶栏的齿轮进入。密码表单显式关闭
-         自动填充，否则密码管理器静默填入会直接改掉存储的凭据。 -->
-    <main id="settings-view" class="container" hidden>
+    <!-- ===== 通道：路由指向上游账号的绑定关系 ===== -->
+    <main class="container" data-view-panel="channels" hidden>
+      <section class="panel" data-management="channels">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="title-tick" aria-hidden="true"></span>
+            <h2>上游通道</h2>
+            <span class="panel-meta" data-meta></span>
+          </div>
+          <button class="btn btn-primary" type="button" data-create="channels">添加通道</button>
+        </header>
+        <p class="panel-help">通道把一个上游账号（以及可选的账号令牌）挂到一条路由上。同一路由下优先级最高的通道优先被选中，同优先级之间按权重轮询。</p>
+        <div class="table-wrap">
+          <table class="data-table" data-table="channels"><tbody data-body="channels"></tbody></table>
+        </div>
+        <div class="empty-state" data-empty="channels" hidden>
+          <p data-empty-text>还没有通道。先添加站点、账号和路由，再把它们连起来。</p>
+        </div>
+      </section>
+    </main>
+
+    <!-- ===== 路由：模型名到上游的映射 ===== -->
+    <main class="container" data-view-panel="routes" hidden>
+      <section class="panel" data-management="routes">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="title-tick" aria-hidden="true"></span>
+            <h2>路由</h2>
+            <span class="panel-meta" data-meta></span>
+          </div>
+          <button class="btn btn-primary" type="button" data-create="routes">添加路由</button>
+        </header>
+        <p class="panel-help">路由决定客户端请求哪个模型名时由哪些通道回应。模型名支持 <code>*</code>、<code>?</code> 通配符，以 <code>re:</code> 开头则按正则匹配。</p>
+        <div class="table-wrap">
+          <table class="data-table" data-table="routes"><tbody data-body="routes"></tbody></table>
+        </div>
+        <div class="empty-state" data-empty="routes" hidden>
+          <p data-empty-text>还没有路由。没有路由时网关不会向上游转发任何请求。</p>
+        </div>
+      </section>
+    </main>
+
+    <!-- ===== 上游：站点、账号、令牌与代理 ===== -->
+    <main class="container" data-view-panel="upstream" hidden>
+      <section class="panel" data-management="sites">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="title-tick" aria-hidden="true"></span>
+            <h2>站点</h2>
+            <span class="panel-meta" data-meta></span>
+          </div>
+          <button class="btn btn-primary" type="button" data-create="sites">添加站点</button>
+        </header>
+        <p class="panel-help">站点是一个上游服务的地址。只有状态为 <code>active</code> 的站点才会参与选路。</p>
+        <div class="table-wrap">
+          <table class="data-table" data-table="sites"><tbody data-body="sites"></tbody></table>
+        </div>
+        <div class="empty-state" data-empty="sites" hidden><p data-empty-text>还没有站点。</p></div>
+      </section>
+
+      <section class="panel" data-management="accounts">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="title-tick" aria-hidden="true"></span>
+            <h2>账号</h2>
+            <span class="panel-meta" data-meta></span>
+          </div>
+          <button class="btn btn-primary" type="button" data-create="accounts">添加账号</button>
+        </header>
+        <p class="panel-help">账号是站点上的一份凭据。访问令牌按写入保存，读取时只显示末四位。</p>
+        <div class="table-wrap">
+          <table class="data-table" data-table="accounts"><tbody data-body="accounts"></tbody></table>
+        </div>
+        <div class="empty-state" data-empty="accounts" hidden><p data-empty-text>还没有账号。</p></div>
+      </section>
+
+      <section class="panel" data-management="tokens">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="title-tick" aria-hidden="true"></span>
+            <h2>账号令牌</h2>
+            <span class="panel-meta" data-meta></span>
+          </div>
+          <button class="btn btn-primary" type="button" data-create="tokens">添加令牌</button>
+        </header>
+        <p class="panel-help">一个账号可以带多个令牌，通道可以指定使用其中某一个；不指定时使用账号本身的访问令牌。</p>
+        <div class="table-wrap">
+          <table class="data-table" data-table="tokens"><tbody data-body="tokens"></tbody></table>
+        </div>
+        <div class="empty-state" data-empty="tokens" hidden><p data-empty-text>还没有令牌。</p></div>
+      </section>
+
+      <section class="panel" data-management="proxies">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="title-tick" aria-hidden="true"></span>
+            <h2>代理</h2>
+            <span class="panel-meta" data-meta></span>
+          </div>
+          <button class="btn btn-primary" type="button" data-create="proxies">添加代理</button>
+        </header>
+        <p class="panel-help">代理按「令牌/账号 → 站点 → 默认代理 → 系统代理 → 直连」的顺序生效。站点和账号上的代理地址优先于这里的默认代理。</p>
+        <div class="table-wrap">
+          <table class="data-table" data-table="proxies"><tbody data-body="proxies"></tbody></table>
+        </div>
+        <div class="empty-state" data-empty="proxies" hidden><p data-empty-text>还没有代理。</p></div>
+      </section>
+    </main>
+
+    <!-- ===== 客户端密钥：下游调用方使用的凭据 ===== -->
+    <main class="container" data-view-panel="keys" hidden>
+      <section class="panel" data-management="keys">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="title-tick" aria-hidden="true"></span>
+            <h2>客户端密钥</h2>
+            <span class="panel-meta" data-meta></span>
+          </div>
+          <button class="btn btn-primary" type="button" data-create="keys">添加密钥</button>
+        </header>
+        <p class="panel-help">客户端用这些密钥调用 <code>/v1/…</code> 接口。密钥只在创建或轮换时显示一次，之后仅显示末四位。</p>
+        <div class="table-wrap">
+          <table class="data-table" data-table="keys"><tbody data-body="keys"></tbody></table>
+        </div>
+        <div class="empty-state" data-empty="keys" hidden>
+          <p data-empty-text>还没有客户端密钥。没有密钥时任何客户端都无法调用网关。</p>
+        </div>
+      </section>
+    </main>
+
+    <!-- ===== 设置：账号与密码 ===== -->
+    <main class="container" data-view-panel="settings" id="settings-view" hidden>
       <section class="panel">
         <header class="panel-header">
           <div class="panel-title">
             <span class="title-tick" aria-hidden="true"></span>
             <h2>账号</h2>
           </div>
-          <button id="settings-back" class="btn btn-ghost" type="button">返回概览</button>
         </header>
         <div class="settings-body">
           <p class="settings-note" id="settings-account"></p>
@@ -293,6 +436,70 @@
         </div>
       </section>
     </main>
+  </div>
+
+  <!-- 记录编辑表单。新建和编辑共用同一个模态框，字段由网关返回的字段清单生成。 -->
+  <div id="editor-overlay" class="modal-overlay" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="editor-title">
+      <header class="modal-header">
+        <h2 id="editor-title" class="modal-title">编辑</h2>
+        <button id="editor-close" class="btn btn-ghost btn-icon" type="button" title="关闭" aria-label="关闭">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </button>
+      </header>
+      <form id="editor-form" action="about:blank" autocomplete="off" spellcheck="false">
+        <div class="modal-body">
+          <p class="modal-note" id="editor-note" hidden></p>
+          <div id="editor-fields" class="editor-fields"></div>
+          <p id="editor-feedback" class="settings-feedback" role="alert" hidden></p>
+        </div>
+        <footer class="modal-actions">
+          <button id="editor-submit" type="submit" class="btn btn-primary">
+            <span class="btn-label">保存</span>
+          </button>
+          <button id="editor-cancel" class="btn btn-ghost" type="button">取消</button>
+        </footer>
+      </form>
+    </div>
+  </div>
+
+  <!-- 删除确认。危险操作走单独的模态框，避免误点。 -->
+  <div id="confirm-overlay" class="modal-overlay" hidden>
+    <div class="modal-card modal-card-narrow" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+      <header class="modal-header">
+        <h2 id="confirm-title" class="modal-title">确认删除</h2>
+      </header>
+      <div class="modal-body">
+        <p class="modal-note" id="confirm-text"></p>
+        <p id="confirm-feedback" class="settings-feedback" role="alert" hidden></p>
+      </div>
+      <footer class="modal-actions">
+        <button id="confirm-submit" class="btn btn-danger" type="button">
+          <span class="btn-label">删除</span>
+        </button>
+        <button id="confirm-cancel" class="btn btn-ghost" type="button">取消</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- 新建或轮换密钥后的一次性显示。密钥不会再次出现，所以给一个复制按钮。 -->
+  <div id="secret-overlay" class="modal-overlay" hidden>
+    <div class="modal-card modal-card-narrow" role="dialog" aria-modal="true" aria-labelledby="secret-title">
+      <header class="modal-header">
+        <h2 id="secret-title" class="modal-title">客户端密钥</h2>
+      </header>
+      <div class="modal-body">
+        <p class="modal-note" id="secret-text">请立即复制保存。关闭后将无法再次查看，只能重新生成。</p>
+        <div class="secret-row">
+          <input id="secret-value" class="field-input mono" type="text" readonly>
+          <button id="secret-copy" class="btn btn-ghost" type="button">复制</button>
+        </div>
+        <p id="secret-feedback" class="settings-feedback" role="alert" hidden></p>
+      </div>
+      <footer class="modal-actions">
+        <button id="secret-close" class="btn btn-primary" type="button">我已保存</button>
+      </footer>
+    </div>
   </div>
 
   <!-- 强制修改密码。当账号仍在使用内置默认密码时显示，此时网关拒绝提供任何

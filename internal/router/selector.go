@@ -47,6 +47,19 @@ func NewMemorySelectorWithFilter(routes []domain.Route, filter ChannelFilter) *M
 	return &MemorySelector{routes: copied, current: make(map[string]float64), filter: filter}
 }
 
+// SetRoutes replaces the routing table in place. The selector object itself is
+// never swapped, so a configuration change made in the management console takes
+// effect for the next request while requests already in flight finish against
+// the table they started with. Round-robin state is kept, because a channel that
+// survives the change should not lose its turn.
+func (s *MemorySelector) SetRoutes(routes []domain.Route) {
+	copied := append([]domain.Route(nil), routes...)
+	sort.SliceStable(copied, func(i, j int) bool { return copied[i].ID < copied[j].ID })
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.routes = copied
+}
+
 // Select resolves a channel for the requested model, applying the downstream
 // key policy and skipping channels already excluded by the retry loop.
 func (s *MemorySelector) Select(request domain.SelectionRequest) (domain.Selection, error) {
