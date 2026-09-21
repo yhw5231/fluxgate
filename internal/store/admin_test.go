@@ -23,7 +23,7 @@ func newAdminTestStore(t *testing.T) (*SQLiteStore, admin.Account) {
 	if err != nil {
 		t.Fatalf("HashPassword() error = %v", err)
 	}
-	account, err := store.CreateAdminAccount(ctx, "admin", hash)
+	account, err := store.CreateAdminAccount(ctx, "admin", hash, false)
 	if err != nil {
 		t.Fatalf("CreateAdminAccount() error = %v", err)
 	}
@@ -90,7 +90,7 @@ func TestCreateAdminAccountRejectsSecondAccount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HashPassword() error = %v", err)
 	}
-	if _, err := store.CreateAdminAccount(ctx, "second", hash); !errors.Is(err, ErrAdminAccountExists) {
+	if _, err := store.CreateAdminAccount(ctx, "second", hash, false); !errors.Is(err, ErrAdminAccountExists) {
 		t.Fatalf("CreateAdminAccount() with a different username error = %v, want ErrAdminAccountExists", err)
 	}
 
@@ -111,7 +111,7 @@ func TestCreateAdminAccountRejectsDuplicateUsername(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HashPassword() error = %v", err)
 	}
-	if _, err := store.CreateAdminAccount(ctx, "admin", hash); !errors.Is(err, ErrAdminAccountExists) {
+	if _, err := store.CreateAdminAccount(ctx, "admin", hash, false); !errors.Is(err, ErrAdminAccountExists) {
 		t.Fatalf("CreateAdminAccount() with the same username error = %v, want ErrAdminAccountExists", err)
 	}
 }
@@ -127,10 +127,10 @@ func TestCreateAdminAccountHonorsUsernameRules(t *testing.T) {
 		t.Fatalf("HashPassword() error = %v", err)
 	}
 
-	if _, err := store.CreateAdminAccount(ctx, "   ", hash); err == nil {
+	if _, err := store.CreateAdminAccount(ctx, "   ", hash, false); err == nil {
 		t.Fatal("CreateAdminAccount() accepted an empty username")
 	}
-	if _, err := store.CreateAdminAccount(ctx, "admin", "   "); err == nil {
+	if _, err := store.CreateAdminAccount(ctx, "admin", "   ", false); err == nil {
 		t.Fatal("CreateAdminAccount() accepted an empty password hash")
 	}
 }
@@ -360,5 +360,184 @@ func TestAdminTablesAreNotPartOfUpstreamSchema(t *testing.T) {
 		if strings.HasPrefix(name, "gateway_admin") {
 			t.Fatalf("upstream schema unexpectedly requires %q", name)
 		}
+	}
+}
+
+// A fresh database must end up with a usable account so the console is
+// reachable without a CLI step, and that account must be flagged so the
+// well-known password cannot reach data.
+func TestEnsureDefaultAdminAccountCreatesFlaggedAccount(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	if err := store.EnsureAdminSchema(ctx); err != nil {
+		t.Fatalf("EnsureAdminSchema() error = %v", err)
+	}
+
+	created, err := store.EnsureDefaultAdminAccount(ctx)
+	if err != nil {
+		t.Fatalf("EnsureDefaultAdminAccount() error = %v", err)
+	}
+	if !created {
+		t.Fatal("EnsureDefaultAdminAccount() reported no account created on an empty database")
+	}
+
+	account, err := store.LoadAdminAccount(ctx)
+	if err != nil {
+		t.Fatalf("LoadAdminAccount() error = %v", err)
+	}
+	if account.Username != admin.DefaultUsername {
+		t.Fatalf("username = %q, want %q", account.Username, admin.DefaultUsername)
+	}
+	if !account.ChangeRequired {
+		t.Fatal("a default-credential account must require a password change")
+	}
+	if err := admin.VerifyPassword(account.PasswordHash, admin.DefaultPassword); err != nil {
+		t.Fatalf("the stored hash does not verify the default password: %v", err)
+	}
+}
+
+func TestEnsureDefaultAdminAccountIsIdempotent(t *testing.T) {
+	store, account := newAdminTestStore(t)
+	ctx := context.Background()
+
+	created, err := store.EnsureDefaultAdminAccount(ctx)
+	if err != nil {
+		t.Fatalf("EnsureDefaultAdminAccount() error = %v", err)
+	}
+	if created {
+		t.Fatal("EnsureDefaultAdminAccount() created a second account")
+	}
+
+	loaded, err := store.LoadAdminAccount(ctx)
+	if err != nil {
+		t.Fatalf("LoadAdminAccount() error = %v", err)
+	}
+	if loaded.ID != account.ID || loaded.PasswordHash != account.PasswordHash {
+		t.Fatal("the existing account was modified")
+	}
+	if loaded.ChangeRequired {
+		t.Fatal("an existing account was flagged for a password change")
+	}
+}
+
+func TestChangeAdminPasswordClearsChangeRequiredAndKeepsSessions(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	if err := store.EnsureAdminSchema(ctx); err != nil {
+		t.Fatalf("EnsureAdminSchema() error = %v", err)
+	}
+	if _, err := store.EnsureDefaultAdminAccount(ctx); err != nil {
+		t.Fatalf("EnsureDefaultAdminAccount() error = %v", err)
+	}
+	account, err := store.LoadAdminAccount(ctx)
+	if err != nil {
+		t.Fatalf("LoadAdminAccount() error = %v", err)
+	}
+
+	// A session created while the change is pending must survive the change, so
+	// the operator is not ejected from the page they just used.
+	_, tokenHash, err := admin.NewSessionToken()
+	if err != nil {
+		t.Fatalf("NewSessionToken() error = %v", err)
+	}
+	now := time.Now().UTC()
+	if err := store.CreateAdminSession(ctx, account.ID, tokenHash, now, now.Add(time.Hour)); err != nil {
+		t.Fatalf("CreateAdminSession() error = %v", err)
+	}
+
+	newHash, err := admin.HashPassword("a-real-password")
+	if err != nil {
+		t.Fatalf("HashPassword() error = %v", err)
+	}
+	if err := store.ChangeAdminPassword(ctx, account.ID, newHash); err != nil {
+		t.Fatalf("ChangeAdminPassword() error = %v", err)
+	}
+
+	reloaded, err := store.LoadAdminAccount(ctx)
+	if err != nil {
+		t.Fatalf("LoadAdminAccount() error = %v", err)
+	}
+	if reloaded.ChangeRequired {
+		t.Fatal("ChangeAdminPassword() left the change-required flag set")
+	}
+	if err := admin.VerifyPassword(reloaded.PasswordHash, "a-real-password"); err != nil {
+		t.Fatalf("the new password does not verify: %v", err)
+	}
+	if err := admin.VerifyPassword(reloaded.PasswordHash, admin.DefaultPassword); !errors.Is(err, admin.ErrInvalidCredentials) {
+		t.Fatal("the default password still works after the change")
+	}
+
+	var sessions int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM gateway_admin_sessions`).Scan(&sessions); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if sessions != 1 {
+		t.Fatalf("sessions = %d, want 1; a password change must not eject the operator", sessions)
+	}
+}
+
+func TestChangeAdminPasswordRejectsUnknownAccount(t *testing.T) {
+	store, _ := newAdminTestStore(t)
+	hash, err := admin.HashPassword("a-real-password")
+	if err != nil {
+		t.Fatalf("HashPassword() error = %v", err)
+	}
+
+	if err := store.ChangeAdminPassword(context.Background(), 99999, hash); !errors.Is(err, ErrNoAdminAccount) {
+		t.Fatalf("ChangeAdminPassword() error = %v, want ErrNoAdminAccount", err)
+	}
+}
+
+func TestChangeAdminPasswordRejectsEmptyHash(t *testing.T) {
+	store, account := newAdminTestStore(t)
+	if err := store.ChangeAdminPassword(context.Background(), account.ID, "   "); err == nil {
+		t.Fatal("ChangeAdminPassword() accepted an empty password hash")
+	}
+}
+
+// A database created before change_required existed must gain the column
+// without being forced through a password change.
+func TestEnsureAdminSchemaMigratesOlderDatabase(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	// Reproduce the previous table shape, then insert an account as that version
+	// would have.
+	if _, err := store.db.ExecContext(ctx, `CREATE TABLE gateway_admin_users (
+		id INTEGER PRIMARY KEY,
+		username TEXT NOT NULL UNIQUE,
+		password_hash TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	)`); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	hash, err := admin.HashPassword("correct-horse-battery-staple")
+	if err != nil {
+		t.Fatalf("HashPassword() error = %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx,
+		`INSERT INTO gateway_admin_users (username, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+		"admin", hash, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("insert legacy account: %v", err)
+	}
+
+	if err := store.EnsureAdminSchema(ctx); err != nil {
+		t.Fatalf("EnsureAdminSchema() on a legacy database error = %v", err)
+	}
+	account, err := store.LoadAdminAccount(ctx)
+	if err != nil {
+		t.Fatalf("LoadAdminAccount() error = %v", err)
+	}
+	if account.ChangeRequired {
+		t.Fatal("an account predating the column was flagged for a password change")
+	}
+	if err := admin.VerifyPassword(account.PasswordHash, "correct-horse-battery-staple"); err != nil {
+		t.Fatalf("the migrated account no longer verifies its password: %v", err)
+	}
+
+	// Running it again must stay a no-op.
+	if err := store.EnsureAdminSchema(ctx); err != nil {
+		t.Fatalf("EnsureAdminSchema() is not idempotent: %v", err)
 	}
 }

@@ -32,6 +32,7 @@ var adminSchemaDDL = []string{
 		id INTEGER PRIMARY KEY,
 		username TEXT NOT NULL UNIQUE,
 		password_hash TEXT NOT NULL,
+		change_required INTEGER NOT NULL DEFAULT 0,
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL
 	)`,
@@ -45,12 +46,44 @@ var adminSchemaDDL = []string{
 	`CREATE INDEX IF NOT EXISTS gateway_admin_sessions_expires_at_idx ON gateway_admin_sessions(expires_at)`,
 }
 
-// EnsureAdminSchema prepares the authentication tables at startup.
+// EnsureAdminSchema prepares the authentication tables at startup and brings a
+// database created by an earlier version up to the current shape.
 func (s *SQLiteStore) EnsureAdminSchema(ctx context.Context) error {
 	for _, statement := range adminSchemaDDL {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("create admin table: %w", err)
 		}
+	}
+	if err := s.addAdminColumnIfMissing(ctx, "change_required", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// addAdminColumnIfMissing adds a column to gateway_admin_users when an older
+// database predates it. SQLite has no IF NOT EXISTS for a column, so the current
+// shape is compared first. The default is chosen so an account created before
+// the column existed is not forced through a password change it does not need.
+func (s *SQLiteStore) addAdminColumnIfMissing(ctx context.Context, column, definition string) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT name FROM pragma_table_info('gateway_admin_users')`)
+	if err != nil {
+		return fmt.Errorf("inspect gateway_admin_users: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return fmt.Errorf("scan gateway_admin_users column: %w", err)
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate gateway_admin_users columns: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE gateway_admin_users ADD COLUMN `+column+` `+definition); err != nil {
+		return fmt.Errorf("add gateway_admin_users.%s: %w", column, err)
 	}
 	return nil
 }
@@ -60,7 +93,10 @@ func (s *SQLiteStore) EnsureAdminSchema(ctx context.Context) error {
 // rather than only by the caller. The check is by row count, not by username,
 // because a unique index on the name alone would still allow a second
 // administrator under a different name.
-func (s *SQLiteStore) CreateAdminAccount(ctx context.Context, username, passwordHash string) (admin.Account, error) {
+//
+// changeRequired marks an account created with a well-known password; the
+// console will not serve data to such an account until the password is changed.
+func (s *SQLiteStore) CreateAdminAccount(ctx context.Context, username, passwordHash string, changeRequired bool) (admin.Account, error) {
 	normalized, err := admin.ValidateUsername(username)
 	if err != nil {
 		return admin.Account{}, err
@@ -79,8 +115,8 @@ func (s *SQLiteStore) CreateAdminAccount(ctx context.Context, username, password
 
 	now := time.Now().UTC()
 	result, err := s.db.ExecContext(ctx,
-		`INSERT INTO gateway_admin_users (username, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?)`,
-		normalized, passwordHash, formatTime(now), formatTime(now))
+		`INSERT INTO gateway_admin_users (username, password_hash, change_required, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
+		normalized, passwordHash, boolInt(changeRequired), formatTime(now), formatTime(now))
 	if err != nil {
 		// A concurrent create can still lose the race against the count above;
 		// the unique index is what actually serializes it.
@@ -94,16 +130,49 @@ func (s *SQLiteStore) CreateAdminAccount(ctx context.Context, username, password
 		return admin.Account{}, fmt.Errorf("read admin account id: %w", err)
 	}
 	return admin.Account{
-		ID:           id,
-		Username:     normalized,
-		PasswordHash: passwordHash,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		ID:             id,
+		Username:       normalized,
+		PasswordHash:   passwordHash,
+		ChangeRequired: changeRequired,
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}, nil
 }
 
+// EnsureDefaultAdminAccount creates the built-in administrator when the database
+// has none, so a fresh deployment is reachable without a CLI step. The account
+// is created with a change-required flag, so the well-known password grants only
+// the ability to set a real one.
+//
+// It reports whether an account was created.
+func (s *SQLiteStore) EnsureDefaultAdminAccount(ctx context.Context) (bool, error) {
+	_, err := s.LoadAdminAccount(ctx)
+	if err == nil {
+		return false, nil
+	}
+	if !errors.Is(err, ErrNoAdminAccount) {
+		return false, err
+	}
+
+	hash, err := admin.HashPassword(admin.DefaultPassword)
+	if err != nil {
+		return false, fmt.Errorf("hash default password: %w", err)
+	}
+	_, err = s.CreateAdminAccount(ctx, admin.DefaultUsername, hash, true)
+	if errors.Is(err, ErrAdminAccountExists) {
+		// Another process created it between the read and the write.
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // ReplaceAdminAccount resets the credential. It is used by the CLI so lost
-// access can be recovered without deleting the database.
+// access can be recovered without deleting the database. The reset clears the
+// change-required flag, because an operator running the CLI has already chosen
+// the password deliberately.
 func (s *SQLiteStore) ReplaceAdminAccount(ctx context.Context, username, passwordHash string) (admin.Account, error) {
 	normalized, err := admin.ValidateUsername(username)
 	if err != nil {
@@ -120,7 +189,7 @@ func (s *SQLiteStore) ReplaceAdminAccount(ctx context.Context, username, passwor
 	}
 
 	result, err := s.db.ExecContext(ctx,
-		`UPDATE gateway_admin_users SET username = ?, password_hash = ?, updated_at = ?`,
+		`UPDATE gateway_admin_users SET username = ?, password_hash = ?, change_required = 0, updated_at = ?`,
 		normalized, passwordHash, formatTime(now))
 	if err != nil {
 		return admin.Account{}, fmt.Errorf("replace admin account: %w", err)
@@ -130,7 +199,7 @@ func (s *SQLiteStore) ReplaceAdminAccount(ctx context.Context, username, passwor
 		return admin.Account{}, fmt.Errorf("read affected rows: %w", err)
 	}
 	if affected == 0 {
-		return s.CreateAdminAccount(ctx, normalized, passwordHash)
+		return s.CreateAdminAccount(ctx, normalized, passwordHash, false)
 	}
 
 	account, err := s.LoadAdminAccount(ctx)
@@ -140,19 +209,45 @@ func (s *SQLiteStore) ReplaceAdminAccount(ctx context.Context, username, passwor
 	return account, nil
 }
 
+// ChangeAdminPassword replaces the credential of the existing account and
+// clears the change-required flag. Unlike ReplaceAdminAccount it keeps the
+// current sessions, because the caller is the signed-in operator rotating their
+// own password rather than an out-of-band reset.
+func (s *SQLiteStore) ChangeAdminPassword(ctx context.Context, accountID int64, passwordHash string) error {
+	if strings.TrimSpace(passwordHash) == "" {
+		return errors.New("password hash must not be empty")
+	}
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE gateway_admin_users SET password_hash = ?, change_required = 0, updated_at = ? WHERE id = ?`,
+		passwordHash, formatTime(time.Now().UTC()), accountID)
+	if err != nil {
+		return fmt.Errorf("change admin password: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read affected rows: %w", err)
+	}
+	if affected == 0 {
+		return ErrNoAdminAccount
+	}
+	return nil
+}
+
 // LoadAdminAccount returns the single administrator account.
 func (s *SQLiteStore) LoadAdminAccount(ctx context.Context) (admin.Account, error) {
 	var account admin.Account
 	var createdAt, updatedAt string
+	var changeRequired int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, username, password_hash, created_at, updated_at FROM gateway_admin_users ORDER BY id LIMIT 1`,
-	).Scan(&account.ID, &account.Username, &account.PasswordHash, &createdAt, &updatedAt)
+		`SELECT id, username, password_hash, change_required, created_at, updated_at FROM gateway_admin_users ORDER BY id LIMIT 1`,
+	).Scan(&account.ID, &account.Username, &account.PasswordHash, &changeRequired, &createdAt, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return admin.Account{}, ErrNoAdminAccount
 	}
 	if err != nil {
 		return admin.Account{}, fmt.Errorf("load admin account: %w", err)
 	}
+	account.ChangeRequired = changeRequired != 0
 	account.CreatedAt, _ = parseTime(createdAt)
 	account.UpdatedAt, _ = parseTime(updatedAt)
 	return account, nil

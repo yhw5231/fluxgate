@@ -714,6 +714,109 @@ code {
 }
 *::-webkit-scrollbar-thumb:hover { background: rgba(148, 163, 184, 0.4); background-clip: content-box; }
 
+/* ===== Settings view ===== */
+.settings-body { padding: 20px 22px 24px; }
+
+.settings-note {
+  margin: 0 0 18px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.settings-form { max-width: 420px; }
+
+.settings-label {
+  display: block;
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+#password-form input[type="password"] {
+  width: 100%;
+  padding: 11px 14px;
+  margin-bottom: 16px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+#password-form input[type="password"]:focus {
+  outline: none;
+  border-color: var(--border-accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.settings-feedback {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+}
+
+.settings-feedback.is-error {
+  background: var(--danger-soft);
+  border: 1px solid rgba(248, 113, 113, 0.32);
+  color: #fecaca;
+}
+
+.settings-feedback.is-success {
+  background: var(--success-soft);
+  border: 1px solid rgba(52, 211, 153, 0.32);
+  color: #a7f3d0;
+}
+
+.settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.settings-hint {
+  margin: 16px 0 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+.settings-title {
+  margin: 0 0 6px;
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* The forced-change screen shown while the account still holds the built-in
+   default password. It covers the app because no data is reachable yet. */
+#password-required {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--bg-base);
+}
+
+#password-required .settings-card {
+  width: 100%;
+  max-width: 460px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 18px 48px rgba(2, 6, 23, 0.65);
+}
+
+.settings-card-body { padding: 22px; }
+
 /* ===== Responsive ===== */
 @media (max-width: 720px) {
   .topbar-inner { padding: 0 16px; }

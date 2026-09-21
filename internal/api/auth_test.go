@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -84,6 +85,17 @@ func (f *fakeSessionStore) DeleteAdminSession(_ context.Context, tokenHash strin
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.sessions, tokenHash)
+	return nil
+}
+
+func (f *fakeSessionStore) ChangeAdminPassword(_ context.Context, accountID int64, passwordHash string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.hasUser || f.account.ID != accountID {
+		return store.ErrNoAdminAccount
+	}
+	f.account.PasswordHash = passwordHash
+	f.account.ChangeRequired = false
 	return nil
 }
 
@@ -559,4 +571,287 @@ func (erroringSessionStore) AuthenticateAdminSession(context.Context, string, ti
 
 func (erroringSessionStore) DeleteAdminSession(context.Context, string) error {
 	return errors.New("boom")
+}
+
+func (erroringSessionStore) ChangeAdminPassword(context.Context, int64, string) error {
+	return errors.New("boom")
+}
+
+// requireChange marks the fake's account as holding a default password.
+func (f *fakeSessionStore) requireChange() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.account.ChangeRequired = true
+}
+
+// newDefaultCredentialStore returns a store holding the built-in default
+// password with the change-required flag set, as a fresh deployment has.
+func newDefaultCredentialStore() *fakeSessionStore {
+	return newFakeSessionStore(admin.DefaultUsername, admin.DefaultPassword)
+}
+
+// A fresh deployment creates admin/admin and must not serve data until the
+// password is changed, or the well-known credential would be enough to read
+// everything on a public deployment.
+func TestDefaultCredentialIsBlockedFromDataUntilChanged(t *testing.T) {
+	sessions := newDefaultCredentialStore()
+	sessions.requireChange()
+	server := &Server{Sessions: sessions}
+	handler := server.Handler()
+
+	login := submitLogin(t, handler, admin.DefaultUsername, admin.DefaultPassword)
+	if login.Code != http.StatusOK {
+		t.Fatalf("login with the default credential = %d, want 200 (body %s)", login.Code, login.Body.String())
+	}
+
+	// The login response tells the console to route straight to settings.
+	var loginBody map[string]any
+	if err := json.Unmarshal(login.Body.Bytes(), &loginBody); err != nil {
+		t.Fatalf("decode login body: %v", err)
+	}
+	if loginBody["change_required"] != true {
+		t.Fatalf("change_required = %v, want true", loginBody["change_required"])
+	}
+
+	cookie := sessionCookie(t, login)
+	for _, path := range []string{"/management/status", "/management/snapshot"} {
+		t.Run(path, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: cookie.Value})
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 while a password change is pending", response.Code)
+			}
+			if !strings.Contains(response.Body.String(), "password_change_required") {
+				t.Fatalf("body = %s, want password_change_required", response.Body.String())
+			}
+		})
+	}
+
+	// The session endpoint stays readable so the console knows why it is blocked.
+	request := httptest.NewRequest(http.MethodGet, "/management/session", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: cookie.Value})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("session status = %d, want 200", response.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode session body: %v", err)
+	}
+	if body["change_required"] != true {
+		t.Fatalf("change_required = %v, want true", body["change_required"])
+	}
+}
+
+func submitPasswordChange(t *testing.T, handler http.Handler, cookie string, current, next string) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := json.Marshal(map[string]string{"current_password": current, "new_password": next})
+	if err != nil {
+		t.Fatalf("marshal password body: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/management/password", strings.NewReader(string(body)))
+	request.Header.Set("Content-Type", "application/json")
+	if cookie != "" {
+		request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: cookie})
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+func TestPasswordChangeUnblocksDataAndReplacesCredential(t *testing.T) {
+	sessions := newDefaultCredentialStore()
+	sessions.requireChange()
+	handler := (&Server{Sessions: sessions}).Handler()
+
+	cookie := sessionCookie(t, submitLogin(t, handler, admin.DefaultUsername, admin.DefaultPassword))
+
+	response := submitPasswordChange(t, handler, cookie.Value, admin.DefaultPassword, "a-proper-secret")
+	if response.Code != http.StatusOK {
+		t.Fatalf("password change = %d, want 200 (body %s)", response.Code, response.Body.String())
+	}
+
+	// The same session now reaches data.
+	status := httptest.NewRequest(http.MethodGet, "/management/status", nil)
+	status.AddCookie(&http.Cookie{Name: sessionCookieName, Value: cookie.Value})
+	statusResponse := httptest.NewRecorder()
+	handler.ServeHTTP(statusResponse, status)
+	if statusResponse.Code != http.StatusOK {
+		t.Fatalf("status after the change = %d, want 200", statusResponse.Code)
+	}
+
+	// The old password is gone and the new one works.
+	if rejected := submitLogin(t, handler, admin.DefaultUsername, admin.DefaultPassword); rejected.Code != http.StatusUnauthorized {
+		t.Fatalf("the default password still signs in: status = %d", rejected.Code)
+	}
+	if accepted := submitLogin(t, handler, admin.DefaultUsername, "a-proper-secret"); accepted.Code != http.StatusOK {
+		t.Fatalf("the new password was rejected: status = %d (body %s)", accepted.Code, accepted.Body.String())
+	}
+}
+
+func TestPasswordChangeRequiresTheCurrentPassword(t *testing.T) {
+	sessions := newFakeSessionStore(admin.DefaultUsername, "original-secret")
+	handler := (&Server{Sessions: sessions}).Handler()
+	cookie := sessionCookie(t, submitLogin(t, handler, admin.DefaultUsername, "original-secret"))
+
+	// A stolen cookie alone must not let an attacker lock the operator out.
+	response := submitPasswordChange(t, handler, cookie.Value, "not-the-current-password", "attacker-choice")
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 for a wrong current password", response.Code)
+	}
+	if accepted := submitLogin(t, handler, admin.DefaultUsername, "original-secret"); accepted.Code != http.StatusOK {
+		t.Fatalf("the original password stopped working: status = %d", accepted.Code)
+	}
+}
+
+func TestPasswordChangeRequiresASession(t *testing.T) {
+	sessions := newFakeSessionStore(admin.DefaultUsername, "original-secret")
+	handler := (&Server{Sessions: sessions}).Handler()
+
+	if response := submitPasswordChange(t, handler, "", "original-secret", "new-secret"); response.Code != http.StatusUnauthorized {
+		t.Fatalf("status without a session = %d, want 401", response.Code)
+	}
+}
+
+func TestPasswordChangeRejectsUnchangedPassword(t *testing.T) {
+	sessions := newDefaultCredentialStore()
+	sessions.requireChange()
+	handler := (&Server{Sessions: sessions}).Handler()
+	cookie := sessionCookie(t, submitLogin(t, handler, admin.DefaultUsername, admin.DefaultPassword))
+
+	response := submitPasswordChange(t, handler, cookie.Value, admin.DefaultPassword, admin.DefaultPassword)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for an unchanged password", response.Code)
+	}
+	if !strings.Contains(response.Body.String(), "password_unchanged") {
+		t.Fatalf("body = %s, want password_unchanged", response.Body.String())
+	}
+
+	// Still blocked, because nothing actually changed.
+	status := httptest.NewRequest(http.MethodGet, "/management/status", nil)
+	status.AddCookie(&http.Cookie{Name: sessionCookieName, Value: cookie.Value})
+	statusResponse := httptest.NewRecorder()
+	handler.ServeHTTP(statusResponse, status)
+	if statusResponse.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; an unchanged password must not clear the gate", statusResponse.Code)
+	}
+}
+
+// There is no minimum length, so a one- or two-character password is accepted.
+func TestPasswordChangeAcceptsShortPasswords(t *testing.T) {
+	sessions := newFakeSessionStore(admin.DefaultUsername, "original-secret")
+	handler := (&Server{Sessions: sessions}).Handler()
+
+	for _, next := range []string{"a", "12", " "} {
+		t.Run("new password "+strconv.Quote(next), func(t *testing.T) {
+			cookie := sessionCookie(t, submitLogin(t, handler, admin.DefaultUsername, "original-secret"))
+			response := submitPasswordChange(t, handler, cookie.Value, "original-secret", next)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body %s)", response.Code, response.Body.String())
+			}
+			if accepted := submitLogin(t, handler, admin.DefaultUsername, next); accepted.Code != http.StatusOK {
+				t.Fatalf("the new password was rejected: status = %d", accepted.Code)
+			}
+			// Restore for the next case.
+			back := sessionCookie(t, submitLogin(t, handler, admin.DefaultUsername, next))
+			if restore := submitPasswordChange(t, handler, back.Value, next, "original-secret"); restore.Code != http.StatusOK {
+				t.Fatalf("could not restore the password: status = %d", restore.Code)
+			}
+		})
+	}
+}
+
+// An empty password can never be entered at sign-in, so accepting it would lock
+// the account out permanently. This is a reachability constraint rather than a
+// strength rule, and it is the only rejected value below the size ceiling.
+func TestPasswordChangeRejectsEmptyPassword(t *testing.T) {
+	sessions := newFakeSessionStore(admin.DefaultUsername, "original-secret")
+	handler := (&Server{Sessions: sessions}).Handler()
+	cookie := sessionCookie(t, submitLogin(t, handler, admin.DefaultUsername, "original-secret"))
+
+	response := submitPasswordChange(t, handler, cookie.Value, "original-secret", "")
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for an empty password", response.Code)
+	}
+	if !strings.Contains(response.Body.String(), "password_empty") {
+		t.Fatalf("body = %s, want password_empty", response.Body.String())
+	}
+	if accepted := submitLogin(t, handler, admin.DefaultUsername, "original-secret"); accepted.Code != http.StatusOK {
+		t.Fatalf("the original password stopped working: status = %d", accepted.Code)
+	}
+}
+
+// A long passphrase must work end to end, which plain bcrypt would refuse.
+func TestPasswordChangeAcceptsLongPassword(t *testing.T) {
+	sessions := newFakeSessionStore(admin.DefaultUsername, "original-secret")
+	handler := (&Server{Sessions: sessions}).Handler()
+	cookie := sessionCookie(t, submitLogin(t, handler, admin.DefaultUsername, "original-secret"))
+
+	long := strings.Repeat("a very long passphrase ", 12) // 276 bytes
+	if response := submitPasswordChange(t, handler, cookie.Value, "original-secret", long); response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for a long passphrase (body %s)", response.Code, response.Body.String())
+	}
+	if accepted := submitLogin(t, handler, admin.DefaultUsername, long); accepted.Code != http.StatusOK {
+		t.Fatalf("the long passphrase does not sign in: status = %d", accepted.Code)
+	}
+}
+
+func TestPasswordChangeRejectsMalformedBody(t *testing.T) {
+	sessions := newFakeSessionStore(admin.DefaultUsername, "original-secret")
+	handler := (&Server{Sessions: sessions}).Handler()
+	cookie := sessionCookie(t, submitLogin(t, handler, admin.DefaultUsername, "original-secret"))
+
+	request := httptest.NewRequest(http.MethodPost, "/management/password", strings.NewReader("{"))
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: cookie.Value})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", response.Code)
+	}
+}
+
+// The management token stays an automation credential and is not subject to the
+// console password-change gate.
+func TestManagementTokenBypassesChangeRequiredGate(t *testing.T) {
+	sessions := newDefaultCredentialStore()
+	sessions.requireChange()
+	handler := (&Server{Sessions: sessions, ManagementToken: "management-secret"}).Handler()
+
+	request := httptest.NewRequest(http.MethodGet, "/management/status", nil)
+	request.Header.Set("Authorization", "Bearer management-secret")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for the management token", response.Code)
+	}
+}
+
+func TestPasswordChangeDoesNotLogCredentials(t *testing.T) {
+	sessions := newFakeSessionStore(admin.DefaultUsername, "original-secret")
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, nil))
+	handler := (&Server{Sessions: sessions, Logger: logger}).Handler()
+	cookie := sessionCookie(t, submitLogin(t, handler, admin.DefaultUsername, "original-secret"))
+
+	submitPasswordChange(t, handler, cookie.Value, "original-secret", "brand-new-secret")
+	submitPasswordChange(t, handler, cookie.Value, "wrong-current-one", "another-secret")
+
+	logged := output.String()
+	for _, secret := range []string{"original-secret", "brand-new-secret", "wrong-current-one", "another-secret"} {
+		if strings.Contains(logged, secret) {
+			t.Fatalf("the log contains %q:\n%s", secret, logged)
+		}
+	}
+	if !strings.Contains(logged, "console_password_changed") {
+		t.Errorf("expected a change audit event, log = %s", logged)
+	}
+	if !strings.Contains(logged, "console_password_change_failed") {
+		t.Errorf("expected a failure audit event, log = %s", logged)
+	}
 }

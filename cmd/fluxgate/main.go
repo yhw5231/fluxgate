@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yhw5231/fluxgate/internal/admin"
 	"github.com/yhw5231/fluxgate/internal/api"
 	"github.com/yhw5231/fluxgate/internal/breaker"
 	"github.com/yhw5231/fluxgate/internal/config"
@@ -65,6 +66,19 @@ func run(parent context.Context, logger *slog.Logger) error {
 
 	if err := persistentStore.EnsureAdminSchema(parent); err != nil {
 		return err
+	}
+
+	// A fresh deployment gets a built-in administrator so the console is
+	// reachable without a CLI step. The account is flagged as needing a password
+	// change, and the data endpoints refuse it until that happens, so the
+	// well-known password only grants the ability to set a real one.
+	if created, err := persistentStore.EnsureDefaultAdminAccount(parent); err != nil {
+		return err
+	} else if created {
+		logger.Warn("default_admin_account_created",
+			"username", admin.DefaultUsername,
+			"detail", "sign in and change the password immediately; data endpoints stay blocked until then",
+		)
 	}
 
 	if err := persistentStore.EnsureUpstreamSchema(parent); err != nil {

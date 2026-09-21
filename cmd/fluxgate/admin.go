@@ -22,10 +22,11 @@ Usage:
   fluxgate admin reset  [--username NAME] [--database PATH]
   fluxgate admin status [--database PATH]
 
-The password is read from a terminal prompt with echo disabled, so it never
-appears in the process list or shell history. Set FLUXGATE_ADMIN_PASSWORD to
-supply it non-interactively, which is how a container entrypoint or a scripted
-deployment does it.
+The gateway creates a default administrator (admin / admin) automatically on
+first start, so this command is only needed to set a different password up
+front or to recover a lost one. The password is read from a terminal prompt with
+echo disabled, so it never appears in the process list or shell history. Set
+FLUXGATE_ADMIN_PASSWORD to supply it non-interactively instead.
 `
 
 // runAdmin implements the "admin" subcommand.
@@ -98,7 +99,7 @@ func createAdminAccount(ctx context.Context, persistentStore *store.SQLiteStore,
 	if err != nil {
 		return err
 	}
-	account, err := persistentStore.CreateAdminAccount(ctx, normalized, hash)
+	account, err := persistentStore.CreateAdminAccount(ctx, normalized, hash, false)
 	if err != nil {
 		if errors.Is(err, store.ErrAdminAccountExists) {
 			return errors.New("an administrator account already exists; use 'fluxgate admin reset' to replace the credential")
@@ -156,7 +157,7 @@ func readNewPassword() (string, error) {
 		return "", errors.New("stdin is not a terminal: set FLUXGATE_ADMIN_PASSWORD to provide the password non-interactively")
 	}
 
-	fmt.Printf("Password (at least %d characters): ", admin.MinPasswordBytes)
+	fmt.Print("Password: ")
 	first, err := term.ReadPassword(fd)
 	fmt.Println()
 	if err != nil {

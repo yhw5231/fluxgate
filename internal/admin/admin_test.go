@@ -1,27 +1,86 @@
 package admin
 
 import (
+	"bytes"
 	"errors"
 	"strings"
 	"testing"
 )
 
-func TestHashPasswordRejectsOutOfBoundsPasswords(t *testing.T) {
+// Passwords carry no length or complexity requirement beyond an abuse ceiling.
+func TestHashPasswordAcceptsAnyReasonablePassword(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		password string
+	}{
+		{name: "empty", password: ""},
+		{name: "single character", password: "a"},
+		{name: "short", password: "abc"},
+		{name: "the built-in default", password: DefaultPassword},
+		{name: "72 bytes", password: strings.Repeat("a", 72)},
+		{name: "73 bytes", password: strings.Repeat("a", 73)},
+		{name: "100 bytes", password: strings.Repeat("a", 100)},
+		{name: "at the ceiling", password: strings.Repeat("a", MaxPasswordBytes)},
+		{name: "unicode", password: "密码密码密码"},
+		{name: "spaces and symbols", password: "  !@#$%^&*()  "},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			hash, err := HashPassword(testCase.password)
+			if err != nil {
+				t.Fatalf("HashPassword() error = %v", err)
+			}
+			if err := VerifyPassword(hash, testCase.password); err != nil {
+				t.Fatalf("VerifyPassword() error = %v for the password just hashed", err)
+			}
+		})
+	}
+}
+
+func TestHashPasswordRejectsOnlyUnusableInput(t *testing.T) {
 	for _, testCase := range []struct {
 		name     string
 		password string
 		wantErr  error
 	}{
-		{name: "empty", password: "", wantErr: ErrPasswordTooShort},
-		{name: "too short", password: strings.Repeat("a", MinPasswordBytes-1), wantErr: ErrPasswordTooShort},
-		{name: "too long", password: strings.Repeat("a", MaxPasswordBytes+1), wantErr: ErrPasswordTooLong},
-		{name: "invalid utf8", password: strings.Repeat("a", MinPasswordBytes) + "\xff\xfe", wantErr: ErrPasswordInvalidEncoding},
+		{name: "past the ceiling", password: strings.Repeat("a", MaxPasswordBytes+1), wantErr: ErrPasswordTooLong},
+		{name: "invalid utf8", password: "valid" + "\xff\xfe", wantErr: ErrPasswordInvalidEncoding},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			if _, err := HashPassword(testCase.password); !errors.Is(err, testCase.wantErr) {
 				t.Fatalf("HashPassword() error = %v, want %v", err, testCase.wantErr)
 			}
 		})
+	}
+}
+
+// bcrypt rejects input past 72 bytes outright, so without pre-hashing a long
+// passphrase could not be stored at all — and two passwords sharing their first
+// 72 bytes would have to stay distinguishable.
+func TestLongPasswordsKeepTheirFullEntropy(t *testing.T) {
+	prefix := strings.Repeat("x", 72)
+	first := prefix + "-first-tail"
+	second := prefix + "-second-tail"
+
+	firstHash, err := HashPassword(first)
+	if err != nil {
+		t.Fatalf("HashPassword() error = %v; long passwords must be storable", err)
+	}
+	if err := VerifyPassword(firstHash, first); err != nil {
+		t.Fatalf("VerifyPassword() error = %v for the stored password", err)
+	}
+	if err := VerifyPassword(firstHash, second); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("VerifyPassword() error = %v; two passwords sharing a 72-byte prefix must not match", err)
+	}
+}
+
+// A generated NUL must not truncate the bcrypt input, which is why the prehash
+// is base64-encoded rather than used as raw digest bytes.
+func TestPrehashHasNoNulBytes(t *testing.T) {
+	for i := 0; i < 512; i++ {
+		prehashed := prehashPassword(string(rune(i)))
+		if bytes.IndexByte(prehashed, 0) != -1 {
+			t.Fatalf("prehash of %d contains a NUL byte", i)
+		}
 	}
 }
 

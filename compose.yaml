@@ -28,7 +28,7 @@ services:
       FLUXGATE_DATABASE_PATH: "/data/hub.db"
       # 管理端点/控制台的访问令牌，供脚本和自动化调用管理接口；留空则只接受账号会话
       FLUXGATE_MANAGEMENT_TOKEN: "${FLUXGATE_MANAGEMENT_TOKEN:-}"
-      # 首次启动自动创建控制台管理员账号的密码（至少 12 个字符）；
+      # 控制台管理员初始密码；留空则首次启动创建 admin/admin 并强制登录后改密
       # 账号创建后此变量不再生效，可从 .env 移除
       FLUXGATE_ADMIN_PASSWORD: "${FLUXGATE_ADMIN_PASSWORD:-}"
       FLUXGATE_ADMIN_USERNAME: "${FLUXGATE_ADMIN_USERNAME:-admin}"

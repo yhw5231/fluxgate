@@ -48,9 +48,8 @@
           <span class="btn-label">Sign in</span>
         </button>
         <p id="auth-error" class="auth-error" role="alert" hidden></p>
-        <p class="auth-hint">Signed in with the administrator account created by
-          <code>fluxgate admin create</code>. The session is kept in an HTTP-only
-          cookie and expires automatically.</p>
+        <p class="auth-hint">A fresh deployment starts with <code>admin</code> /
+          <code>admin</code> and asks for a new password at first sign-in.</p>
       </form>
     </div>
   </div>
@@ -74,6 +73,12 @@
           <span id="topbar-status" class="status-pill status-unknown" data-status>
             <span class="status-dot" aria-hidden="true"></span><span data-status-label>Connecting</span>
           </span>
+          <button id="settings-button" class="btn btn-ghost btn-icon" type="button" title="Settings" aria-label="Settings">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z" fill="none" stroke="currentColor" stroke-width="1.7"/>
+              <path d="M19.4 13a7.6 7.6 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7.6 7.6 0 0 0-1.7-1L15 3.4h-4l-.3 2.6a7.6 7.6 0 0 0-1.7 1l-2.4-1-2 3.4L6.6 11a7.6 7.6 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7.6 7.6 0 0 0 1.7 1l.3 2.6h4l.3-2.6a7.6 7.6 0 0 0 1.7-1l2.4 1 2-3.4-2-1.6z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+            </svg>
+          </button>
           <button id="refresh-button" class="btn btn-ghost btn-icon" type="button" title="Refresh now" aria-label="Refresh now">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M20 12a8 8 0 1 1-2.34-5.66M20 3v5h-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
@@ -81,7 +86,7 @@
           </button>
           <button id="signout-button" class="btn btn-ghost btn-icon" type="button" title="Sign out" aria-label="Sign out">
             <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M15 3h4a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1h-4M10 17l5-5-5-5M15 12H3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M15 3h4a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1h-4M10 17l5-5-5-5M15 12H3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
             </svg>
           </button>
         </div>
@@ -229,6 +234,105 @@
         <span class="footer-brand">fluxgate console</span>
       </footer>
     </main>
+
+    <!-- Settings: a separate view inside the signed-in app, reached from the
+         gear in the top bar. The password form opts out of autofill because a
+         password manager filling it silently would rotate the stored credential
+         without the operator noticing. -->
+    <main id="settings-view" class="container" hidden>
+      <section class="panel">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="title-tick" aria-hidden="true"></span>
+            <h2>Account</h2>
+          </div>
+          <button id="settings-back" class="btn btn-ghost" type="button">Back to dashboard</button>
+        </header>
+        <div class="settings-body">
+          <p class="settings-note" id="settings-account"></p>
+
+          <form id="password-form" class="settings-form"
+                action="about:blank" autocomplete="off" autocapitalize="off" spellcheck="false">
+            <!-- A dummy pair absorbs a password manager that ignores the form's
+                 autocomplete="off" and fills the first fields it finds. -->
+            <input type="text" name="fake-username" autocomplete="username" hidden tabindex="-1" aria-hidden="true">
+            <input type="password" name="fake-password" autocomplete="current-password" hidden tabindex="-1" aria-hidden="true">
+
+            <label class="settings-label" for="current-password">Current password</label>
+            <input id="current-password" name="current_password" type="password"
+                   autocomplete="new-password" data-1p-ignore data-lpignore="true"
+                   data-bwignore="true" data-form-type="other" required>
+
+            <label class="settings-label" for="new-password">New password</label>
+            <input id="new-password" name="new_password" type="password"
+                   autocomplete="new-password" data-1p-ignore data-lpignore="true"
+                   data-bwignore="true" data-form-type="other" required>
+
+            <label class="settings-label" for="confirm-password">Confirm new password</label>
+            <input id="confirm-password" name="confirm_password" type="password"
+                   autocomplete="new-password" data-1p-ignore data-lpignore="true"
+                   data-bwignore="true" data-form-type="other" required>
+
+            <p id="password-feedback" class="settings-feedback" role="alert" hidden></p>
+
+            <div class="settings-actions">
+              <button id="password-submit" type="submit" class="btn btn-primary">
+                <span class="btn-label">Change password</span>
+              </button>
+              <button id="password-cancel" type="button" class="btn btn-ghost">Cancel</button>
+            </div>
+            <p class="settings-hint">There is no minimum length: choose whatever
+              your deployment needs. Changing the password keeps you signed in on
+              this browser.</p>
+          </form>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Forced password change. Shown when the account still holds the built-in
+       default password, which the gateway refuses to serve data to. It is a
+       modal over the whole app because nothing behind it is reachable yet. -->
+  <div id="password-required" hidden>
+    <div class="settings-card" role="dialog" aria-labelledby="password-required-title">
+      <div class="settings-card-body">
+        <h2 id="password-required-title" class="settings-title">Set a new password</h2>
+        <p class="settings-note">This gateway still uses the default password, so
+          no gateway data is served until it is changed.</p>
+
+        <form id="required-password-form" class="settings-form"
+              action="about:blank" autocomplete="off" autocapitalize="off" spellcheck="false">
+          <input type="text" name="fake-username" autocomplete="username" hidden tabindex="-1" aria-hidden="true">
+          <input type="password" name="fake-password" autocomplete="current-password" hidden tabindex="-1" aria-hidden="true">
+
+          <label class="settings-label" for="required-current-password">Current password</label>
+          <input id="required-current-password" name="current_password" type="password"
+                 autocomplete="new-password" data-1p-ignore data-lpignore="true"
+                 data-bwignore="true" data-form-type="other" required>
+
+          <label class="settings-label" for="required-new-password">New password</label>
+          <input id="required-new-password" name="new_password" type="password"
+                 autocomplete="new-password" data-1p-ignore data-lpignore="true"
+                 data-bwignore="true" data-form-type="other" required>
+
+          <label class="settings-label" for="required-confirm-password">Confirm new password</label>
+          <input id="required-confirm-password" name="confirm_password" type="password"
+                 autocomplete="new-password" data-1p-ignore data-lpignore="true"
+                 data-bwignore="true" data-form-type="other" required>
+
+          <p id="required-password-feedback" class="settings-feedback" role="alert" hidden></p>
+
+          <div class="settings-actions">
+            <button id="required-password-submit" type="submit" class="btn btn-primary">
+              <span class="btn-label">Set password</span>
+            </button>
+            <button id="required-signout" type="button" class="btn btn-ghost">Sign out</button>
+          </div>
+          <p class="settings-hint">There is no minimum length: choose whatever
+            your deployment needs.</p>
+        </form>
+      </div>
+    </div>
   </div>
 
   <script src="app.js"></script>

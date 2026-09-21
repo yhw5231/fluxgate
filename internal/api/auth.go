@@ -21,6 +21,7 @@ type SessionStore interface {
 	CreateAdminSession(ctx context.Context, accountID int64, tokenHash string, issuedAt, expiresAt time.Time) error
 	AuthenticateAdminSession(ctx context.Context, token string, now time.Time) (admin.Account, error)
 	DeleteAdminSession(ctx context.Context, tokenHash string) error
+	ChangeAdminPassword(ctx context.Context, accountID int64, passwordHash string) error
 }
 
 // Console session lifetime. A session is a convenience for the operator, not a
@@ -154,15 +155,83 @@ func (s *Server) consoleAuthenticationEnabled(ctx context.Context) bool {
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	authenticated := false
 	username := ""
+	changeRequired := false
 	if account, ok := s.currentSession(r); ok {
 		authenticated = true
 		username = account.Username
+		changeRequired = account.ChangeRequired
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"authenticated": authenticated,
-		"username":      username,
-		"configured":    s.consoleAuthenticationEnabled(r.Context()),
+		"authenticated":   authenticated,
+		"username":        username,
+		"configured":      s.consoleAuthenticationEnabled(r.Context()),
+		"change_required": changeRequired,
 	})
+}
+
+// changePasswordRequest is the JSON body of a password change.
+type changePasswordRequest struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+// handleChangePassword sets a new password for the signed-in account. It exists
+// so an account created with the built-in default password can be made private,
+// and it is reachable in that state even though every data endpoint is blocked.
+func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	if s.Sessions == nil {
+		writeError(w, http.StatusServiceUnavailable, "console_auth_not_configured", "console authentication is not configured")
+		return
+	}
+
+	account, ok := s.currentSession(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "a console session is required")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	var request changePasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "request body must be a JSON object")
+		return
+	}
+
+	// Re-authenticate with the current password so a stolen session cookie alone
+	// cannot lock the real operator out of their own console.
+	if err := admin.VerifyPassword(account.PasswordHash, request.CurrentPassword); err != nil {
+		s.logAuthEvent(r, "console_password_change_failed", account.Username)
+		writeError(w, http.StatusUnauthorized, "invalid_credentials", "the current password is incorrect")
+		return
+	}
+	if request.NewPassword == request.CurrentPassword {
+		writeError(w, http.StatusBadRequest, "password_unchanged", "the new password must differ from the current one")
+		return
+	}
+	// Sign-in requires a password, so an empty one could never be used again and
+	// would lock the account out permanently. This is a reachability constraint,
+	// not a strength rule: no minimum length is enforced beyond it.
+	if request.NewPassword == "" {
+		writeError(w, http.StatusBadRequest, "password_empty", "the new password must not be empty, or sign-in would be impossible")
+		return
+	}
+	if err := admin.ValidatePassword(request.NewPassword); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_password", err.Error())
+		return
+	}
+
+	hash, err := admin.HashPassword(request.NewPassword)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_password", err.Error())
+		return
+	}
+	if err := s.Sessions.ChangeAdminPassword(r.Context(), account.ID, hash); err != nil {
+		writeError(w, http.StatusInternalServerError, "password_change_failed", "could not store the new password")
+		return
+	}
+
+	s.logAuthEvent(r, "console_password_changed", account.Username)
+	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "change_required": false})
 }
 
 // handleLogin verifies a username and password and issues a session cookie.
@@ -249,7 +318,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   int(sessionLifetime.Seconds()),
 	})
 	s.logAuthEvent(r, "console_login_succeeded", account.Username)
-	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "username": account.Username})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"authenticated":   true,
+		"username":        account.Username,
+		"change_required": account.ChangeRequired,
+	})
 }
 
 // handleLogout revokes the caller's session and clears the cookie.
@@ -295,8 +368,18 @@ func (s *Server) currentSession(r *http.Request) (admin.Account, bool) {
 // authenticateConsole authorizes a management request. A console session
 // issued by a sign-in is preferred; the configured management token remains
 // accepted so existing automation and scripts keep working unchanged.
+//
+// A session whose account still holds the built-in default password is refused
+// here rather than at the UI, so the gate cannot be bypassed by calling the
+// endpoint directly. Such an account can reach only the session and
+// change-password routes, which is what lets the operator set a real password.
 func (s *Server) authenticateConsole(w http.ResponseWriter, r *http.Request) bool {
-	if _, ok := s.currentSession(r); ok {
+	if account, ok := s.currentSession(r); ok {
+		if account.ChangeRequired {
+			writeError(w, http.StatusForbidden, "password_change_required",
+				"the console password must be changed before any data can be read")
+			return false
+		}
 		return true
 	}
 	return s.authenticateManagement(w, r)

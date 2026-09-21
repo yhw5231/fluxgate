@@ -27,6 +27,7 @@
 
   var state = {
     snapshot: null,
+    username: '',
     channelNames: {},
     timer: null,
     countdown: 0,
@@ -51,6 +52,31 @@
     els.uptime = $('topbar-uptime');
     els.refresh = $('refresh-button');
     els.signout = $('signout-button');
+
+    // Settings view and the password forms. Its container is the app, because
+    // the settings page is a second view inside the signed-in shell rather than
+    // a separate page load.
+    els.dashboardView = document.querySelector('.container:not(#settings-view)');
+    els.settingsButton = $('settings-button');
+    els.settingsView = $('settings-view');
+    els.settingsBack = $('settings-back');
+    els.settingsAccount = $('settings-account');
+    els.passwordForm = $('password-form');
+    els.currentPassword = $('current-password');
+    els.newPassword = $('new-password');
+    els.confirmPassword = $('confirm-password');
+    els.passwordFeedback = $('password-feedback');
+    els.passwordSubmit = $('password-submit');
+    els.passwordCancel = $('password-cancel');
+
+    els.passwordRequired = $('password-required');
+    els.requiredForm = $('required-password-form');
+    els.requiredCurrent = $('required-current-password');
+    els.requiredNew = $('required-new-password');
+    els.requiredConfirm = $('required-confirm-password');
+    els.requiredFeedback = $('required-password-feedback');
+    els.requiredSubmit = $('required-password-submit');
+    els.requiredSignout = $('required-signout');
 
     els.banner = $('error-banner');
     els.bannerTitle = els.banner.querySelector('[data-banner-title]');
@@ -160,6 +186,7 @@
   function showAuth(message) {
     stopAutoRefresh();
     els.app.hidden = true;
+    els.passwordRequired.hidden = true;
     els.authOverlay.hidden = false;
     els.authError.hidden = !message;
     els.authError.textContent = message || '';
@@ -172,7 +199,39 @@
   function showConsole() {
     els.authOverlay.hidden = true;
     els.app.hidden = false;
+    showDashboard();
+  }
+
+  /* The forced-change screen: the account still has the built-in password, so
+   * the gateway serves no data. Only the password form and sign-out are usable. */
+  function showPasswordRequired() {
+    stopAutoRefresh();
+    els.authOverlay.hidden = true;
+    els.app.hidden = false;
+    els.passwordRequired.hidden = false;
+    resetPasswordForm(els.requiredForm, els.requiredCurrent, els.requiredNew,
+      els.requiredConfirm, els.requiredFeedback);
+    els.requiredCurrent.focus();
+  }
+
+  function showDashboard() {
+    els.passwordRequired.hidden = true;
+    els.settingsView.hidden = true;
+    els.dashboardView.hidden = false;
     startAutoRefresh();
+  }
+
+  function showSettings() {
+    stopAutoRefresh();
+    els.passwordRequired.hidden = true;
+    els.dashboardView.hidden = true;
+    els.settingsView.hidden = false;
+    els.settingsAccount.textContent = state.username
+      ? 'Signed in as ' + state.username + '.'
+      : 'Signed in.';
+    resetPasswordForm(els.passwordForm, els.currentPassword, els.newPassword,
+      els.confirmPassword, els.passwordFeedback);
+    els.currentPassword.focus();
   }
 
   function signOut() {
@@ -236,6 +295,12 @@
 
       if (status.status === 401 || snapshot.status === 401) {
         showAuth('Your session expired. Sign in again to continue.');
+        return;
+      }
+      // The gateway refuses data to an account that still holds the default
+      // password; show the forced-change screen rather than an error banner.
+      if (status.status === 403 || snapshot.status === 403) {
+        showPasswordRequired();
         return;
       }
       if (status.status === 503 || snapshot.status === 503) {
@@ -489,6 +554,94 @@
     }
   }
 
+  /* ===== Password change ===== */
+
+  function resetPasswordForm(form, current, next, confirm, feedback) {
+    form.reset();
+    current.value = '';
+    next.value = '';
+    confirm.value = '';
+    feedback.hidden = true;
+    feedback.textContent = '';
+    feedback.className = 'settings-feedback';
+    var submit = form.querySelector('button[type="submit"]');
+    if (submit) {
+      submit.disabled = false;
+      submit.querySelector('.btn-label').textContent =
+        form.id === 'required-password-form' ? 'Set password' : 'Change password';
+    }
+  }
+
+  function passwordFeedback(feedback, message, kind) {
+    feedback.hidden = !message;
+    feedback.textContent = message || '';
+    feedback.className = 'settings-feedback' + (kind ? ' is-' + kind : '');
+  }
+
+  /* submitPasswordChange drives both the settings form and the forced-change
+   * form; onDone runs only after the gateway accepted the new password. */
+  function submitPasswordChange(form, feedback, onDone) {
+    var current = form.querySelector('input[name="current_password"]');
+    var next = form.querySelector('input[name="new_password"]');
+    var confirm = form.querySelector('input[name="confirm_password"]');
+    var submit = form.querySelector('button[type="submit"]');
+    var label = submit.querySelector('.btn-label');
+    var original = label.textContent;
+
+    feedback.hidden = true;
+
+    if (!current.value || !next.value) {
+      passwordFeedback(feedback, 'Enter the current password and the new password.', 'error');
+      return;
+    }
+    if (next.value !== confirm.value) {
+      passwordFeedback(feedback, 'The two new passwords do not match.', 'error');
+      confirm.focus();
+      return;
+    }
+
+    submit.disabled = true;
+    label.textContent = 'Saving…';
+
+    post('/management/password', {
+      current_password: current.value,
+      new_password: next.value
+    }).then(function (result) {
+      if (result.ok) {
+        resetPasswordForm(form, current, next, confirm, feedback);
+        // Clear the values the browser may have kept before handing control back.
+        form.reset();
+        current.value = next.value = confirm.value = '';
+        onDone();
+        return;
+      }
+      submit.disabled = false;
+      label.textContent = original;
+      if (result.status === 401) {
+        passwordFeedback(feedback, 'The current password is incorrect.', 'error');
+        current.value = '';
+        current.focus();
+        return;
+      }
+      if (result.status === 400 && result.body && result.body.error) {
+        passwordFeedback(feedback, result.body.error.message || 'The new password was rejected.', 'error');
+        return;
+      }
+      if (result.status === 403) {
+        // The session is authenticated but still gated: refresh so the forced
+        // screen reappears rather than silently failing.
+        passwordFeedback(feedback, 'Sign in again to change the password.', 'error');
+        return;
+      }
+      passwordFeedback(feedback, errorMessage(result.body, 'Unexpected gateway response.'), 'error');
+    }).catch(function (err) {
+      submit.disabled = false;
+      label.textContent = original;
+      passwordFeedback(feedback, 'Cannot reach the gateway: ' +
+        String(err && err.message ? err.message : err), 'error');
+    });
+  }
+
   /* ===== Wiring ===== */
 
   function setSubmitting(submitting) {
@@ -518,6 +671,13 @@
       post('/management/login', { username: username, password: password }).then(function (result) {
         if (result.ok) {
           els.authPassword.value = '';
+          state.username = (result.body && result.body.username) || username;
+          // A default-credential account must set a real password before the
+          // gateway will serve anything, so the console goes straight there.
+          if (result.body && result.body.change_required) {
+            showPasswordRequired();
+            return;
+          }
           showConsole();
           refresh();
           return;
@@ -527,7 +687,7 @@
           return;
         }
         if (result.status === 503) {
-          signInError('No administrator account exists yet. Run "fluxgate admin create" on the gateway host.');
+          signInError('Console sign-in is not configured on this gateway.');
           return;
         }
         if (result.status === 401) {
@@ -540,6 +700,33 @@
       });
     });
 
+    els.requiredForm.addEventListener('submit', function (event) {
+      event.preventDefault();
+      submitPasswordChange(els.requiredForm, els.requiredFeedback, function () {
+        showConsole();
+        refresh();
+      });
+    });
+    els.requiredSignout.addEventListener('click', signOut);
+
+    els.passwordForm.addEventListener('submit', function (event) {
+      event.preventDefault();
+      submitPasswordChange(els.passwordForm, els.passwordFeedback, function () {
+        passwordFeedback(els.passwordFeedback, 'Password updated.', 'success');
+        refresh();
+      });
+    });
+
+    els.settingsButton.addEventListener('click', showSettings);
+    els.settingsBack.addEventListener('click', function () {
+      showDashboard();
+      refresh();
+    });
+    els.passwordCancel.addEventListener('click', function () {
+      showDashboard();
+      refresh();
+    });
+
     els.refresh.addEventListener('click', refresh);
     els.signout.addEventListener('click', signOut);
     els.bannerRetry.addEventListener('click', refresh);
@@ -548,7 +735,7 @@
     });
 
     document.addEventListener('visibilitychange', function () {
-      if (!document.hidden && !els.app.hidden) { refresh(); }
+      if (!document.hidden && !els.dashboardView.hidden) { refresh(); }
     });
   }
 
@@ -560,12 +747,17 @@
 
     request('/management/session').then(function (result) {
       if (result.ok && result.body && result.body.authenticated) {
+        state.username = result.body.username || '';
+        if (result.body.change_required) {
+          showPasswordRequired();
+          return;
+        }
         showConsole();
         refresh();
         return;
       }
       if (result.ok && result.body && result.body.configured === false) {
-        showAuth('No administrator account exists yet. Run "fluxgate admin create" on the gateway host.');
+        showAuth('Console sign-in is not configured on this gateway.');
         return;
       }
       showAuth('');

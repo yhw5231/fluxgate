@@ -82,6 +82,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /management/session", s.handleSession)
 	mux.HandleFunc("POST /management/login", s.handleLogin)
 	mux.HandleFunc("POST /management/logout", s.handleLogout)
+	// Reachable while a password change is pending, which is the only way out of
+	// that state.
+	mux.HandleFunc("POST /management/password", s.handleChangePassword)
 	mux.HandleFunc("GET /management/status", s.handleStatus)
 	mux.HandleFunc("GET /management/snapshot", s.handleManagementSnapshot)
 	mux.HandleFunc("GET /v1/models", s.handleModels)

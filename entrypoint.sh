@@ -7,9 +7,9 @@
 # 若以非 root 用户启动（如 docker run --user 或 Kubernetes securityContext），
 # 则跳过准备阶段直接运行，此时数据目录必须已可写。
 #
-# 另外，若设置了 FLUXGATE_ADMIN_PASSWORD 且尚未创建管理员账号，则在启动网关
-# 前自动创建账号（仅首次生效）。未设置该变量时跳过，需自行执行
-# `fluxgate admin create`。
+# 另外，若设置了 FLUXGATE_ADMIN_PASSWORD，则在启动网关前用它创建管理员账号
+# （仅首次生效，账号已存在时忽略）。未设置时网关自身会创建 admin/admin 并强制
+# 首次登录后改密，因此无需任何配置即可使用控制台。
 set -eu
 
 run_uid="${GATEWAY_UID:-10001}"
