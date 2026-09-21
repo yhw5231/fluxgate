@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/yhw5231/fluxgate/internal/domain"
@@ -23,6 +24,14 @@ type Result struct {
 	Attempt  domain.Attempt
 }
 
+// DispatchPolicy is everything the engine consults while a request is being
+// retried: how often it may try, and how far it may move away from the channel
+// it started on.
+type DispatchPolicy struct {
+	Retry    domain.RetryPolicy
+	Failover domain.FailoverPolicy
+}
+
 // Engine performs bounded same-channel retries and channel failover before a
 // response is exposed to the downstream client.
 type Engine struct {
@@ -32,8 +41,40 @@ type Engine struct {
 	ProxyResolver *Resolver
 	TransportPool *TransportPool
 	Policy        domain.RetryPolicy
-	Sleep         func(context.Context, time.Duration) error
-	Now           func() time.Time
+	// Failover is the static failover configuration. A nil value means the
+	// engine's own default: a failed channel may be replaced by any other
+	// eligible one.
+	Failover *domain.FailoverPolicy
+	Sleep    func(context.Context, time.Duration) error
+	Now      func() time.Time
+
+	// installed holds the policy a console write installed, so a retry or
+	// failover change takes effect for the next request instead of at the next
+	// restart. It is read once per request, which is what keeps one request
+	// governed by one policy.
+	installed atomic.Pointer[DispatchPolicy]
+}
+
+// SetPolicy replaces the retry and failover policy. It is safe to call while
+// requests are in flight.
+func (e *Engine) SetPolicy(policy DispatchPolicy) {
+	if e == nil {
+		return
+	}
+	e.installed.Store(&policy)
+}
+
+// currentPolicy returns the installed policy, falling back to the static fields
+// so an engine assembled without a console keeps its configured behavior.
+func (e *Engine) currentPolicy() DispatchPolicy {
+	if stored := e.installed.Load(); stored != nil {
+		return *stored
+	}
+	failover := domain.FailoverPolicy{Enabled: true, CrossUpstream: true}
+	if e.Failover != nil {
+		failover = *e.Failover
+	}
+	return DispatchPolicy{Retry: e.Policy, Failover: failover}
 }
 
 // Forward transforms and dispatches an OpenAI-compatible request. Failed
@@ -46,7 +87,8 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 	if client == nil {
 		client = http.DefaultClient
 	}
-	policy := normalizePolicy(e.Policy)
+	policy := e.currentPolicy()
+	retry := normalizePolicy(policy.Retry)
 	sleep := e.Sleep
 	if sleep == nil {
 		sleep = sleepContext
@@ -59,18 +101,21 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 	excluded := make(map[string]struct{})
 	attemptsByChannel := make(map[string]int)
 	var lastFailure domain.Failure
+	// pinned records the channel the request started on, which is what a request
+	// with failover switched off, or with cross-upstream failover switched off,
+	// has to stay with.
+	pinned := domain.Selection{}
 
-	for attemptNumber := 1; attemptNumber <= policy.MaxAttempts; attemptNumber++ {
-		selection, err := e.Selector.Select(domain.SelectionRequest{
-			Model:    input.Model,
-			Policy:   input.Policy,
-			Excluded: excluded,
-		})
+	for attemptNumber := 1; attemptNumber <= retry.MaxAttempts; attemptNumber++ {
+		selection, err := e.Selector.Select(e.selectionRequest(input, excluded, pinned, policy.Failover))
 		if err != nil {
 			if lastFailure.Err != nil || lastFailure.StatusCode != 0 {
 				return Result{}, finalError(lastFailure)
 			}
 			return Result{}, err
+		}
+		if pinned.Channel.ID == "" {
+			pinned = selection
 		}
 
 		channel := selection.Channel
@@ -130,7 +175,7 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 		if response != nil {
 			statusCode = response.StatusCode
 		}
-		retryable := dispatchErr != nil || isRetryableStatus(policy, statusCode)
+		retryable := dispatchErr != nil || isRetryableStatus(retry, statusCode)
 		lastFailure = domain.Failure{
 			Attempt:    attempt,
 			StatusCode: statusCode,
@@ -147,18 +192,40 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 		if response != nil {
 			drainAndClose(response.Body)
 		}
-		if channelAttempt >= policy.MaxAttemptsPerChannel {
+		// A channel is given up only when the request is allowed to leave it, so
+		// switching failover off retries the same channel instead of moving on.
+		if policy.Failover.Enabled && channelAttempt >= retry.MaxAttemptsPerChannel {
 			excluded[channel.ID] = struct{}{}
 		}
-		if attemptNumber >= policy.MaxAttempts {
+		if attemptNumber >= retry.MaxAttempts {
 			break
 		}
-		if err := sleep(ctx, backoff(policy, attemptNumber)); err != nil {
+		if err := sleep(ctx, backoff(retry, attemptNumber)); err != nil {
 			return Result{}, err
 		}
 	}
 
 	return Result{}, finalError(lastFailure)
+}
+
+// selectionRequest builds one lookup, restricted to the channel or the upstream
+// the request has to stay with while failover is limited.
+func (e *Engine) selectionRequest(input domain.Request, excluded map[string]struct{}, pinned domain.Selection, failover domain.FailoverPolicy) domain.SelectionRequest {
+	request := domain.SelectionRequest{
+		Model:    input.Model,
+		Policy:   input.Policy,
+		Excluded: excluded,
+	}
+	if pinned.Channel.ID == "" {
+		return request
+	}
+	switch {
+	case !failover.Enabled:
+		request.OnlyChannel = pinned.Channel.ID
+	case !failover.CrossUpstream:
+		request.OnlySiteID = pinned.Channel.SiteID
+	}
+	return request
 }
 
 func buildRequest(ctx context.Context, input domain.Request, channel domain.Channel, body []byte) (*http.Request, context.CancelFunc, error) {

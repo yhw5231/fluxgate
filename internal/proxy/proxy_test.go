@@ -272,3 +272,129 @@ func TestEngineAppliesChannelRequestTimeout(t *testing.T) {
 		t.Fatal("upstream request context was not canceled by the channel timeout")
 	}
 }
+
+// channelServer answers with a status and records how many times it was called.
+func channelServer(t *testing.T, status int, calls *int) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*calls++
+		w.WriteHeader(status)
+		if status < http.StatusMultipleChoices {
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		} else {
+			_, _ = w.Write([]byte(`{"error":"failed"}`))
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// Switching failover off keeps a request on the line it started with, which is
+// what makes a single upstream's behaviour observable.
+func TestEngineWithoutFailoverRetriesTheSameChannel(t *testing.T) {
+	var firstCalls, secondCalls int
+	first := channelServer(t, http.StatusServiceUnavailable, &firstCalls)
+	second := channelServer(t, http.StatusOK, &secondCalls)
+
+	engine := &Engine{
+		Selector: router.NewMemorySelector(routeFor(nil,
+			domain.Channel{ID: "first", Enabled: true, Weight: 10, BaseURL: first.URL, APIKey: "first-key"},
+			domain.Channel{ID: "second", Enabled: true, Weight: 10, BaseURL: second.URL, APIKey: "second-key"},
+		)),
+		Policy: domain.RetryPolicy{
+			MaxAttempts:           4,
+			MaxAttemptsPerChannel: 1,
+			RetryStatuses:         map[int]struct{}{503: {}},
+		},
+		Sleep: noSleep,
+	}
+	engine.SetPolicy(DispatchPolicy{
+		Retry:    engine.Policy,
+		Failover: domain.FailoverPolicy{Enabled: false},
+	})
+
+	if _, err := engine.Forward(context.Background(), domain.Request{Method: http.MethodPost, Path: "/v1/chat/completions", Body: []byte(`{"model":"m"}`), Model: "m"}); err == nil {
+		t.Fatal("Forward() succeeded, want the failing upstream reported")
+	}
+	if firstCalls != 4 {
+		t.Errorf("first channel calls = %d, want 4 attempts on the same channel", firstCalls)
+	}
+	if secondCalls != 0 {
+		t.Errorf("second channel calls = %d, want none while failover is off", secondCalls)
+	}
+}
+
+// Failover limited to one upstream moves between its keys but never reaches for
+// a different upstream.
+func TestEngineCrossUpstreamFailoverCanBeLimitedToOneUpstream(t *testing.T) {
+	var sameSiteCalls, otherSiteCalls int
+	first := channelServer(t, http.StatusServiceUnavailable, &sameSiteCalls)
+	other := channelServer(t, http.StatusOK, &otherSiteCalls)
+
+	engine := &Engine{
+		Selector: router.NewMemorySelector(routeFor(nil,
+			domain.Channel{ID: "first", Enabled: true, Weight: 10, SiteID: 1, BaseURL: first.URL, APIKey: "first-key"},
+			domain.Channel{ID: "other", Enabled: true, Weight: 10, SiteID: 2, BaseURL: other.URL, APIKey: "other-key"},
+		)),
+		Policy: domain.RetryPolicy{
+			MaxAttempts:           4,
+			MaxAttemptsPerChannel: 1,
+			RetryStatuses:         map[int]struct{}{503: {}},
+		},
+		Sleep: noSleep,
+	}
+	engine.SetPolicy(DispatchPolicy{
+		Retry:    engine.Policy,
+		Failover: domain.FailoverPolicy{Enabled: true, CrossUpstream: false},
+	})
+
+	if _, err := engine.Forward(context.Background(), domain.Request{Method: http.MethodPost, Path: "/v1/chat/completions", Body: []byte(`{"model":"m"}`), Model: "m"}); err == nil {
+		t.Fatal("Forward() succeeded, want the failing upstream reported")
+	}
+	if otherSiteCalls != 0 {
+		t.Errorf("the other upstream was called %d times, want none", otherSiteCalls)
+	}
+	if sameSiteCalls == 0 {
+		t.Error("the request never reached the upstream it started on")
+	}
+}
+
+// A retry or failover change made while the gateway runs has to reach the next
+// request, without a restart.
+func TestEnginePolicyCanBeReplacedAtRuntime(t *testing.T) {
+	var calls int
+	server := channelServer(t, http.StatusServiceUnavailable, &calls)
+	engine := &Engine{
+		Selector: router.NewMemorySelector(routeFor(nil,
+			domain.Channel{ID: "only", Enabled: true, Weight: 10, BaseURL: server.URL, APIKey: "key"},
+		)),
+		Policy: domain.RetryPolicy{
+			MaxAttempts:           1,
+			MaxAttemptsPerChannel: 1,
+			RetryStatuses:         map[int]struct{}{503: {}},
+		},
+		Sleep: noSleep,
+	}
+
+	if _, err := engine.Forward(context.Background(), domain.Request{Method: http.MethodPost, Path: "/v1/chat/completions", Body: []byte(`{"model":"m"}`), Model: "m"}); err == nil {
+		t.Fatal("Forward() succeeded, want the failure reported")
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want the configured single attempt", calls)
+	}
+
+	engine.SetPolicy(DispatchPolicy{
+		Retry: domain.RetryPolicy{
+			MaxAttempts:           3,
+			MaxAttemptsPerChannel: 3,
+			RetryStatuses:         map[int]struct{}{503: {}},
+		},
+		Failover: domain.FailoverPolicy{Enabled: false},
+	})
+	if _, err := engine.Forward(context.Background(), domain.Request{Method: http.MethodPost, Path: "/v1/chat/completions", Body: []byte(`{"model":"m"}`), Model: "m"}); err == nil {
+		t.Fatal("Forward() succeeded, want the failure reported")
+	}
+	if calls != 4 {
+		t.Errorf("calls = %d, want three more attempts under the installed policy", calls)
+	}
+}

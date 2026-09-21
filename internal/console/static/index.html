@@ -93,9 +93,8 @@
       <!-- 应用内视图切换。每个按钮对应一个 main，只有一个可见。 -->
       <nav class="console-nav" id="console-nav" aria-label="管理台视图">
         <button class="nav-item is-active" type="button" data-view="overview">概览</button>
-        <button class="nav-item" type="button" data-view="channels">通道</button>
-        <button class="nav-item" type="button" data-view="routes">路由</button>
         <button class="nav-item" type="button" data-view="upstream">上游</button>
+        <button class="nav-item" type="button" data-view="routes">路由</button>
         <button class="nav-item" type="button" data-view="keys">客户端密钥</button>
         <button class="nav-item" type="button" data-view="settings">设置</button>
       </nav>
@@ -111,7 +110,7 @@
           <strong data-banner-title>请求失败</strong>
           <span data-banner-detail></span>
         </div>
-        <button id="banner-retry" class="btn btn-ghost" type="button">重试</button>
+        <button id="banner-retry" class="btn btn-ghost" type="button"><span class="btn-label">重试</span></button>
       </div>
 
       <div id="notice" class="banner banner-success" hidden>
@@ -175,7 +174,10 @@
             <h2>熔断状态</h2>
             <span class="panel-meta" data-meta></span>
           </div>
-          <span class="panel-note">每 10 秒自动刷新 &middot; <span data-next-refresh>&mdash;</span></span>
+          <div class="panel-actions">
+            <span class="panel-note">每 10 秒自动刷新 &middot; <span data-next-refresh>&mdash;</span></span>
+            <button id="breakers-reset-all" class="btn btn-ghost btn-small" type="button"><span class="btn-label">全部恢复</span></button>
+          </div>
         </header>
         <div class="table-wrap">
           <table class="data-table" data-breakers-table>
@@ -188,6 +190,7 @@
                 <th class="num">失败次数</th>
                 <th class="num">熔断级别</th>
                 <th>状态</th>
+                <th class="actions">操作</th>
               </tr>
             </thead>
             <tbody data-breakers-body></tbody>
@@ -203,23 +206,21 @@
         <header class="panel-header">
           <div class="panel-title">
             <span class="title-tick" aria-hidden="true"></span>
-            <h2>上游通道</h2>
+            <h2>上游线路</h2>
             <span class="panel-meta" data-meta></span>
           </div>
-          <span class="panel-note">按优先级排序</span>
+          <span class="panel-note">每个上游密钥是一条线路</span>
         </header>
         <div class="table-wrap">
           <table class="data-table" data-channels-table>
             <thead>
               <tr>
-                <th>通道</th>
+                <th>线路</th>
                 <th>状态</th>
                 <th class="num">优先级</th>
                 <th class="num">权重</th>
-                <th>路由策略</th>
-                <th>熔断模式</th>
+                <th>密钥模式</th>
                 <th>代理</th>
-                <th class="num">映射数</th>
               </tr>
             </thead>
             <tbody data-channels-body></tbody>
@@ -227,7 +228,7 @@
         </div>
         <div class="empty-state" data-channels-empty hidden>
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.5" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="18" cy="6" r="2.5" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="12" cy="18" r="2.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M6 8.5v1a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3v-1M12 12.5v3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-          <p>尚未配置上游通道，到「通道」页添加</p>
+          <p>尚未配置上游，到「上游」页添加</p>
         </div>
       </section>
 
@@ -254,112 +255,45 @@
       </footer>
     </main>
 
-    <!-- ===== 通道：路由指向上游账号的绑定关系 ===== -->
-    <main class="container" data-view-panel="channels" hidden>
-      <section class="panel" data-management="channels">
-        <header class="panel-header">
-          <div class="panel-title">
-            <span class="title-tick" aria-hidden="true"></span>
-            <h2>上游通道</h2>
-            <span class="panel-meta" data-meta></span>
-          </div>
-          <button class="btn btn-primary" type="button" data-create="channels">添加通道</button>
-        </header>
-        <p class="panel-help">通道把一个上游账号（以及可选的账号令牌）挂到一条路由上。同一路由下优先级最高的通道优先被选中，同优先级之间按权重轮询。</p>
-        <div class="table-wrap">
-          <table class="data-table" data-table="channels"><tbody data-body="channels"></tbody></table>
-        </div>
-        <div class="empty-state" data-empty="channels" hidden>
-          <p data-empty-text>还没有通道。先添加站点、账号和路由，再把它们连起来。</p>
-        </div>
-      </section>
-    </main>
-
-    <!-- ===== 路由：模型名到上游的映射 ===== -->
-    <main class="container" data-view-panel="routes" hidden>
-      <section class="panel" data-management="routes">
-        <header class="panel-header">
-          <div class="panel-title">
-            <span class="title-tick" aria-hidden="true"></span>
-            <h2>路由</h2>
-            <span class="panel-meta" data-meta></span>
-          </div>
-          <button class="btn btn-primary" type="button" data-create="routes">添加路由</button>
-        </header>
-        <p class="panel-help">路由决定客户端请求哪个模型名时由哪些通道回应。模型名支持 <code>*</code>、<code>?</code> 通配符，以 <code>re:</code> 开头则按正则匹配。</p>
-        <div class="table-wrap">
-          <table class="data-table" data-table="routes"><tbody data-body="routes"></tbody></table>
-        </div>
-        <div class="empty-state" data-empty="routes" hidden>
-          <p data-empty-text>还没有路由。没有路由时网关不会向上游转发任何请求。</p>
-        </div>
-      </section>
-    </main>
-
-    <!-- ===== 上游：站点、账号、令牌与代理 ===== -->
+    <!-- ===== 上游：一个上游服务就是一条配置 ===== -->
     <main class="container" data-view-panel="upstream" hidden>
-      <section class="panel" data-management="sites">
+      <section class="panel" data-management="upstreams">
         <header class="panel-header">
           <div class="panel-title">
             <span class="title-tick" aria-hidden="true"></span>
-            <h2>站点</h2>
+            <h2>上游</h2>
             <span class="panel-meta" data-meta></span>
           </div>
-          <button class="btn btn-primary" type="button" data-create="sites">添加站点</button>
+          <button class="btn btn-primary" type="button" data-create="upstreams">添加上游</button>
         </header>
-        <p class="panel-help">站点是一个上游服务的地址。只有状态为 <code>active</code> 的站点才会参与选路。</p>
+        <p class="panel-help">一个上游填一处上游服务：名称、API 地址、权重、请求头、一组密钥，以及它提供哪些模型。保存后网关会按选中的模型自动建立路由，无需再手工配置通道。</p>
         <div class="table-wrap">
-          <table class="data-table" data-table="sites"><tbody data-body="sites"></tbody></table>
+          <table class="data-table" data-table="upstreams"><tbody data-body="upstreams"></tbody></table>
         </div>
-        <div class="empty-state" data-empty="sites" hidden><p data-empty-text>还没有站点。</p></div>
+        <div class="empty-state" data-empty="upstreams" hidden>
+          <p data-empty-text>还没有上游。添加上游并选中模型后，网关才开始转发请求。</p>
+        </div>
       </section>
+    </main>
 
-      <section class="panel" data-management="accounts">
+    <!-- ===== 路由：由上游的模型自动生成，这里只读展示匹配结果 ===== -->
+    <main class="container" data-view-panel="routes" hidden>
+      <section class="panel" data-panel="routing">
         <header class="panel-header">
           <div class="panel-title">
             <span class="title-tick" aria-hidden="true"></span>
-            <h2>账号</h2>
+            <h2>模型路由</h2>
             <span class="panel-meta" data-meta></span>
           </div>
-          <button class="btn btn-primary" type="button" data-create="accounts">添加账号</button>
+          <span class="panel-note">由上游的模型自动匹配</span>
         </header>
-        <p class="panel-help">账号是站点上的一份凭据。访问令牌按写入保存，读取时只显示末四位。</p>
+        <p class="panel-help">选中某个模型后，网关自动建立对应的路由，并把该上游的每个密钥接上去；客户端请求这个模型名时，就在这些上游之间按权重分配，并在失败时转移。同一个模型由多个上游提供时会合并到同一条路由。</p>
         <div class="table-wrap">
-          <table class="data-table" data-table="accounts"><tbody data-body="accounts"></tbody></table>
+          <table class="data-table" data-table="routing"><tbody data-body="routing"></tbody></table>
         </div>
-        <div class="empty-state" data-empty="accounts" hidden><p data-empty-text>还没有账号。</p></div>
-      </section>
-
-      <section class="panel" data-management="tokens">
-        <header class="panel-header">
-          <div class="panel-title">
-            <span class="title-tick" aria-hidden="true"></span>
-            <h2>账号令牌</h2>
-            <span class="panel-meta" data-meta></span>
-          </div>
-          <button class="btn btn-primary" type="button" data-create="tokens">添加令牌</button>
-        </header>
-        <p class="panel-help">一个账号可以带多个令牌，通道可以指定使用其中某一个；不指定时使用账号本身的访问令牌。</p>
-        <div class="table-wrap">
-          <table class="data-table" data-table="tokens"><tbody data-body="tokens"></tbody></table>
+        <div class="empty-state" data-empty="routing" hidden>
+          <p data-empty-text>还没有可路由的模型。到「上游」页添加一个上游并选中模型。</p>
         </div>
-        <div class="empty-state" data-empty="tokens" hidden><p data-empty-text>还没有令牌。</p></div>
-      </section>
-
-      <section class="panel" data-management="proxies">
-        <header class="panel-header">
-          <div class="panel-title">
-            <span class="title-tick" aria-hidden="true"></span>
-            <h2>代理</h2>
-            <span class="panel-meta" data-meta></span>
-          </div>
-          <button class="btn btn-primary" type="button" data-create="proxies">添加代理</button>
-        </header>
-        <p class="panel-help">代理按「令牌/账号 → 站点 → 默认代理 → 系统代理 → 直连」的顺序生效。站点和账号上的代理地址优先于这里的默认代理。</p>
-        <div class="table-wrap">
-          <table class="data-table" data-table="proxies"><tbody data-body="proxies"></tbody></table>
-        </div>
-        <div class="empty-state" data-empty="proxies" hidden><p data-empty-text>还没有代理。</p></div>
       </section>
     </main>
 
@@ -384,7 +318,7 @@
       </section>
     </main>
 
-    <!-- ===== 设置：账号与密码 ===== -->
+    <!-- ===== 设置：账号、运行策略与代理 ===== -->
     <main class="container" data-view-panel="settings" id="settings-view" hidden>
       <section class="panel">
         <header class="panel-header">
@@ -434,6 +368,26 @@
             <p class="settings-hint">密码没有最小长度限制，按你的部署需要设置即可。修改密码后，当前浏览器会保持登录状态。</p>
           </form>
         </div>
+      </section>
+
+      <!-- 运行策略：故障转移、重试与熔断冷却。字段由网关返回的定义生成，
+           这里只提供容器，所以新增一个策略项不必改页面。 -->
+      <div id="policy-panels"></div>
+
+      <section class="panel" data-management="proxies">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="title-tick" aria-hidden="true"></span>
+            <h2>代理</h2>
+            <span class="panel-meta" data-meta></span>
+          </div>
+          <button class="btn btn-primary" type="button" data-create="proxies">添加代理</button>
+        </header>
+        <p class="panel-help">网关到上游的出口代理。上游自己的代理地址优先，其次是这里标记为默认的代理，最后才是直连。</p>
+        <div class="table-wrap">
+          <table class="data-table" data-table="proxies"><tbody data-body="proxies"></tbody></table>
+        </div>
+        <div class="empty-state" data-empty="proxies" hidden><p data-empty-text>还没有代理。</p></div>
       </section>
     </main>
   </div>

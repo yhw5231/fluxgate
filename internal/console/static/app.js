@@ -24,9 +24,10 @@
     return API_BASE + suffix.replace(/^\//, '');
   }
 
-  /* 管理视图 = 概览之外的视图，它们读取的是可写的配置清单。 */
-  var VIEWS = ['overview', 'channels', 'routes', 'upstream', 'keys', 'settings'];
-  var MANAGEMENT_VIEWS = { channels: true, routes: true, upstream: true, keys: true };
+  /* 管理视图 = 概览之外的视图，它们读取的是可写的配置清单。设置页也读取配置，
+   * 因为运行策略和配置一起返回。 */
+  var VIEWS = ['overview', 'upstream', 'routes', 'keys', 'settings'];
+  var MANAGEMENT_VIEWS = { upstream: true, routes: true, keys: true, settings: true };
 
   var state = {
     view: 'overview',
@@ -39,7 +40,8 @@
     countdown: 0,
     loading: false,
     editor: null,
-    confirm: null
+    confirm: null,
+    policySignature: null
   };
 
   var els = {};
@@ -84,6 +86,13 @@
     els.requiredFeedback = $('required-password-feedback');
     els.requiredSubmit = $('required-password-submit');
     els.requiredSignout = $('required-signout');
+
+    els.policyPanels = $('policy-panels');
+    els.breakersResetAll = $('breakers-reset-all');
+    els.routingBody = document.querySelector('[data-body="routing"]');
+    els.routingEmpty = document.querySelector('[data-empty="routing"]');
+    els.routingMeta = document.querySelector('[data-panel="routing"] [data-meta]');
+    els.routingTable = document.querySelector('[data-table="routing"]');
 
     els.banner = $('error-banner');
     els.bannerTitle = els.banner.querySelector('[data-banner-title]');
@@ -285,6 +294,7 @@
   var CHOICE_LABELS = {
     route_mode: { pattern: '按模型匹配', explicit_group: '显式分组' },
     routing_strategy: { weighted: '加权轮询', round_robin: '轮询', stable_first: '固定优先' },
+    key_mode: { available_first: '可用优先', round_robin: '轮询' },
     protocol: { http: 'HTTP', https: 'HTTPS', socks5: 'SOCKS5', socks5h: 'SOCKS5H' }
   };
 
@@ -300,53 +310,39 @@
     { value: 'disabled', label: '停用' }
   ];
 
-  /* FIELDS[resource][column] */
+  var KEY_MODE_OPTIONS = [
+    { value: 'available_first', label: '可用优先' },
+    { value: 'round_robin', label: '轮询' }
+  ];
+
+  function keyModeLabel(value) {
+    return value === 'available_first' ? '可用优先' : '轮询';
+  }
+
+  /* 一条线路（一个上游密钥）的密钥模式，来自它所在路由的策略：可用优先的
+   * 上游让第一个密钥保持最高优先级，轮询的上游让所有密钥同权。 */
+  function channelKeyModeLabel(strategy) {
+    if (strategy === 'stable_first') { return '可用优先'; }
+    if (strategy === 'round_robin') { return '轮询'; }
+    return '加权';
+  }
+
+  /* FIELDS[resource][column]
+   *
+   * 「上游」的表单是自建的（密钥要一行一个、模型要能拉取和勾选），这里仍然保留
+   * 它的字段标签，因为字段级报错要用它们指出是哪一个输入。 */
   var FIELDS = {
-    sites: {
+    upstreams: {
       name: { label: '名称', placeholder: '例如 OpenAI 官方' },
-      url: { label: '站点地址', placeholder: 'https://api.example.com', help: '上游服务的根地址，必须包含 http:// 或 https://。' },
-      platform: { label: '平台', placeholder: 'openai', help: '平台标识，同一个站点的账号共用它。' },
-      status: { label: '状态', type: 'select', options: STATUS_OPTIONS, help: '只有 active 的站点才参与选路。' },
-      global_weight: { label: '全局权重', type: 'number', step: 'any', placeholder: '1', help: '站点权重会乘到该站点每个通道的权重上。' },
-      proxy_url: { label: '站点代理', placeholder: 'http://127.0.0.1:7890', help: '留空表示不使用站点级代理；填 system 表示使用系统代理。' },
-      use_system_proxy: { label: '使用系统代理' },
-      custom_headers: { label: '自定义请求头', type: 'json', placeholder: '{"X-Custom": "value"}', help: 'JSON 对象，会附加到发往该站点的请求上。' },
-      forced_upstream_endpoint: { label: '强制上游端点', placeholder: 'https://api.example.com/v1', help: '填写后，该站点的请求一律发往这个地址。' }
-    },
-    accounts: {
-      site_id: { label: '所属站点', type: 'reference', resource: 'sites' },
-      access_token: { label: '访问令牌', help: '写入后不再显示原文，只显示末四位；留空表示保持不变。' },
-      api_token: { label: 'API 令牌', help: '可选。填写后优先于访问令牌；留空表示保持不变，勾选清除可删除。' },
-      status: { label: '状态', type: 'select', options: STATUS_OPTIONS },
-      extra_config: {
-        label: '扩展配置', type: 'json', placeholder: '{"proxyUrl": "http://127.0.0.1:7890"}',
-        help: 'JSON 对象。proxyUrl 指定该账号使用的代理，useSystemProxy 为 true 时改用系统代理。'
-      }
-    },
-    tokens: {
-      account_id: { label: '所属账号', type: 'reference', resource: 'accounts' },
-      token: { label: '令牌', help: '写入后不再显示原文，只显示末四位；留空表示保持不变。' },
-      proxy_url: { label: '令牌代理', placeholder: 'socks5://127.0.0.1:1080', help: '该令牌专用代理，优先于账号和站点代理。' },
-      use_system_proxy: { label: '使用系统代理' },
-      enabled: { label: '启用' }
-    },
-    routes: {
-      model_pattern: { label: '模型匹配', placeholder: 'gpt-4.1 或 gpt-* 或 re:^claude', help: '客户端请求的模型名。支持 * 和 ? 通配符，re: 前缀表示正则表达式。' },
-      display_name: { label: '对外别名', placeholder: 'gpt-4.1', help: '客户端也可以用这个别名请求，优先级高于通配符匹配。' },
-      route_mode: { label: '路由模式', type: 'select' },
-      routing_strategy: { label: '路由策略', type: 'select' },
-      enabled: { label: '启用' },
-      model_mapping: { label: '模型映射', type: 'json', placeholder: '{"gpt-4.1": "gpt-4.1-2025-04-14"}', help: 'JSON 对象，把请求的模型名改写成上游的模型名。按写入顺序匹配。' },
-      source_route_ids: { label: '成员路由', type: 'id_list', resource: 'routes', placeholder: '[1, 2]', help: '只有「显式分组」模式使用：JSON 数组，列出这个分组包含的路由 ID。' }
-    },
-    channels: {
-      route_id: { label: '所属路由', type: 'reference', resource: 'routes' },
-      account_id: { label: '上游账号', type: 'reference', resource: 'accounts' },
-      token_id: { label: '账号令牌', type: 'reference', resource: 'tokens', dependsOn: 'account_id', help: '留空表示使用账号自身的访问令牌。' },
-      source_model: { label: '源模型', placeholder: 'gpt-4.1', help: '该通道实际发给上游的模型名，留空时按路由决定。' },
-      priority: { label: '优先级', type: 'number', step: '1', placeholder: '0', help: '数值越大越先被选中；优先级不同时不会互相轮询。' },
-      weight: { label: '权重', type: 'number', step: '1', placeholder: '10', help: '同优先级之间按权重分配流量，必须大于 0。' },
-      enabled: { label: '启用' }
+      url: { label: 'API 地址', placeholder: 'https://api.example.com', help: '上游服务的根地址，必须包含 http:// 或 https://。' },
+      global_weight: { label: '权重', type: 'number', step: 'any', placeholder: '1', help: '权重越大分到的请求越多；同一个模型的多个上游之间按权重分配。' },
+      custom_headers: { label: '请求头', type: 'json', placeholder: '{"X-Custom": "value"}', help: 'JSON 对象，会附加到发往这个上游的每个请求上。' },
+      proxy_url: { label: '代理', placeholder: 'http://127.0.0.1:7890', help: '留空表示直连；填 system 表示使用系统代理。' },
+      status: { label: '状态', type: 'select', options: STATUS_OPTIONS, help: '停用后该上游的线路不再参与选路。' },
+      keys: { label: '密钥', help: '一行一个，可以整段粘贴。留空表示保持已保存的密钥不变。' },
+      key_mode: { label: '密钥模式', type: 'select', options: KEY_MODE_OPTIONS, help: '可用优先：先用第一个密钥，失败或熔断后再用下一个。轮询：按权重在所有密钥之间分配。' },
+      models: { label: '模型', help: '勾选这个上游提供的模型，保存后网关自动建立路由。' },
+      model_mapping: { label: '模型映射', help: '把客户端请求的模型名换成上游认识的模型名。' }
     },
     keys: {
       name: { label: '名称', placeholder: '例如 内部服务' },
@@ -359,116 +355,36 @@
       used_requests: { label: '已用请求数', type: 'number', step: '1' },
       supported_models: { label: '排除模型', type: 'json', placeholder: '["gpt-4.1-mini", "re:^o1"]', help: 'JSON 数组，命中的模型会被拒绝并不出现在 /v1/models 中。' },
       allowed_route_ids: { label: '限定路由', type: 'id_list', resource: 'routes', placeholder: '[1, 2]', help: 'JSON 数组，只允许这些路由；留空表示不限制。' },
-      excluded_site_ids: { label: '排除站点', type: 'id_list', resource: 'sites', placeholder: '[3]', help: 'JSON 数组，这些站点的通道不会被选中。' },
-      site_weight_multipliers: { label: '站点权重系数', type: 'json', placeholder: '{"3": 2}', help: 'JSON 对象，键是站点 ID，值是大于 0 的倍数。' },
+      excluded_site_ids: { label: '排除上游', type: 'id_list', resource: 'sites', placeholder: '[3]', help: 'JSON 数组，这些上游的线路不会被选中。' },
+      site_weight_multipliers: { label: '上游权重系数', type: 'json', placeholder: '{"3": 2}', help: 'JSON 对象，键是上游 ID，值是大于 0 的倍数。' },
       excluded_credential_refs: {
         label: '排除凭据', type: 'json',
         placeholder: '[{"kind":"account_token","siteId":1,"accountId":2,"tokenId":3}]',
-        help: 'JSON 数组，精确排除某个账号令牌对应的通道。'
+        help: 'JSON 数组，精确排除某个上游密钥对应的线路。'
       }
     },
     proxies: {
       name: { label: '名称', placeholder: '例如 本地出口' },
       protocol: { label: '协议', type: 'select' },
       url: { label: '代理地址', placeholder: 'http://127.0.0.1:7890', help: '支持的协议：http、https、socks5、socks5h。' },
-      is_default: { label: '设为默认代理', help: '默认代理在所有层级都不匹配时生效。' },
+      is_default: { label: '设为默认代理', help: '没有其他代理设置生效时使用它。' },
       enabled: { label: '启用' }
     }
   };
 
   /* RESOURCES[resource] describes the management table of a resource. */
   var RESOURCES = {
-    channels: {
-      title: '通道',
-      create: '添加通道',
-      noun: '通道',
+    upstreams: {
+      title: '上游',
+      create: '添加上游',
+      noun: '上游',
       columns: [
-        { label: 'ID', className: 'num', cell: function (row) { return '#' + row.id; } },
-        { label: '所属路由', cell: function (row) { return routeName(row.route_id); } },
-        { label: '上游账号', cell: function (row) { return accountName(row.account_id); } },
-        { label: '账号令牌', cell: function (row) { return row.token_id ? tokenName(row.token_id) : tag('账号默认'); } },
-        { label: '源模型', cell: function (row) { return text(row.source_model); } },
-        { label: '优先级', className: 'num', cell: function (row) { return String(row.priority || 0); } },
-        { label: '权重', className: 'num', cell: function (row) { return String(row.weight || 0); } },
-        { label: '状态', cell: function (row) { return enabledBadge(row.enabled); } }
-      ],
-      actions: ['edit', 'delete'],
-      describe: function (row) { return routeName(row.route_id) + ' → ' + accountName(row.account_id); }
-    },
-    routes: {
-      title: '路由',
-      create: '添加路由',
-      noun: '路由',
-      columns: [
-        { label: 'ID', className: 'num', cell: function (row) { return '#' + row.id; } },
-        { label: '模型匹配', cell: function (row) { return element('span', 'cell-strong mono', text(row.model_pattern)); } },
-        { label: '对外别名', cell: function (row) { return text(row.display_name); } },
-        { label: '模式', cell: function (row) { return tag(enumLabel('route_mode', row.route_mode, 'pattern')); } },
-        { label: '策略', cell: function (row) { return tag(enumLabel('routing_strategy', row.routing_strategy, 'weighted')); } },
-        { label: '映射', className: 'num', cell: function (row) { return jsonSize(row.model_mapping, 'object'); } },
-        { label: '成员路由', cell: function (row) { return routeIDList(row.source_route_ids); } },
-        { label: '通道', className: 'num', cell: function (row) { return String(channelCount(row.id)); } },
-        { label: '状态', cell: function (row) { return enabledBadge(row.enabled); } }
-      ],
-      actions: ['edit', 'delete'],
-      describe: function (row) { return text(row.display_name, row.model_pattern); }
-    },
-    sites: {
-      title: '站点',
-      create: '添加站点',
-      noun: '站点',
-      columns: [
-        { label: 'ID', className: 'num', cell: function (row) { return '#' + row.id; } },
         { label: '名称', cell: function (row) { return element('span', 'cell-strong', text(row.name)); } },
-        { label: '地址', cell: function (row) { return element('span', 'mono', text(row.url)); } },
-        { label: '平台', cell: function (row) { return text(row.platform); } },
-        { label: '状态', cell: function (row) { return statusBadge(row.status); } },
-        { label: '全局权重', className: 'num', cell: function (row) { return text(row.global_weight, '1'); } },
-        { label: '代理', cell: function (row) { return proxyCell(row.proxy_url, row.use_system_proxy); } }
-      ],
-      actions: ['edit', 'delete'],
-      describe: function (row) { return text(row.name, '#' + row.id); }
-    },
-    accounts: {
-      title: '账号',
-      create: '添加账号',
-      noun: '账号',
-      columns: [
-        { label: 'ID', className: 'num', cell: function (row) { return '#' + row.id; } },
-        { label: '站点', cell: function (row) { return siteName(row.site_id); } },
-        { label: '访问令牌', cell: function (row) { return secretCell(row.access_token); } },
-        { label: 'API 令牌', cell: function (row) { return secretCell(row.api_token); } },
-        { label: '状态', cell: function (row) { return statusBadge(row.status); } },
-        { label: '代理', cell: function (row) { return accountProxyCell(row.extra_config); } }
-      ],
-      actions: ['edit', 'delete'],
-      describe: function (row) { return siteName(row.site_id) + ' #' + row.id; }
-    },
-    tokens: {
-      title: '账号令牌',
-      create: '添加令牌',
-      noun: '令牌',
-      columns: [
-        { label: 'ID', className: 'num', cell: function (row) { return '#' + row.id; } },
-        { label: '账号', cell: function (row) { return accountName(row.account_id); } },
-        { label: '令牌', cell: function (row) { return secretCell(row.token); } },
-        { label: '代理', cell: function (row) { return proxyCell(row.proxy_url, row.use_system_proxy); } },
-        { label: '状态', cell: function (row) { return enabledBadge(row.enabled); } }
-      ],
-      actions: ['edit', 'delete'],
-      describe: function (row) { return accountName(row.account_id) + ' #' + row.id; }
-    },
-    proxies: {
-      title: '代理',
-      create: '添加代理',
-      noun: '代理',
-      columns: [
-        { label: 'ID', className: 'num', cell: function (row) { return '#' + row.id; } },
-        { label: '名称', cell: function (row) { return element('span', 'cell-strong', text(row.name)); } },
-        { label: '协议', cell: function (row) { return tag(enumLabel('protocol', row.protocol, 'http')); } },
-        { label: '地址', cell: function (row) { return element('span', 'mono', text(row.url)); } },
-        { label: '默认', cell: function (row) { return row.is_default ? badge('默认', 'info') : '—'; } },
-        { label: '状态', cell: function (row) { return enabledBadge(row.enabled); } }
+        { label: 'API 地址', cell: function (row) { return element('span', 'mono', text(row.url)); } },
+        { label: '权重', className: 'num', cell: function (row) { return text(row.global_weight, '1'); } },
+        { label: '密钥', cell: function (row) { return upstreamKeysCell(row); } },
+        { label: '模型', cell: function (row) { return upstreamModelsCell(row); } },
+        { label: '状态', cell: function (row) { return statusBadge(row.status); } }
       ],
       actions: ['edit', 'delete'],
       describe: function (row) { return text(row.name, '#' + row.id); }
@@ -491,8 +407,50 @@
       // empty input is a valid create rather than a missing required field.
       optionalSecrets: ['key'],
       describe: function (row) { return text(row.name, '#' + row.id); }
+    },
+    proxies: {
+      title: '代理',
+      create: '添加代理',
+      noun: '代理',
+      columns: [
+        { label: 'ID', className: 'num', cell: function (row) { return '#' + row.id; } },
+        { label: '名称', cell: function (row) { return element('span', 'cell-strong', text(row.name)); } },
+        { label: '协议', cell: function (row) { return tag(enumLabel('protocol', row.protocol, 'http')); } },
+        { label: '地址', cell: function (row) { return element('span', 'mono', text(row.url)); } },
+        { label: '默认', cell: function (row) { return row.is_default ? badge('默认', 'info') : '—'; } },
+        { label: '状态', cell: function (row) { return enabledBadge(row.enabled); } }
+      ],
+      actions: ['edit', 'delete'],
+      describe: function (row) { return text(row.name, '#' + row.id); }
     }
   };
+
+  function upstreamKeyList(row) {
+    var keys = parseJSON(row ? row.keys : null);
+    return Array.isArray(keys) ? keys : [];
+  }
+
+  function upstreamKeyMode(row) {
+    return row.key_mode === 'available_first' ? 'available_first' : 'round_robin';
+  }
+
+  function upstreamKeysCell(row) {
+    var wrapper = element('span', 'tag-list');
+    var keys = upstreamKeyList(row);
+    wrapper.appendChild(tag(keys.length + ' 个'));
+    wrapper.appendChild(tag(keyModeLabel(upstreamKeyMode(row))));
+    return wrapper;
+  }
+
+  function upstreamModelsCell(row) {
+    var models = parseJSON(row.models);
+    if (!Array.isArray(models) || models.length === 0) {
+      return element('span', 'cell-muted', '未选择');
+    }
+    var count = tag(String(models.length));
+    count.title = models.join('\n');
+    return count;
+  }
 
   /* ===== Configuration lookups ===== */
 
@@ -749,7 +707,11 @@
     configuration_reload_failed: '变更已写入数据库，但网关重新加载配置失败，请重启网关后再试。',
     cross_origin_rejected: '请求来源不是管理台本身，已拒绝。',
     unknown_resource: '未知的配置类型。',
-    request_too_large: '提交的内容过大。'
+    request_too_large: '提交的内容过大。',
+    // 运行策略与上游探测
+    upstream_probe_failed: '获取模型失败，请检查 API 地址和密钥。',
+    upstream_unreachable: '无法连接该上游。',
+    breakers_not_supported: '本网关没有可恢复的熔断记录。'
   };
 
   /* 字段级校验失败的中文说明。reason 是网关稳定给出的原因码，params 携带
@@ -771,13 +733,20 @@
     referenced: function (field, params) {
       var noun = RESOURCE_NOUNS[params.resource] || params.resource;
       return '无法删除：仍有 ' + params.count + ' 条「' + noun + '」引用这条记录，请先删除它们或改指向别处。';
-    }
+    },
+    // 探测上游模型列表时的原因码，用于把失败说清楚。
+    invalid_request: function () { return '请先填写 API 地址，并至少填一个密钥。'; },
+    no_model_endpoint: function () { return '该上游没有 /v1/models 接口，请检查 API 地址，或手动添加模型名。'; },
+    credential_rejected: function (field, params) { return '上游拒绝了该密钥（HTTP ' + params.status + '），请检查密钥是否正确。'; },
+    upstream_status: function (field, params) { return '上游返回了 HTTP ' + params.status + '。'; },
+    unreadable_response: function () { return '上游返回的不是模型列表，请手动添加模型名。'; },
+    unreachable: function () { return '无法连接该上游，请检查地址、代理和网络。'; }
   };
 
   /* 配置类型的中文名，用于「仍有 N 条××引用」这类提示。 */
   var RESOURCE_NOUNS = {
-    sites: '站点', accounts: '账号', tokens: '账号令牌', routes: '路由',
-    channels: '通道', keys: '客户端密钥', proxies: '代理'
+    upstreams: '上游', sites: '上游', accounts: '上游凭据', tokens: '上游密钥', routes: '路由',
+    channels: '线路', keys: '客户端密钥', proxies: '代理'
   };
 
   function apiError(body) {
@@ -797,6 +766,8 @@
         if (error.code === 'configuration_referenced' && error.message) {
           return message + '（' + error.message + '）';
         }
+        // 探测类错误的具体原因（凭据被拒、返回了非 JSON 等）来自网关，附在后面。
+        if (error.message) { return message + '（' + error.message + '）'; }
         return message;
       }
       if (error.message) { return error.message; }
@@ -875,6 +846,8 @@
       state.snapshot = snapshot.body || {};
       render(status.body || {}, state.snapshot);
       renderManagement();
+      renderRouting();
+      renderPolicy();
     }).catch(function (err) {
       showBanner('无法连接网关', String(err && err.message ? err.message : err));
     }).then(function () {
@@ -968,6 +941,42 @@
     return !isNaN(parsed.getTime()) && parsed.getTime() > Date.now();
   }
 
+  function renderChannels(channels) {
+    els.channelsBody.textContent = '';
+    els.channelsMeta.textContent = '已配置 ' + channels.length + ' 条线路';
+
+    if (channels.length === 0) {
+      els.channelsEmpty.hidden = false;
+      els.channelsTable.hidden = true;
+      return;
+    }
+    els.channelsTable.hidden = false;
+    els.channelsEmpty.hidden = true;
+
+    channels.forEach(function (channel) {
+      var row = document.createElement('tr');
+
+      var nameCell = document.createElement('td');
+      nameCell.appendChild(element('span', 'cell-strong', text(channel.name, channel.id)));
+      nameCell.appendChild(element('span', 'cell-id', '#' + text(channel.id)));
+      row.appendChild(nameCell);
+
+      cell(row, badge(channel.enabled ? '已启用' : '已禁用', channel.enabled ? 'success' : 'danger'));
+      cell(row, String(channel.priority === undefined ? 0 : channel.priority), 'num');
+      cell(row, String(channel.weight === undefined ? 0 : channel.weight), 'num');
+      cell(row, tag(channelKeyModeLabel(channel.routing_strategy)));
+
+      var proxyVariant = channel.proxy_source === 'direct' ? 'muted' : 'info';
+      cell(row, badge(enumLabel('proxy_source', channel.proxy_source, 'direct'), proxyVariant));
+
+      els.channelsBody.appendChild(row);
+    });
+  }
+
+  /* renderBreakers lists the recorded circuits. A tripped circuit can be cleared
+   * from here, which is the manual half of recovery: a channel cooled down for
+   * another fifteen minutes returns to service as soon as an operator who has
+   * fixed the upstream says so. */
   function renderBreakers(breakers) {
     els.breakersBody.textContent = '';
     els.breakersMeta.textContent = '跟踪 ' + breakers.length + ' 项';
@@ -1009,56 +1018,157 @@
       stateCell.appendChild(badge(label, variant));
       row.appendChild(stateCell);
 
+      var actionCell = document.createElement('td');
+      actionCell.className = 'actions';
+      if (open || entry.consecutive_failures > 0) {
+        var restore = busyButton('btn btn-ghost btn-small', '恢复');
+        restore.addEventListener('click', function () { resetBreaker(entry, restore); });
+        actionCell.appendChild(restore);
+      }
+      row.appendChild(actionCell);
+
       els.breakersBody.appendChild(row);
     });
   }
 
-  function renderChannels(channels) {
-    els.channelsBody.textContent = '';
-    els.channelsMeta.textContent = '已配置 ' + channels.length + ' 个';
+  /* resetBreaker clears one recorded circuit, by the identifiers the breaker
+   * filed it under. */
+  function resetBreaker(entry, button) {
+    setSubmitting(button, true, '恢复');
+    post('/management/breakers/reset', {
+      scope: entry.scope || 'channel',
+      channel_id: entry.channel_id || '',
+      key_id: entry.key_id || '',
+      model: entry.model || ''
+    }).then(function (result) {
+      setSubmitting(button, false, '恢复');
+      if (result.ok) {
+        showNotice('已恢复该线路，下一个请求会重新尝试它。');
+        refresh();
+        return;
+      }
+      if (result.status === 401) { showAuth('登录状态已过期，请重新登录后继续。'); return; }
+      showBanner('恢复失败', errorMessage(result.body, '网关拒绝了这次恢复。'));
+    }).catch(function (err) {
+      setSubmitting(button, false, '恢复');
+      showBanner('无法连接网关', String(err && err.message ? err.message : err));
+    });
+  }
 
-    if (channels.length === 0) {
-      els.channelsEmpty.hidden = false;
-      els.channelsTable.hidden = true;
+  function resetAllBreakers() {
+    setSubmitting(els.breakersResetAll, true, '全部恢复');
+    post('/management/breakers/reset', { scope: 'all' }).then(function (result) {
+      setSubmitting(els.breakersResetAll, false, '全部恢复');
+      if (result.ok) {
+        var count = result.body && typeof result.body.reset === 'number' ? result.body.reset : 0;
+        showNotice(count > 0 ? '已恢复 ' + count + ' 条熔断记录。' : '没有需要恢复的熔断记录。');
+        refresh();
+        return;
+      }
+      if (result.status === 401) { showAuth('登录状态已过期，请重新登录后继续。'); return; }
+      showBanner('恢复失败', errorMessage(result.body, '网关拒绝了这次恢复。'));
+    }).catch(function (err) {
+      setSubmitting(els.breakersResetAll, false, '全部恢复');
+      showBanner('无法连接网关', String(err && err.message ? err.message : err));
+    });
+  }
+
+  /* renderRouting shows the routing table the gateway derived from the upstreams:
+   * one row per model, with the upstreams that serve it and the name each of them
+   * knows it by. It is read-only because it is not configured — it is what the
+   * model selection on the upstream page produces. */
+  function renderRouting() {
+    if (!els.routingBody) { return; }
+    els.routingBody.textContent = '';
+    var rows = routingRows();
+    els.routingMeta.textContent = rows.length + ' 个模型';
+
+    var empty = els.routingEmpty;
+    if (state.configuration === null) {
+      els.routingTable.hidden = true;
+      empty.hidden = false;
+      setEmptyText(empty, 'routing', state.configurationError || '尚未读取配置。');
       return;
     }
-    els.channelsTable.hidden = false;
-    els.channelsEmpty.hidden = true;
+    if (rows.length === 0) {
+      els.routingTable.hidden = false;
+      empty.hidden = false;
+      setEmptyText(empty, 'routing', '还没有可路由的模型。到「上游」页添加一个上游并选中模型。');
+      return;
+    }
+    els.routingTable.hidden = false;
+    empty.hidden = true;
+    setEmptyText(empty, 'routing', '还没有可路由的模型。到「上游」页添加一个上游并选中模型。');
 
-    channels.forEach(function (channel) {
-      var row = document.createElement('tr');
-
-      var nameCell = document.createElement('td');
-      nameCell.appendChild(element('span', 'cell-strong', text(channel.name, channel.id)));
-      nameCell.appendChild(element('span', 'cell-id', '#' + text(channel.id)));
-      row.appendChild(nameCell);
-
-      cell(row, badge(channel.enabled ? '已启用' : '已禁用', channel.enabled ? 'success' : 'danger'));
-      cell(row, String(channel.priority === undefined ? 0 : channel.priority), 'num');
-      cell(row, String(channel.weight === undefined ? 0 : channel.weight), 'num');
-      cell(row, tag(enumLabel('routing_strategy', channel.routing_strategy, 'weighted')));
-      cell(row, tag(enumLabel('breaker_mode', channel.breaker_mode, 'cooldown')));
-
-      var proxyVariant = channel.proxy_source === 'direct' ? 'muted' : 'info';
-      cell(row, badge(enumLabel('proxy_source', channel.proxy_source, 'direct'), proxyVariant));
-
-      var mappings = Array.isArray(channel.model_mappings) ? channel.model_mappings : [];
-      var mappingCell = document.createElement('td');
-      mappingCell.className = 'num';
-      if (mappings.length === 0) {
-        mappingCell.textContent = '0';
-      } else {
-        var summary = mappings.map(function (mapping) {
-          return text(mapping.pattern) + ' → ' + text(mapping.target);
-        }).join('\n');
-        var count = tag(String(mappings.length));
-        count.title = summary;
-        mappingCell.appendChild(count);
-      }
-      row.appendChild(mappingCell);
-
-      els.channelsBody.appendChild(row);
+    var head = els.routingTable.querySelector('thead');
+    if (head) { head.textContent = ''; } else {
+      head = document.createElement('thead');
+      els.routingTable.insertBefore(head, els.routingTable.firstChild);
+    }
+    var headerRow = document.createElement('tr');
+    ['模型', '上游', '上游模型名', '匹配方式', '线路数', '状态'].forEach(function (label) {
+      var th = document.createElement('th');
+      th.textContent = label;
+      headerRow.appendChild(th);
     });
+    head.appendChild(headerRow);
+
+    rows.forEach(function (entry) {
+      var row = document.createElement('tr');
+      cell(row, element('span', 'cell-strong mono', entry.model));
+      cell(row, entry.upstreams.length ? entry.upstreams.join('、') : '—');
+      cell(row, entry.targets.length ? entry.targets.join('、') : '与左侧一致');
+      cell(row, tag(entry.mode));
+      cell(row, String(entry.lines), 'num');
+      cell(row, enabledBadge(entry.enabled));
+      els.routingBody.appendChild(row);
+    });
+  }
+
+  function routingRows() {
+    var routes = resourceRows('routes');
+    var channels = resourceRows('channels');
+    var rows = [];
+    routes.forEach(function (route) {
+      var model = String(route.display_name || '').trim() || String(route.model_pattern || '').trim();
+      if (!model) { return; }
+      var upstreams = [];
+      var targets = [];
+      var lines = 0;
+      channels.forEach(function (channel) {
+        if (String(channel.route_id) !== String(route.id)) { return; }
+        lines += 1;
+        var owner = upstreamNameOfChannel(channel);
+        if (owner && upstreams.indexOf(owner) === -1) { upstreams.push(owner); }
+        var target = String(channel.source_model || '').trim();
+        if (target && target !== model && targets.indexOf(target) === -1) { targets.push(target); }
+      });
+      rows.push({
+        model: model,
+        upstreams: upstreams,
+        targets: targets,
+        lines: lines,
+        enabled: route.enabled !== false,
+        mode: routingMode(route)
+      });
+    });
+    rows.sort(function (left, right) { return left.model < right.model ? -1 : (left.model > right.model ? 1 : 0); });
+    return rows;
+  }
+
+  function upstreamNameOfChannel(channel) {
+    var account = rowByID('accounts', channel.account_id);
+    if (!account) { return ''; }
+    return siteName(account.site_id);
+  }
+
+  function routingMode(route) {
+    if (route.route_mode === 'explicit_group') { return '分组'; }
+    var pattern = String(route.model_pattern || '');
+    if (String(route.display_name || '').trim()) { return '别名'; }
+    if (pattern.indexOf('re:') === 0) { return '正则'; }
+    if (pattern.indexOf('*') !== -1 || pattern.indexOf('?') !== -1) { return '通配'; }
+    return '精确';
   }
 
   function renderModels(models, filter) {
@@ -1218,6 +1328,13 @@
   function openEditor(resource, row) {
     var metadata = RESOURCES[resource];
     if (!metadata) { return; }
+    // The upstream form is the one form the generic renderer cannot build: its
+    // keys are a list that is pasted in one go, and its models are picked from
+    // what the upstream actually serves.
+    if (resource === 'upstreams') {
+      openUpstreamEditor(row);
+      return;
+    }
     var fields = state.configuration && state.configuration.fields
       ? state.configuration.fields[resource] : null;
     if (!Array.isArray(fields) || fields.length === 0) {
@@ -1243,6 +1360,316 @@
     els.editorOverlay.hidden = false;
     var firstInput = els.editorFields.querySelector('input:not([type=hidden]), select, textarea');
     if (firstInput) { firstInput.focus(); }
+  }
+
+  /* ===== Upstream editor =====
+   *
+   * The upstream form keeps the same contract as the generic one — the gateway
+   * says which fields exist, this file says how each is labelled and which
+   * widget it gets — but two fields need more than an input:
+   *
+   *   keys    one key per line, so a batch copies in at once. The gateway shows
+   *           stored keys masked; submitting a mask keeps the key it stands for.
+   *   models  picked from what the upstream answers, each with the name that
+   *           upstream knows it by. Saving them is what creates the routes.
+   */
+  function openUpstreamEditor(row) {
+    var fields = state.configuration && state.configuration.fields
+      ? state.configuration.fields.upstreams : null;
+    if (!Array.isArray(fields) || fields.length === 0) {
+      showBanner('无法编辑', '网关没有返回「上游」的字段定义。');
+      return;
+    }
+
+    state.editor = { resource: 'upstreams', id: row ? row.id : 0, fields: [] };
+    els.editorTitle.textContent = (row ? '编辑' : '添加') + '上游';
+    els.editorNote.hidden = true;
+    els.editorFields.textContent = '';
+    hideFeedback(els.editorFeedback);
+    setSubmitting(els.editorSubmit, false, '保存');
+
+    fields.forEach(function (field) {
+      // The mapping is edited per model inside the picker, not as raw JSON, and
+      // the platform identifier the schema stores is not read by the gateway, so
+      // neither belongs in a form an operator fills in by hand.
+      if (field.name === 'model_mapping' || field.name === 'platform') { return; }
+      if (field.name === 'models') {
+        var picker = createModelPicker(row);
+        els.editorFields.appendChild(picker.wrapper);
+        state.editor.fields = state.editor.fields.concat(picker.fields);
+        return;
+      }
+      if (field.name === 'keys') {
+        var keys = createKeysField(field, row);
+        els.editorFields.appendChild(keys.wrapper);
+        state.editor.fields.push(keys);
+        return;
+      }
+      var built = buildField('upstreams', field, row);
+      if (!built) { return; }
+      els.editorFields.appendChild(built.wrapper);
+      state.editor.fields.push(built);
+    });
+
+    els.editorOverlay.hidden = false;
+    var firstInput = els.editorFields.querySelector('input:not([type=hidden]), select, textarea');
+    if (firstInput) { firstInput.focus(); }
+  }
+
+  /* createKeysField is the batch key input: one key per line. */
+  function createKeysField(field, row) {
+    var wrapper = element('div', 'field field-editor');
+    wrapper.setAttribute('data-field', 'keys');
+    var inputID = 'editor-field-upstreams-keys';
+    var label = element('label', 'field-label', (FIELDS.upstreams.keys || {}).label || '密钥');
+    label.setAttribute('for', inputID);
+    wrapper.appendChild(label);
+
+    var stored = upstreamKeyList(row);
+    var area = document.createElement('textarea');
+    area.id = inputID;
+    area.className = 'field-input mono';
+    area.rows = 4;
+    area.spellcheck = false;
+    area.placeholder = '每行一个密钥，可以一次粘贴多个';
+    area.value = stored.join('\n');
+    wrapper.appendChild(area);
+
+    wrapper.appendChild(element('p', 'field-help', (FIELDS.upstreams.keys || {}).help || ''));
+    if (stored.length > 0) {
+      wrapper.appendChild(element('p', 'field-help',
+        '已保存 ' + stored.length + ' 个密钥，上面显示的是末四位；按行序排列，留空表示保持不变。'));
+    }
+
+    return {
+      name: 'keys', kind: 'json_array', required: false, input: area, wrapper: wrapper,
+      read: function () {
+        var lines = area.value.split('\n').map(function (line) { return line.trim(); })
+          .filter(function (line) { return line !== ''; });
+        if (lines.length === 0 && stored.length === 0) {
+          throw new FieldError('至少填写一个密钥');
+        }
+        return lines;
+      }
+    };
+  }
+
+  /* createModelPicker builds the model section: fetch, filter, select, and name
+   * the model the way the upstream knows it. */
+  function createModelPicker(row) {
+    var wrapper = element('div', 'field field-editor');
+    wrapper.setAttribute('data-field', 'models');
+    var heading = element('span', 'field-label', (FIELDS.upstreams.models || {}).label || '模型');
+    wrapper.appendChild(heading);
+    wrapper.appendChild(element('p', 'field-help',
+      '勾选这个上游提供的模型；保存后网关会自动为它们建立路由。「上游模型名」填上游认识的写法，留空表示与模型名相同。'));
+
+    var rows = [];
+    var known = {};
+    var filter = '';
+    var storedMapping = parseJSON(row ? row.model_mapping : null);
+    var storedModels = parseJSON(row ? row.models : null);
+    if (Array.isArray(storedModels)) {
+      storedModels.forEach(function (name) {
+        addModel(String(name), true, mappingTarget(storedMapping, name));
+      });
+    }
+
+    var toolbar = element('div', 'picker-toolbar');
+    var fetchButton = busyButton('btn btn-ghost btn-small', '获取模型');
+    fetchButton.addEventListener('click', function () { fetchModels(fetchButton); });
+    var filterInput = document.createElement('input');
+    filterInput.type = 'search';
+    filterInput.className = 'field-input filter-input';
+    filterInput.placeholder = '筛选模型…';
+    filterInput.setAttribute('aria-label', '筛选模型');
+    filterInput.addEventListener('input', function () {
+      filter = filterInput.value.trim().toLowerCase();
+      paint();
+    });
+    var status = element('span', 'picker-status', '已选 ' + rows.length + ' 个');
+    toolbar.appendChild(fetchButton);
+    toolbar.appendChild(filterInput);
+    toolbar.appendChild(status);
+    wrapper.appendChild(toolbar);
+
+    var list = element('div', 'model-list');
+    wrapper.appendChild(list);
+
+    var manual = element('div', 'picker-manual');
+    var manualInput = document.createElement('input');
+    manualInput.type = 'text';
+    manualInput.className = 'field-input';
+    manualInput.placeholder = '手动添加一个模型名';
+    var manualButton = busyButton('btn btn-ghost btn-small', '添加');
+    manualButton.addEventListener('click', function () {
+      var name = manualInput.value.trim();
+      if (!name) { return; }
+      addModel(name, true, '');
+      manualInput.value = '';
+      filter = '';
+      filterInput.value = '';
+      paint();
+    });
+    manualInput.addEventListener('keydown', function (event) {
+      if (event.key === 'Enter') { event.preventDefault(); manualButton.click(); }
+    });
+    manual.appendChild(manualInput);
+    manual.appendChild(manualButton);
+    wrapper.appendChild(manual);
+
+    paint();
+
+    function addModel(name, checked, target) {
+      name = String(name || '').trim();
+      if (!name) { return; }
+      if (known[name]) {
+        if (checked) { known[name].checked = true; }
+        if (target && !known[name].target) { known[name].target = target; }
+        return;
+      }
+      var entry = { name: name, checked: checked === true, target: target || '' };
+      known[name] = entry;
+      rows.push(entry);
+      rows.sort(function (left, right) { return left.name < right.name ? -1 : (left.name > right.name ? 1 : 0); });
+    }
+
+    function visibleRows() {
+      if (!filter) { return rows; }
+      return rows.filter(function (entry) { return entry.name.toLowerCase().indexOf(filter) !== -1; });
+    }
+
+    function paint() {
+      list.textContent = '';
+      var visible = visibleRows();
+      if (visible.length === 0) {
+        list.appendChild(element('p', 'field-help', rows.length === 0
+          ? '还没有模型。填写 API 地址和密钥后点「获取模型」，也可以手动添加。'
+          : '没有符合筛选条件的模型。'));
+      }
+      visible.forEach(function (entry) {
+        var line = element('label', 'model-line');
+        var box = document.createElement('input');
+        box.type = 'checkbox';
+        box.checked = entry.checked;
+        box.addEventListener('change', function () {
+          entry.checked = box.checked;
+          updateStatus();
+        });
+        line.appendChild(box);
+        line.appendChild(element('span', 'model-name mono', entry.name));
+        var target = document.createElement('input');
+        target.type = 'text';
+        target.className = 'field-input model-target';
+        target.placeholder = '上游模型名（可选）';
+        target.value = entry.target;
+        target.addEventListener('input', function () { entry.target = target.value.trim(); });
+        line.appendChild(target);
+        list.appendChild(line);
+      });
+      updateStatus();
+    }
+
+    function updateStatus() {
+      var selected = rows.filter(function (entry) { return entry.checked; }).length;
+      status.textContent = rows.length === 0
+        ? ''
+        : '已选 ' + selected + ' / ' + rows.length + ' 个';
+    }
+
+    function fetchModels(button) {
+      var url = editorFieldValue('url');
+      if (!url) {
+        showFeedback(els.editorFeedback, '请先填写 API 地址。', 'error');
+        return;
+      }
+      var headers = {};
+      var rawHeaders = editorFieldValue('custom_headers');
+      if (rawHeaders) {
+        var parsedHeaders = parseJSON(rawHeaders);
+        if (parsedHeaders && typeof parsedHeaders === 'object' && !Array.isArray(parsedHeaders)) {
+          headers = parsedHeaders;
+        }
+      }
+      setSubmitting(button, true, '获取模型');
+      status.textContent = '正在向上游查询…';
+      hideFeedback(els.editorFeedback);
+
+      post('/management/upstreams/models', {
+        id: state.editor ? state.editor.id : 0,
+        url: url,
+        key: firstKeyLine(),
+        headers: headers
+      }).then(function (result) {
+        setSubmitting(button, false, '获取模型');
+        if (result.ok) {
+          var models = (result.body && result.body.models) || [];
+          models.forEach(function (name) { addModel(name, false, ''); });
+          status.textContent = '上游返回 ' + models.length + ' 个模型';
+          paint();
+          return;
+        }
+        status.textContent = '';
+        if (result.status === 401) { showAuth('登录状态已过期，请重新登录后继续。'); return; }
+        showFeedback(els.editorFeedback, errorMessage(result.body, '获取模型失败。'), 'error');
+      }).catch(function (err) {
+        setSubmitting(button, false, '获取模型');
+        status.textContent = '';
+        showFeedback(els.editorFeedback, '无法连接网关：' + String(err && err.message ? err.message : err), 'error');
+      });
+    }
+
+    /* firstKeyLine is what the probe presents: the key the operator just typed,
+     * or the mask of a stored one, which the gateway resolves itself. */
+    function firstKeyLine() {
+      var raw = editorFieldValue('keys');
+      var lines = String(raw || '').split('\n');
+      for (var index = 0; index < lines.length; index++) {
+        if (lines[index].trim() !== '') { return lines[index].trim(); }
+      }
+      return '';
+    }
+
+    return {
+      wrapper: wrapper,
+      fields: [
+        {
+          name: 'models', kind: 'json_array', required: false, input: list, wrapper: wrapper,
+          read: function () {
+            return rows.filter(function (entry) { return entry.checked; })
+              .map(function (entry) { return entry.name; });
+          }
+        },
+        {
+          name: 'model_mapping', kind: 'json_object', required: false, input: list, wrapper: wrapper,
+          read: function () {
+            var mapping = {};
+            var count = 0;
+            rows.forEach(function (entry) {
+              if (!entry.checked || !entry.target || entry.target === entry.name) { return; }
+              mapping[entry.name] = entry.target;
+              count += 1;
+            });
+            return count === 0 ? null : mapping;
+          }
+        }
+      ]
+    };
+  }
+
+  function mappingTarget(mapping, name) {
+    if (!mapping || typeof mapping !== 'object') { return ''; }
+    var target = mapping[name];
+    return typeof target === 'string' ? target.trim() : '';
+  }
+
+  /* editorFieldValue reads the current value of a rendered editor input, which is
+   * how the model picker sees the address and the keys typed above it. */
+  function editorFieldValue(name) {
+    var wrapper = els.editorFields.querySelector('[data-field="' + name + '"]');
+    if (!wrapper) { return ''; }
+    var input = wrapper.querySelector('input, select, textarea');
+    return input ? input.value : '';
   }
 
   function closeEditor() {
@@ -1652,6 +2079,264 @@
     });
   }
 
+  /* ===== Runtime policy =====
+   *
+   * The settings page edits the policy the gateway applies while it runs:
+   * whether a failed request may move to another line, how it is retried, and
+   * how long a failing line is held out of rotation. The gateway owns the field
+   * list, so a policy value added there shows up here without a change to this
+   * file; only the labels and the wording of each section live here. */
+  var POLICY_SECTION_ORDER = ['failover', 'retry', 'breaker'];
+
+  var POLICY_SECTIONS = {
+    failover: {
+      title: '故障转移',
+      help: '一条线路失败后，请求是否换到别的线路继续。关闭后只在同一条线路上重试，便于观察某个上游本身的失败。'
+    },
+    retry: {
+      title: '错误重试',
+      help: '在把失败交给客户端之前，网关自己重试多少次、等多久。只有列表里的状态码会被重试，其余错误立即返回。'
+    },
+    breaker: {
+      title: '故障冷却与恢复',
+      help: '连续失败达到阈值后，这条线路被暂时移出选路（熔断），冷却时间每次按倍数增长，到期自动恢复；作用域选「通道禁用」的线路不会自动恢复，需要在概览页手动恢复。'
+    }
+  };
+
+  var POLICY_FIELDS = {
+    'gateway.failover.enabled': { label: '启用故障转移' },
+    'gateway.failover.cross_upstream': { label: '允许跨上游转移', help: '关闭后只在同一个上游的不同密钥之间切换，不会换到其它上游。' },
+    'gateway.retry.max_attempts': { label: '单次请求最多尝试', unit: 'count' },
+    'gateway.retry.max_attempts_per_channel': { label: '单条线路最多尝试', unit: 'count' },
+    'gateway.retry.base_backoff_ms': { label: '首次重试等待', unit: 'ms' },
+    'gateway.retry.max_backoff_ms': { label: '重试等待上限', unit: 'ms' },
+    'gateway.retry.statuses': { label: '重试的状态码', help: '用逗号分隔，例如 408,429,500,502,503,504。' },
+    'gateway.breaker.mode': { label: '熔断作用域', help: '决定一次熔断影响多大范围：整条线路、一个密钥、或一个密钥加一个模型。' },
+    'gateway.breaker.threshold': { label: '连续失败多少次熔断', unit: 'count' },
+    'gateway.breaker.base_cooldown_seconds': { label: '首次冷却时间', unit: 's' },
+    'gateway.breaker.max_cooldown_seconds': { label: '冷却时间上限', unit: 's' },
+    'gateway.breaker.cooldown_multiplier': { label: '冷却倍数', unit: 'x', help: '每多熔断一次，冷却时间乘以此倍数，直到上限。' }
+  };
+
+  var POLICY_UNITS = { count: '次', ms: '毫秒', s: '秒', x: '倍' };
+
+  function policyUnit(unit) {
+    return POLICY_UNITS[unit] || unit;
+  }
+
+  function renderPolicy() {
+    if (!els.policyPanels) { return; }
+    var configuration = state.configuration;
+    var signature = JSON.stringify(configuration
+      ? { policy: configuration.policy, fields: configuration.policy_fields }
+      : null);
+    // The form is rebuilt only when the values behind it changed, so a refresh
+    // cannot wipe out what the operator is typing.
+    if (signature === state.policySignature) { return; }
+
+    els.policyPanels.textContent = '';
+    if (!configuration || !Array.isArray(configuration.policy_fields)) {
+      state.policySignature = signature;
+      return;
+    }
+    var bySection = {};
+    configuration.policy_fields.forEach(function (field) {
+      var section = field.section || 'retry';
+      if (!bySection[section]) { bySection[section] = []; }
+      bySection[section].push(field);
+    });
+    POLICY_SECTION_ORDER.forEach(function (name) {
+      var fields = bySection[name];
+      if (!fields || fields.length === 0) { return; }
+      els.policyPanels.appendChild(policySection(name, fields, configuration.policy || {}));
+    });
+    state.policySignature = signature;
+  }
+
+  function policySection(name, fields, values) {
+    var meta = POLICY_SECTIONS[name] || { title: name };
+    var section = element('section', 'panel');
+    section.setAttribute('data-policy-section', name);
+
+    var header = element('header', 'panel-header');
+    var title = element('div', 'panel-title');
+    var tick = element('span', 'title-tick', '');
+    tick.setAttribute('aria-hidden', 'true');
+    title.appendChild(tick);
+    var heading = document.createElement('h2');
+    heading.textContent = meta.title;
+    title.appendChild(heading);
+    header.appendChild(title);
+    section.appendChild(header);
+
+    var body = element('div', 'settings-body');
+    if (meta.help) { body.appendChild(element('p', 'panel-help', meta.help)); }
+
+    var form = element('form', 'settings-form');
+    form.setAttribute('action', 'about:blank');
+    form.setAttribute('autocomplete', 'off');
+    var inputs = fields.map(function (field) {
+      var widget = policyField(field, values[field.key]);
+      form.appendChild(widget.wrapper);
+      return { field: field, widget: widget };
+    });
+
+    var feedback = element('p', 'settings-feedback');
+    feedback.setAttribute('role', 'alert');
+    feedback.hidden = true;
+    form.appendChild(feedback);
+
+    var actions = element('div', 'settings-actions');
+    var save = element('button', 'btn btn-primary', '');
+    save.type = 'submit';
+    save.appendChild(element('span', 'btn-label', '保存'));
+    var restore = element('button', 'btn btn-ghost', '');
+    restore.type = 'button';
+    restore.appendChild(element('span', 'btn-label', '恢复默认'));
+    restore.addEventListener('click', function () {
+      submitPolicy(inputs, feedback, restore, '恢复默认', true);
+    });
+    actions.appendChild(save);
+    actions.appendChild(restore);
+    form.appendChild(actions);
+    form.appendChild(element('p', 'settings-hint',
+      '清空某一项表示恢复该进程默认值（由部署时的环境变量决定）。'));
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      submitPolicy(inputs, feedback, save, '保存', false);
+    });
+
+    body.appendChild(form);
+    section.appendChild(body);
+    return section;
+  }
+
+  /* policyField renders one policy value. Clearing an input submits null, which
+   * is what removes the override rather than storing an empty value. */
+  function policyField(field, value) {
+    var meta = POLICY_FIELDS[field.key] || {};
+    var labelText = (meta.label || field.key);
+    if (field.kind !== 'bool' && meta.unit) { labelText += '（' + policyUnit(meta.unit) + '）'; }
+    var inputID = 'policy-' + String(field.key).replace(/[.]/g, '-');
+    var wrapper = element('div', 'field field-editor');
+    wrapper.setAttribute('data-field', field.key);
+
+    function fieldLabel() {
+      var label = element('label', 'field-label', labelText);
+      label.setAttribute('for', inputID);
+      return label;
+    }
+
+    var read;
+    if (field.kind === 'bool') {
+      var toggle = document.createElement('input');
+      toggle.type = 'checkbox';
+      toggle.className = 'field-checkbox';
+      toggle.id = inputID;
+      toggle.checked = value === true;
+      var line = element('label', 'checkline');
+      line.appendChild(toggle);
+      line.appendChild(element('span', '', labelText));
+      wrapper.appendChild(line);
+      read = function () { return toggle.checked; };
+    } else if (field.kind === 'choice') {
+      var select = document.createElement('select');
+      select.id = inputID;
+      select.className = 'field-input';
+      (field.choices || []).forEach(function (choice) {
+        var option = document.createElement('option');
+        option.value = choice;
+        option.textContent = enumLabel('breaker_mode', choice, choice);
+        select.appendChild(option);
+      });
+      var current = value === undefined || value === null ? '' : String(value);
+      select.value = current;
+      wrapper.appendChild(fieldLabel());
+      wrapper.appendChild(select);
+      read = function () { return select.value; };
+    } else if (field.kind === 'int_list') {
+      var list = document.createElement('input');
+      list.type = 'text';
+      list.id = inputID;
+      list.className = 'field-input mono';
+      list.placeholder = '408,429,500,502,503,504';
+      list.value = Array.isArray(value) ? value.join(',') : '';
+      wrapper.appendChild(fieldLabel());
+      wrapper.appendChild(list);
+      read = function () {
+        var raw = list.value.trim();
+        if (raw === '') { return null; }
+        var codes = [];
+        raw.split(',').forEach(function (part) {
+          part = part.trim();
+          if (part === '') { return; }
+          var code = Number(part);
+          if (!isFinite(code) || code !== Math.floor(code)) {
+            throw new FieldError('状态码必须是整数：' + part);
+          }
+          codes.push(code);
+        });
+        return codes.length === 0 ? null : codes;
+      };
+    } else {
+      var number = document.createElement('input');
+      number.type = 'number';
+      number.id = inputID;
+      number.className = 'field-input';
+      number.step = field.kind === 'float' ? 'any' : '1';
+      if (field.min !== undefined && field.min !== null) { number.min = String(field.min); }
+      if (field.max !== undefined && field.max !== null) { number.max = String(field.max); }
+      number.value = value === undefined || value === null ? '' : String(value);
+      wrapper.appendChild(fieldLabel());
+      wrapper.appendChild(number);
+      read = function () {
+        var raw = number.value.trim();
+        if (raw === '') { return null; }
+        var parsed = Number(raw);
+        if (!isFinite(parsed)) { throw new FieldError('必须是数字'); }
+        return parsed;
+      };
+    }
+    if (meta.help) { wrapper.appendChild(element('p', 'field-help', meta.help)); }
+    return { wrapper: wrapper, read: read };
+  }
+
+  /* submitPolicy writes the values of one section. A restore sends null for
+   * every field, which puts the process defaults back. */
+  function submitPolicy(inputs, feedback, button, idleLabel, restore) {
+    var settings = {};
+    for (var index = 0; index < inputs.length; index++) {
+      var entry = inputs[index];
+      var value;
+      try {
+        value = restore ? null : entry.widget.read();
+      } catch (error) {
+        showFeedback(feedback,
+          ((POLICY_FIELDS[entry.field.key] || {}).label || entry.field.key) + '：' + error.message, 'error');
+        return;
+      }
+      settings[entry.field.key] = value;
+    }
+
+    setSubmitting(button, true, idleLabel);
+    hideFeedback(feedback);
+    put('/management/policy', { settings: settings }).then(function (result) {
+      setSubmitting(button, false, idleLabel);
+      if (result.ok) {
+        if (result.body && result.body.configuration) { applyConfiguration(result.body.configuration); }
+        renderPolicy();
+        renderManagement();
+        showNotice(restore ? '已恢复默认设置。' : '运行策略已保存，立即生效。');
+        return;
+      }
+      if (result.status === 401) { showAuth('登录状态已过期，请重新登录后继续。'); return; }
+      showFeedback(feedback, errorMessage(result.body, '网关拒绝了这次修改。'), 'error');
+    }).catch(function (err) {
+      setSubmitting(button, false, idleLabel);
+      showFeedback(feedback, '无法连接网关：' + String(err && err.message ? err.message : err), 'error');
+    });
+  }
+
   /* ===== Confirm and secret dialogs ===== */
 
   function openConfirm(options) {
@@ -1746,7 +2431,17 @@
 
   function setSubmitting(button, submitting, idleLabel) {
     button.disabled = submitting;
-    button.querySelector('.btn-label').textContent = submitting ? '处理中…' : idleLabel;
+    var label = button.querySelector('.btn-label');
+    if (label) { label.textContent = submitting ? '处理中…' : idleLabel; }
+  }
+
+  /* busyButton builds a button whose label can be swapped while a request is in
+   * flight, which is what tells the operator the click was received. */
+  function busyButton(className, label) {
+    var button = element('button', className);
+    button.type = 'button';
+    button.appendChild(element('span', 'btn-label', label));
+    return button;
   }
 
   function markInvalid(wrapper) {
@@ -1968,6 +2663,9 @@
     els.refresh.addEventListener('click', refresh);
     els.signout.addEventListener('click', signOut);
     els.bannerRetry.addEventListener('click', refresh);
+    if (els.breakersResetAll) {
+      els.breakersResetAll.addEventListener('click', resetAllBreakers);
+    }
     els.modelFilter.addEventListener('input', function () {
       renderModels(state.snapshot && state.snapshot.models ? state.snapshot.models : [], els.modelFilter.value);
     });

@@ -166,12 +166,23 @@ type Column struct {
 	// console shows for an untouched checkbox. It is only meaningful for
 	// KindBool and mirrors the column default in the schema.
 	Default bool
+	// DefaultValue is the value a create stores when it omits the column, for a
+	// column whose schema default is not enough. It carries the column's own
+	// type: a string for text, an int64, a float64 or a bool.
+	DefaultValue any
 	// Synthetic marks a field that is not a column. A request may carry it and
 	// Apply stores it, but it is never part of the row itself.
 	Synthetic bool
 	// Validate inspects the normalized value: a string for text and time, an
 	// int64, a float64, a bool, or the decoded JSON for the JSON kinds.
 	Validate func(value any) error
+}
+
+// queryer is the part of database/sql a read hook needs, so the same hook runs
+// inside a write transaction and against the pool on a read path.
+type queryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
 // Resource describes one editable table.
@@ -190,6 +201,9 @@ type Resource struct {
 	CheckRow func(ctx context.Context, tx *sql.Tx, id int64, row map[string]any) error
 	// Apply stores the synthetic fields of a request once the row itself is written.
 	Apply func(ctx context.Context, tx *sql.Tx, id int64, values map[string]any) error
+	// Decorate fills the synthetic fields of a row that has just been read, so a
+	// field assembled from other tables is shown the same way it is written.
+	Decorate func(ctx context.Context, db queryer, rows []map[string]any) error
 	// GuardDelete refuses a delete that would leave other configuration pointing
 	// at a missing row.
 	GuardDelete func(ctx context.Context, tx *sql.Tx, id int64) error
@@ -200,9 +214,15 @@ type Resource struct {
 }
 
 // resources is the editable configuration surface in the order the console
-// presents it: what upstreams the gateway talks to, what it talks to them with,
-// how models reach them, and what clients present to the gateway.
+// presents it: the upstreams it talks to — each one a name, an address, its
+// keys and the models it serves — and then what clients present to the gateway.
+//
+// The tables behind an upstream are still described here individually, because
+// the management API addresses them directly and automation uses them to reach
+// details the upstream form deliberately hides, such as a forced endpoint or a
+// per-key proxy.
 var resources = []Resource{
+	upstreamResource,
 	{
 		Name: "sites", Table: "sites", OrderBy: "id",
 		Columns: []Column{
@@ -465,6 +485,9 @@ func (s *SQLiteStore) ListResource(ctx context.Context, name string) ([]map[stri
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("list %s: %w", resource.Name, err)
 	}
+	if err := decorateRows(ctx, resource, s.db, listed); err != nil {
+		return nil, err
+	}
 	return listed, nil
 }
 
@@ -502,8 +525,12 @@ func (s *SQLiteStore) CreateResource(ctx context.Context, name string, values ma
 		value, present := provided[column.Name]
 		if !present {
 			// An omitted column takes the schema default, which keeps a create
-			// from having to name every optional field.
-			continue
+			// from having to name every optional field. A column whose schema
+			// default is not enough carries one of its own.
+			if column.DefaultValue == nil {
+				continue
+			}
+			value = column.DefaultValue
 		}
 		columns = append(columns, column.Name)
 		placeholders = append(placeholders, "?")
@@ -527,6 +554,12 @@ func (s *SQLiteStore) CreateResource(ctx context.Context, name string, values ma
 	}
 	stored, err := loadResourceRow(ctx, tx, resource, id)
 	if err != nil {
+		return nil, err
+	}
+	// The stored row is answered with its synthetic fields filled in, so the
+	// client that made the change sees what it now holds rather than only the
+	// columns of the table behind it.
+	if err := decorateRows(ctx, resource, tx, []map[string]any{stored}); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -598,6 +631,9 @@ func (s *SQLiteStore) UpdateResource(ctx context.Context, name string, id int64,
 	if err != nil {
 		return nil, err
 	}
+	if err := decorateRows(ctx, resource, tx, []map[string]any{stored}); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit %s update: %w", resource.Name, err)
 	}
@@ -653,6 +689,15 @@ func orderBy(resource Resource) string {
 		return "id"
 	}
 	return resource.OrderBy
+}
+
+// decorateRows fills the synthetic fields of rows that were just read. A
+// resource without a hook has none.
+func decorateRows(ctx context.Context, resource Resource, db queryer, rows []map[string]any) error {
+	if resource.Decorate == nil || len(rows) == 0 {
+		return nil
+	}
+	return resource.Decorate(ctx, db, rows)
 }
 
 // columnList renders the select list of a resource.

@@ -18,6 +18,7 @@ import (
 	"github.com/yhw5231/fluxgate/internal/api"
 	"github.com/yhw5231/fluxgate/internal/breaker"
 	"github.com/yhw5231/fluxgate/internal/config"
+	"github.com/yhw5231/fluxgate/internal/policy"
 	"github.com/yhw5231/fluxgate/internal/proxy"
 	"github.com/yhw5231/fluxgate/internal/router"
 	"github.com/yhw5231/fluxgate/internal/store"
@@ -123,7 +124,18 @@ func run(parent context.Context, logger *slog.Logger) error {
 		ProxyResolver: proxyResolver,
 		TransportPool: transportPool,
 		Policy:        cfg.Retry,
+		Failover:      &cfg.Failover,
 	}
+	// The runtime policy is the environment's settings with whatever the console
+	// stored on top of them. It is installed once here and again after every
+	// console write, so a retry, failover, or cooldown change applies to the next
+	// request rather than at the next restart.
+	runtime, warnings := policy.FromSettings(configuration.Settings, cfg.Policy())
+	for _, warning := range warnings {
+		logger.Warn("policy_setting_ignored", "detail", warning)
+	}
+	engine.SetPolicy(proxy.DispatchPolicy{Retry: runtime.Retry, Failover: runtime.Failover})
+	circuitBreaker.SetPolicy(runtime.Breaker)
 
 	gatewayAPI := &api.Server{
 		Engine:              engine,
@@ -132,6 +144,8 @@ func run(parent context.Context, logger *slog.Logger) error {
 		Sessions:            persistentStore,
 		ConfigStore:         persistentStore,
 		BreakerSnapshotter:  breakerStore,
+		BreakerReset:        breakerStore,
+		PolicyDefaults:      cfg.Policy(),
 		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,
 		Logger:              logger,
 		StartedAt:           time.Now().UTC(),
@@ -144,6 +158,12 @@ func run(parent context.Context, logger *slog.Logger) error {
 		applyRequestTimeout(&updated, cfg.RequestTimeout)
 		selector.SetRoutes(updated.Routes)
 		proxyResolver.SetConfig(proxyConfiguration(updated))
+		applied, ignored := policy.FromSettings(updated.Settings, cfg.Policy())
+		for _, warning := range ignored {
+			logger.Warn("policy_setting_ignored", "detail", warning)
+		}
+		engine.SetPolicy(proxy.DispatchPolicy{Retry: applied.Retry, Failover: applied.Failover})
+		circuitBreaker.SetPolicy(applied.Breaker)
 	}
 	gatewayAPI.Ready.Store(true)
 

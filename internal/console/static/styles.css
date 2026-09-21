@@ -959,6 +959,84 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 .secret-row { display: flex; gap: 8px; align-items: center; }
 .secret-row .field-input { flex: 1; color: var(--accent); }
 
+/* ===== Upstream model picker =====
+   The model list and the key list are the two fields the upstream form builds
+   itself, because neither one is a single value. */
+.field-editor[data-field="models"],
+.field-editor[data-field="keys"] { grid-column: 1 / -1; }
+
+.picker-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.picker-toolbar .filter-input { flex: 1; min-width: 140px; }
+
+.picker-status {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.model-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 10px;
+  padding: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: rgba(2, 6, 15, 0.25);
+}
+
+.model-line {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) minmax(120px, 42%);
+  align-items: center;
+  gap: 10px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.model-line:hover { background: rgba(148, 163, 184, 0.07); }
+.model-line input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; }
+
+.model-name {
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-line .model-target { padding: 5px 8px; font-size: 12px; }
+
+.picker-manual {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.picker-manual .field-input { flex: 1; }
+
+/* ===== Policy panels =====
+   A policy section is generated from the field list the gateway returns, so
+   only its action group needs its own rule. */
+.panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+[data-policy-section] .settings-form { max-width: 560px; }
+
 /* ===== Responsive ===== */
 @media (max-width: 720px) {
   .topbar-inner { padding: 0 16px; }

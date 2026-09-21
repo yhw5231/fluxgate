@@ -16,6 +16,9 @@ type Store interface {
 	EnsureBreakerSchema(ctx context.Context) error
 	LoadBreakerStates(ctx context.Context) (map[breaker.Scope]breaker.State, error)
 	UpdateBreakerState(ctx context.Context, scope breaker.Scope, update func(breaker.State) breaker.State) (breaker.State, error)
+	// DeleteBreakerStates clears the circuits a caller names, or every circuit
+	// when the list is empty, returning how many were removed.
+	DeleteBreakerStates(ctx context.Context, scopes []breaker.Scope) (int64, error)
 	CleanupBreakerStates(ctx context.Context, before time.Time) (int64, error)
 	Close() error
 }

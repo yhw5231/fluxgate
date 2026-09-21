@@ -19,6 +19,7 @@ import (
 	"github.com/yhw5231/fluxgate/internal/breaker"
 	"github.com/yhw5231/fluxgate/internal/console"
 	"github.com/yhw5231/fluxgate/internal/domain"
+	"github.com/yhw5231/fluxgate/internal/policy"
 	"github.com/yhw5231/fluxgate/internal/proxy"
 	"github.com/yhw5231/fluxgate/internal/router"
 	"github.com/yhw5231/fluxgate/internal/store"
@@ -53,8 +54,18 @@ type Server struct {
 	// Applier installs a reloaded snapshot in the routing engine. When nil, a
 	// change is reported by the API and applied to proxied traffic at the next
 	// restart.
-	Applier             ConfigurationApplier
-	BreakerSnapshotter  BreakerSnapshotter
+	Applier            ConfigurationApplier
+	BreakerSnapshotter BreakerSnapshotter
+	// BreakerReset clears recorded circuits, which is how the console brings a
+	// cooled-down or disabled channel back into service immediately.
+	BreakerReset BreakerResetter
+	// Prober asks an upstream for its model list. When nil, a default client with
+	// the gateway's own timeouts is used.
+	Prober UpstreamProber
+	// PolicyDefaults is the runtime policy the environment configured. A console
+	// write overrides individual values of it; it is also what a cleared override
+	// returns to.
+	PolicyDefaults      policy.Policy
 	Models              []string
 	MaxRequestBodyBytes int64
 	Logger              *slog.Logger
@@ -103,6 +114,19 @@ func (s *Server) currentModels() []string {
 	return s.Models
 }
 
+// currentPolicy is the runtime policy the gateway is applying: the environment's
+// defaults with whatever overrides the settings table holds.
+func (s *Server) currentPolicy() policy.Policy {
+	defaults := s.PolicyDefaults
+	if defaults.Retry.MaxAttempts <= 0 {
+		// A gateway assembled without explicit defaults — a test, or an embedder
+		// that only wants the proxy — runs with the built-in ones.
+		defaults = policy.Default()
+	}
+	applied, _ := policy.FromSettings(s.currentConfiguration().Settings, defaults)
+	return applied
+}
+
 // limiter returns the per-server sign-in limiter, creating it on first use.
 func (s *Server) limiter() *loginLimiter {
 	s.loginLimiterOnce.Do(func() {
@@ -141,6 +165,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /management/configuration/{resource}/{id}", s.handleConfigurationUpdate)
 	mux.HandleFunc("DELETE /management/configuration/{resource}/{id}", s.handleConfigurationDelete)
 	mux.HandleFunc("POST /management/configuration/keys/{id}/rotate", s.handleConfigurationKeyRotate)
+	// The runtime policy is stored like configuration but is not a row of a
+	// table, so it has its own endpoint rather than a resource name.
+	mux.HandleFunc("PUT /management/policy", s.handlePolicyUpdate)
+	// Asking an upstream what it serves, so a model can be picked rather than
+	// typed.
+	mux.HandleFunc("POST /management/upstreams/models", s.handleUpstreamModels)
+	// Clearing a recorded circuit, which is the manual half of breaker recovery.
+	mux.HandleFunc("POST /management/breakers/reset", s.handleBreakerReset)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleProxy)
 	mux.HandleFunc("POST /v1/responses", s.handleProxy)

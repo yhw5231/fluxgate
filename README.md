@@ -1,6 +1,6 @@
 # Fluxgate
 
-Fluxgate is a lightweight, independently deployable Go gateway that reads the existing upstream SQLite configuration and provides OpenAI-compatible proxy endpoints, bounded server-side retries, weighted routing, proxy selection, and persistent circuit-breaker state. It ships with an embedded management console that both shows the running state and edits that configuration: upstream sites, accounts, tokens, routes, channels, client keys, and proxy profiles.
+Fluxgate is a lightweight, independently deployable Go gateway that reads the existing upstream SQLite configuration and provides OpenAI-compatible proxy endpoints, bounded server-side retries, weighted routing, proxy selection, and persistent circuit-breaker state. It ships with an embedded management console that both shows the running state and edits that configuration: upstreams with their keys and models, the routing the gateway derives from them, client keys, proxy profiles, and the retry, failover, and circuit-breaker policy the gateway applies while it runs.
 
 ## Requirements
 
@@ -283,32 +283,55 @@ error codes stay stable for automation while the console renders them in Chinese
 
 ### Managing the configuration from the console
 
-The console is also where the configuration is edited: sites, accounts, account
-tokens, routes, channels, client keys, and proxy profiles can all be added,
-changed, and removed without touching the database by hand or restarting the
-gateway. Every accepted write reloads the configuration and hands the result to
-the routing engine, so a channel added in the console serves traffic on the next
-request.
+The console is also where the configuration is edited. Its main view is 上游
+(upstreams): one row per upstream service, holding everything that upstream needs
+— a name, an API address, a weight, request headers, an optional proxy, its keys,
+and the models it serves. Adding an upstream and picking its models is all it takes
+to route them; the routes appear by themselves. Every accepted write reloads the
+configuration and hands the result to the routing engine, so an upstream added in
+the console serves traffic on the next request.
 
-The views are 概览 (the live dashboard), 通道 (channels), 路由 (routes), 上游
-(sites, accounts, tokens, and proxies), 客户端密钥 (client keys), and 设置 (the
-administrator account). Each editable table has an 添加 button, and every row has
-编辑 and 删除 actions; client keys additionally have 轮换, which mints a new value
-and invalidates the old one immediately.
+The views are 概览 (the live dashboard), 上游 (upstreams), 路由 (the routing table
+the gateway derived, shown read-only), 客户端密钥 (client keys), and 设置 (the
+administrator account, the runtime policy, and proxy profiles).
+
+The upstream form is built around the four things that actually vary between
+upstreams:
+
+- **Keys are pasted in one go.** One key per line, as many as needed. The stored
+  keys are shown masked and are matched by position: an untouched line keeps the
+  key it stands for, a changed line replaces it, an added line is stored, and a
+  removed line retires that key.
+- **Key selection has two modes.** 可用优先 (available first) prefers the first key
+  and moves to the next one only when it fails or is cooling down; 轮询 (round
+  robin) spreads requests across every key by weight.
+- **Models are picked, not typed.** 获取模型 asks the upstream itself for its model
+  list, so the operator selects from what it really serves; a model can also be
+  typed in by hand. Each selected model takes an optional upstream model name —
+  the spelling that upstream knows, when it differs from the name clients use.
+- **Routing is derived.** Selecting a model creates its route and one line per key;
+  deselecting it removes them once no other upstream serves that model. A route the
+  operator wrote by hand through the API is never pruned by a console edit.
+
+Each editable table has an 添加 button, and every row has 编辑 and 删除 actions;
+client keys additionally have 轮换, which mints a new value and invalidates the old
+one immediately. The 概览 view lists the recorded circuits and can clear one (恢复)
+or all of them (全部恢复), which is how a cooled-down or disabled line returns to
+service before its cooldown would have expired.
 
 A few rules the console enforces, all of them on the server rather than in the
 browser:
 
-- **Secrets are write-only.** An upstream access token or client key is stored as
-  written but returned as a mask showing its last four characters. The form for an
-  existing row starts empty and leaves the stored value alone unless a new value is
-  typed, so a mask can never be saved back over a credential. A key is shown in
-  full exactly once, when it is created or rotated.
-- **References are checked.** A channel must name a route, an account, and — when
-  it names one — a token that belongs to that account. A delete is refused while
-  other rows still point at it, and the refusal says how many and of which kind.
-  Deleting a route does take its channels with it, and the console reports how many
-  went.
+- **Secrets are write-only.** An upstream key or client key is stored as written
+  but returned as a mask showing its last four characters. The form for an existing
+  row starts with the mask and leaves the stored value alone unless a new value is
+  typed, so a mask can never be saved back over a credential. A client key is shown
+  in full exactly once, when it is created or rotated.
+- **References are checked.** A channel must name a route and an account, ids have
+  to exist, and a delete is refused while other rows still point at what it would
+  remove — the refusal says how many and of which kind. Deleting an upstream does
+  take its credentials, its lines, and the routes that only existed for it, and the
+  console reports how many went.
 - **Values are typed and bounded.** Model mappings, custom headers, exclusion
   lists, and weight multipliers are validated as JSON of the expected shape; a URL
   has to be one the transport can actually use; text has a byte bound. A rejected
@@ -316,13 +339,14 @@ browser:
   stable `reason` code, and its parameters, which the console renders in Chinese
   and highlights on the form.
 - **A write is same-origin.** The console authenticates with a cookie, so a
-  state-changing request is only accepted from the gateway's own origin. The
-  management token remains accepted, because a script carries it in a header a
-  page cannot set.
+  state-changing request — including an upstream probe — is only accepted from the
+  gateway's own origin. The management token remains accepted, because a script
+  carries it in a header a page cannot set.
 
 Every write is logged as `console_configuration_created`, `…_updated`, `…_deleted`,
-or `…_key_rotated` with the resource, the row id, and the client address. Values
-are never logged, because a write carries credentials.
+`…_key_rotated`, `console_policy_updated`, or `console_breakers_reset` with the
+resource, the row id, and the client address. Values are never logged, because a
+write carries credentials.
 
 The console page itself is unauthenticated so it can render the sign-in form; every
 data request it makes — reads and writes alike — goes to the authenticated management
@@ -396,20 +420,43 @@ Management endpoints:
 - `PUT /management/configuration/{resource}/{id}`
 - `DELETE /management/configuration/{resource}/{id}`
 - `POST /management/configuration/keys/{id}/rotate`
+- `PUT /management/policy`
+- `POST /management/upstreams/models`
+- `POST /management/breakers/reset`
 - `GET /management/session`
 - `POST /management/login`
 - `POST /management/logout`
 - `POST /management/password`
 
-`{resource}` is one of `sites`, `accounts`, `tokens`, `routes`, `channels`, `keys`, or
-`proxies`. `GET /management/configuration` returns every row of each resource with
-secrets masked, the writable field list of each resource, and the models the gateway
-currently routes, so the console builds its tables and forms from one payload. A
-successful write answers with the stored row and the reloaded payload, so the console
-repaints from a single round trip; when a key value was minted it is returned once as
-`generated.key`. A create needs the fields the resource marks as required and takes
-the schema default for the rest; an update applies only the fields the request
-carries, so a partial update from automation never clears what it did not mention.
+`{resource}` is one of `upstreams`, `sites`, `accounts`, `tokens`, `routes`,
+`channels`, `keys`, or `proxies`. `GET /management/configuration` returns every row of
+each resource with secrets masked, the writable field list of each resource, the models
+the gateway currently routes, and the runtime policy with its field list, so the console
+builds its tables and forms from one payload. A successful write answers with the stored
+row and the reloaded payload, so the console repaints from a single round trip; when a
+key value was minted it is returned once as `generated.key`. A create needs the fields
+the resource marks as required and takes the schema default for the rest; an update
+applies only the fields the request carries, so a partial update from automation never
+clears what it did not mention.
+
+`upstreams` is the composite resource the console's upstream form writes, and the only
+one whose fields are assembled from several tables. Alongside the columns of `sites` it
+carries four synthetic fields: `keys` (a JSON array of strings, one per key, matched by
+position), `key_mode` (`available_first` or `round_robin`), `models` (the exposed model
+names the upstream serves), and `model_mapping` (a JSON object of exposed name to the
+name that upstream knows). Writing `keys` or `models` creates the account, the token
+rows, the routes, and the channels behind them; the route ids the console created are
+recorded in the settings table under `gateway.managed_routes`, so an edit prunes only
+what it owns. The tables themselves remain addressable one by one for a detail the form
+does not show, such as a forced endpoint or a per-key proxy.
+
+`PUT /management/policy` stores runtime policy overrides, and `POST
+/management/breakers/reset` clears one recorded circuit (`scope` of `channel`, `key`, or
+`key_model` with the identifying fields) or every circuit (`scope: "all"`). `POST
+/management/upstreams/models` asks an upstream for its model list: the body carries the
+`url`, one `key`, and any `headers` from the form before it is saved, or an `id` and a
+masked key so the gateway probes with the key it already stores. The key is used for
+that one outbound request and is never part of a response.
 
 The write endpoints refuse a request that changes nothing valid: `400` with
 `invalid_configuration` for a bad value (the body names the `field` and a stable
@@ -544,7 +591,10 @@ Candidate channels are then filtered by:
 - `route_channels.source_model`: when set, the channel only serves models that
   equal it, are alias-equivalent (a `vendor/` prefix and a trailing `-free` are
   ignored), or match it as a pattern. A channel on an exact-pattern route
-  inherits that pattern as its source model when the column is empty.
+  inherits that pattern as its source model when the column is empty. A channel
+  that names its own model on an exact-pattern route is a candidate for that
+  route regardless, which is what lets one exposed model reach several upstreams
+  that each spell it differently.
 - The downstream key exclusions described below.
 - The circuit breaker and channels already tried by the retry loop.
 
@@ -552,10 +602,12 @@ The model written into the upstream request body is resolved in this order:
 
 1. If the request named the route's `display_name` and the channel has a
    `source_model`, that source model is used.
-2. Otherwise, if `model_mapping` did not rewrite the name and the route pattern
+2. Otherwise, if the channel names its own model on an exact-pattern route, that
+   is the name its upstream receives.
+3. Otherwise, if `model_mapping` did not rewrite the name and the route pattern
    is an exact match, the channel `source_model` is used, falling back to the
    route pattern.
-3. Otherwise the mapped model is used, defaulting to the requested name.
+4. Otherwise the mapped model is used, defaulting to the requested name.
 
 `model_mapping` entries are evaluated in declaration order: an exact key first,
 then the first matching pattern. Order is preserved rather than relying on map
@@ -599,6 +651,8 @@ models and minus models with no channel the key may use.
 - `FLUXGATE_MAX_ATTEMPTS_PER_CHANNEL`: Maximum attempts against one channel. Default: `2`.
 - `FLUXGATE_RETRY_BASE_BACKOFF`: Initial retry backoff duration. Default: `50ms`.
 - `FLUXGATE_RETRY_MAX_BACKOFF`: Maximum retry backoff duration. Default: `1s`.
+- `FLUXGATE_FAILOVER_ENABLED`: Whether a failed request may move to another channel at all. Default: `true`. With it off, the request keeps retrying the channel it started on, which is what makes one upstream's behavior observable.
+- `FLUXGATE_FAILOVER_CROSS_UPSTREAM`: Whether failover may reach another upstream, or only another key of the same one. Default: `true`.
 
 Retryable status codes are `408`, `409`, `425`, `429`, `500`, `502`, `503`, and `504`. Network failures may also be retried within the configured limits. Once a streaming response has been committed to the downstream client, the gateway does not switch channels.
 
@@ -608,8 +662,45 @@ Retryable status codes are `408`, `409`, `425`, `429`, `500`, `502`, `503`, and 
 - `FLUXGATE_BREAKER_THRESHOLD`: Consecutive failure threshold. Default: `3`.
 - `FLUXGATE_BREAKER_BASE_COOLDOWN`: Initial cooldown duration. Default: `30s`.
 - `FLUXGATE_BREAKER_MAX_COOLDOWN`: Maximum exponential cooldown duration. Default: `15m`.
+- `FLUXGATE_BREAKER_COOLDOWN_MULTIPLIER`: Factor the cooldown of a repeatedly failing circuit grows by, until the maximum. Default: `2`.
 
-Channel-specific breaker modes loaded from the existing configuration can override the default mode. Breaker state is persisted in the Go-owned `gateway_breaker_states` table and restored after restart.
+Channel-specific breaker modes loaded from the existing configuration can override the default mode. Breaker state is persisted in the Go-owned `gateway_breaker_states` table and restored after restart. A `disable` circuit does not return to service by itself; it is cleared from the console (恢复) or through `POST /management/breakers/reset`.
+
+### Runtime policy
+
+The retry, failover, and circuit-breaker settings above can be changed while the
+gateway runs, from the console's 设置 page. A change is stored in the configuration
+database's `settings` table under a `gateway.`-prefixed key, is additive to whatever
+else that shared table holds, and takes effect for the next request rather than at the
+next restart. Clearing a value removes its row, which puts the environment's value
+back; restoring a section's defaults does that for every value in it.
+
+| Setting | Meaning |
+| --- | --- |
+| `gateway.failover.enabled` | Whether a failed request may move to another line at all. With it off, the request stays on the line it started with. |
+| `gateway.failover.cross_upstream` | Whether it may move to another upstream, or only to another key of the same one. |
+| `gateway.retry.max_attempts` | Total upstream attempts for one request. |
+| `gateway.retry.max_attempts_per_channel` | Attempts against one line before it is given up. |
+| `gateway.retry.statuses` | JSON array of status codes that are retried. |
+| `gateway.retry.base_backoff_ms` | Initial wait before a retry, in milliseconds. |
+| `gateway.retry.max_backoff_ms` | Upper bound of that wait, in milliseconds. |
+| `gateway.breaker.mode` | `cooldown`, `disable`, `key_cooldown`, or `key_model_cooldown`. |
+| `gateway.breaker.threshold` | Consecutive failures before a line is held out. |
+| `gateway.breaker.base_cooldown_seconds` | First cooldown, in seconds. |
+| `gateway.breaker.max_cooldown_seconds` | Upper bound of the cooldown, in seconds. |
+| `gateway.breaker.cooldown_multiplier` | Growth factor applied per consecutive trip. |
+
+A policy value is validated twice: on its own against the field's range or choice list,
+and as a whole against the rules that tie two values together — a per-line attempt
+budget may not exceed the total one, a cooldown ceiling may not sit below its floor. A
+request that breaks one is answered with `400 invalid_configuration` naming the field to
+change, and nothing is stored. The same parser reads the table at startup, so a row that
+was edited by hand and cannot be read is reported once in the log as
+`policy_setting_ignored` and the value it tried to set keeps its environment default.
+
+Two settings the console does not write are worth knowing about: the console records the
+routes it created in `gateway.managed_routes`, and it is the only thing that prunes
+them.
 
 ### Network timeout settings
 

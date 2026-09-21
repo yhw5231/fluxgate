@@ -548,3 +548,58 @@ func TestEveryResourceHasAnAddressableUniqueName(t *testing.T) {
 		}
 	}
 }
+
+// The settings table is shared with whatever else owns the database, so a
+// gateway write has to add its own rows, replace them, and delete them when the
+// override is cleared — never touch anything else.
+func TestPutSettingsAddsReplacesAndClearsRows(t *testing.T) {
+	store := prepareManagedStore(t)
+	ctx := context.Background()
+	if _, err := store.db.Exec(`INSERT INTO settings (key, value) VALUES ('foreign_key', 'keep me')`); err != nil {
+		t.Fatalf("seed foreign setting: %v", err)
+	}
+
+	if err := store.PutSettings(ctx, map[string]string{
+		"gateway.retry.max_attempts": "4",
+		"gateway.breaker.threshold":  "2",
+	}); err != nil {
+		t.Fatalf("PutSettings() error = %v", err)
+	}
+	settings, err := store.LoadSettings(ctx)
+	if err != nil {
+		t.Fatalf("LoadSettings() error = %v", err)
+	}
+	if settings["gateway.retry.max_attempts"] != "4" || settings["gateway.breaker.threshold"] != "2" {
+		t.Errorf("settings = %v, want the stored values", settings)
+	}
+	if settings["foreign_key"] != "keep me" {
+		t.Errorf("the write disturbed another writer's row: %v", settings["foreign_key"])
+	}
+
+	if err := store.PutSettings(ctx, map[string]string{"gateway.retry.max_attempts": "8"}); err != nil {
+		t.Fatalf("PutSettings() error = %v", err)
+	}
+	settings, err = store.LoadSettings(ctx)
+	if err != nil {
+		t.Fatalf("LoadSettings() error = %v", err)
+	}
+	if settings["gateway.retry.max_attempts"] != "8" {
+		t.Errorf("the replaced value = %v, want 8", settings["gateway.retry.max_attempts"])
+	}
+
+	// An empty value clears the override, which is how a value returns to the
+	// process default.
+	if err := store.PutSettings(ctx, map[string]string{"gateway.retry.max_attempts": ""}); err != nil {
+		t.Fatalf("PutSettings() error = %v", err)
+	}
+	settings, err = store.LoadSettings(ctx)
+	if err != nil {
+		t.Fatalf("LoadSettings() error = %v", err)
+	}
+	if _, present := settings["gateway.retry.max_attempts"]; present {
+		t.Error("the cleared setting is still stored")
+	}
+	if settings["gateway.breaker.threshold"] != "2" {
+		t.Error("clearing one setting removed another")
+	}
+}

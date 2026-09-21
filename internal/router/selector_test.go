@@ -335,3 +335,79 @@ func TestMemorySelectorForwardsRequestedModelForGlobRoute(t *testing.T) {
 		t.Fatalf("selected model = %q, want the requested model", got)
 	}
 }
+
+// One exposed model may reach several upstreams that each spell it differently.
+// The route carries the name clients ask for and the channel carries the name
+// its own upstream knows, so both channels have to be candidates and each has to
+// receive its own spelling.
+func TestMemorySelectorSendsEachUpstreamItsOwnModelName(t *testing.T) {
+	selector := NewMemorySelector([]domain.Route{route(1, "claude-sonnet",
+		domain.Channel{ID: "vendor-a", Enabled: true, Weight: 10, SiteID: 1, SourceModel: "claude-3-5-sonnet"},
+		domain.Channel{ID: "vendor-b", Enabled: true, Weight: 10, SiteID: 2, SourceModel: "claude-sonnet"},
+	)})
+
+	seen := map[string]string{}
+	for index := 0; index < 8; index++ {
+		selection := selectChannel(t, selector, "claude-sonnet", domain.RoutingPolicy{})
+		seen[selection.Channel.ID] = selection.Model
+	}
+	if len(seen) != 2 {
+		t.Fatalf("only %v were selected, want both upstreams to stay reachable", seen)
+	}
+	if seen["vendor-a"] != "claude-3-5-sonnet" {
+		t.Errorf("vendor-a received %q, want its own name claude-3-5-sonnet", seen["vendor-a"])
+	}
+	if seen["vendor-b"] != "claude-sonnet" {
+		t.Errorf("vendor-b received %q, want claude-sonnet", seen["vendor-b"])
+	}
+}
+
+// A channel whose own model name is not equivalent to the request is still a
+// candidate on the route that exposes it, which is what makes the mapping work.
+func TestMemorySelectorAdmitsAnExplicitSourceModelOnAnExactRoute(t *testing.T) {
+	selector := NewMemorySelector([]domain.Route{route(1, "gpt-4.1",
+		domain.Channel{ID: "renamed", Enabled: true, Weight: 10, SourceModel: "gpt-4.1-2025-04-14"},
+	)})
+	selection := selectChannel(t, selector, "gpt-4.1", domain.RoutingPolicy{})
+	if selection.Channel.ID != "renamed" {
+		t.Fatalf("selected channel = %q, want renamed", selection.Channel.ID)
+	}
+	if selection.Model != "gpt-4.1-2025-04-14" {
+		t.Fatalf("selected model = %q, want the channel's own name", selection.Model)
+	}
+
+	// The same channel is not a candidate for a different model.
+	if selector.HasCandidate("gpt-4.1-mini", domain.RoutingPolicy{}) {
+		t.Error("a channel with an explicit source model answered for an unrelated model")
+	}
+}
+
+func TestMemorySelectorHonoursThePin(t *testing.T) {
+	selector := NewMemorySelector([]domain.Route{route(1, "gpt-4.1",
+		domain.Channel{ID: "a", Enabled: true, Weight: 10, SiteID: 1},
+		domain.Channel{ID: "b", Enabled: true, Weight: 10, SiteID: 2},
+	)})
+
+	selection, err := selector.Select(domain.SelectionRequest{Model: "gpt-4.1", OnlyChannel: "b"})
+	if err != nil {
+		t.Fatalf("Select(OnlyChannel) error = %v", err)
+	}
+	if selection.Channel.ID != "b" {
+		t.Fatalf("selected channel = %q, want the pinned one", selection.Channel.ID)
+	}
+
+	selection, err = selector.Select(domain.SelectionRequest{Model: "gpt-4.1", OnlySiteID: 1})
+	if err != nil {
+		t.Fatalf("Select(OnlySiteID) error = %v", err)
+	}
+	if selection.Channel.ID != "a" {
+		t.Fatalf("selected channel = %q, want the channel of the pinned upstream", selection.Channel.ID)
+	}
+
+	if _, err := selector.Select(domain.SelectionRequest{Model: "gpt-4.1", OnlyChannel: "gone"}); err == nil {
+		t.Error("Select() answered a pin that matches no channel")
+	}
+	if _, err := selector.Select(domain.SelectionRequest{Model: "gpt-4.1", OnlySiteID: 99}); err == nil {
+		t.Error("Select() answered a pin that matches no upstream")
+	}
+}

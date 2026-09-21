@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yhw5231/fluxgate/internal/policy"
 	"github.com/yhw5231/fluxgate/internal/store"
 )
 
@@ -45,6 +46,12 @@ type ConfigurationStore interface {
 	CreateResource(ctx context.Context, name string, values map[string]any) (map[string]any, error)
 	UpdateResource(ctx context.Context, name string, id int64, values map[string]any) (map[string]any, error)
 	DeleteResource(ctx context.Context, name string, id int64) (map[string]int64, error)
+	// PutSettings stores runtime policy overrides, deleting a key whose value is
+	// empty so the value it overrode applies again.
+	PutSettings(ctx context.Context, values map[string]string) error
+	// UpstreamKey reads the first key of a stored upstream, for the model probe
+	// that has to present a credential the console is never shown.
+	UpstreamKey(ctx context.Context, id int64) (string, error)
 	LoadConfiguration(ctx context.Context) (store.Configuration, error)
 }
 
@@ -60,10 +67,8 @@ const (
 	// while still keeping a hostile request from being buffered whole.
 	maxConfigurationBodyBytes = 1 << 20
 
-	// secretMask replaces a stored credential in a management response. The
-	// bullet characters cannot occur in a credential, which is what makes the
-	// mask recognizable when the console sends a row back.
-	secretMask = "••••"
+	// secretMask replaces a stored credential in a management response.
+	secretMask = store.SecretMask
 
 	// downstreamKeyBytes is the entropy of a generated client credential.
 	downstreamKeyBytes = 32
@@ -312,12 +317,18 @@ func (s *Server) configurationInventory(ctx context.Context) (map[string]any, er
 	if models == nil {
 		models = []string{}
 	}
+	// The runtime policy travels with the configuration because it is stored in
+	// the same database and read back the same way: after a write the console
+	// holds the values the gateway is now using, not the ones it asked for.
+	applied := s.currentPolicy()
 	return map[string]any{
-		"generated_at": time.Now().UTC().Format(time.RFC3339Nano),
-		"loaded_at":    loadedAt,
-		"models":       models,
-		"resources":    rows,
-		"fields":       fields,
+		"generated_at":  time.Now().UTC().Format(time.RFC3339Nano),
+		"loaded_at":     loadedAt,
+		"models":        models,
+		"resources":     rows,
+		"fields":        fields,
+		"policy":        applied.Values(),
+		"policy_fields": policy.Fields(),
 	}, nil
 }
 
@@ -384,14 +395,7 @@ func maskRow(row map[string]any, resourceName string) map[string]any {
 // maskSecret renders a stored credential so the console can show that one is
 // set, and which one it is, without receiving the value itself.
 func maskSecret(value string) string {
-	if value == "" {
-		return ""
-	}
-	runes := []rune(value)
-	if len(runes) <= 4 {
-		return secretMask
-	}
-	return secretMask + string(runes[len(runes)-4:])
+	return store.MaskSecret(value)
 }
 
 // stripEchoedSecrets drops a secret field that still carries the mask. An

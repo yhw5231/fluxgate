@@ -377,7 +377,10 @@ func TestConsoleCarriesTheManagementViewsAndEditor(t *testing.T) {
 	}
 	page := string(body)
 
-	for _, resource := range []string{"channels", "routes", "sites", "accounts", "tokens", "proxies", "keys"} {
+	// The upstream is the one form the gateway configures as a whole; the client
+	// keys and the proxies are still plain tables, and the routing table is
+	// derived rather than written, so it carries no create button.
+	for _, resource := range []string{"upstreams", "proxies", "keys"} {
 		for _, wanted := range []string{
 			`data-management="` + resource + `"`,
 			`data-create="` + resource + `"`,
@@ -387,9 +390,19 @@ func TestConsoleCarriesTheManagementViewsAndEditor(t *testing.T) {
 			}
 		}
 	}
+	for _, wanted := range []string{
+		`data-table="routing"`,
+		`data-body="routing"`,
+		`id="policy-panels"`,
+		`id="breakers-reset-all"`,
+	} {
+		if !strings.Contains(page, wanted) {
+			t.Errorf("console is missing %q", wanted)
+		}
+	}
 	// Each view toggles as a whole, so the container and its navigation entry
 	// have to exist even before the script runs.
-	for _, view := range []string{"overview", "channels", "routes", "upstream", "keys", "settings"} {
+	for _, view := range []string{"overview", "upstream", "routes", "keys", "settings"} {
 		if !strings.Contains(page, `data-view="`+view+`"`) {
 			t.Errorf("console navigation has no %q entry", view)
 		}

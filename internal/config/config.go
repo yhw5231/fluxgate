@@ -10,14 +10,13 @@ import (
 
 	"github.com/yhw5231/fluxgate/internal/breaker"
 	"github.com/yhw5231/fluxgate/internal/domain"
+	"github.com/yhw5231/fluxgate/internal/policy"
 )
 
 const (
 	defaultAddress               = ":8081"
 	defaultDatabasePath          = "../data/hub.db"
 	defaultMaxRequestBodyBytes   = int64(8 << 20)
-	defaultMaxAttempts           = 8
-	defaultMaxAttemptsPerChannel = 2
 	defaultRequestTimeout        = 60 * time.Second
 	defaultConnectTimeout        = 10 * time.Second
 	defaultTLSHandshakeTimeout   = 10 * time.Second
@@ -28,11 +27,6 @@ const (
 	defaultWriteTimeout          = 0
 	defaultIdleTimeout           = 120 * time.Second
 	defaultShutdownTimeout       = 15 * time.Second
-	defaultBaseBackoff           = 50 * time.Millisecond
-	defaultMaxBackoff            = time.Second
-	defaultBreakerThreshold      = 3
-	defaultBreakerBaseCooldown   = 30 * time.Second
-	defaultBreakerMaxCooldown    = 15 * time.Minute
 	defaultIntegrityCheck        = true
 )
 
@@ -53,10 +47,17 @@ type Config struct {
 	IdleTimeout           time.Duration
 	ShutdownTimeout       time.Duration
 	Retry                 domain.RetryPolicy
+	Failover              domain.FailoverPolicy
 	Breaker               breaker.Policy
 	// IntegrityCheck verifies the shared SQLite database at startup so a
 	// damaged file fails loudly instead of serving wrong routing data.
 	IntegrityCheck bool
+}
+
+// Policy is the runtime traffic policy these settings produce. A console write
+// overrides individual values of it; the environment supplies the rest.
+func (c Config) Policy() policy.Policy {
+	return policy.Policy{Retry: c.Retry, Failover: c.Failover, Breaker: c.Breaker}
 }
 
 // Load reads gateway settings from environment variables and applies bounded,
@@ -128,6 +129,15 @@ func Load() (Config, error) {
 	if cfg.Breaker.Threshold, err = intEnv("FLUXGATE_BREAKER_THRESHOLD", cfg.Breaker.Threshold, true); err != nil {
 		return Config{}, err
 	}
+	if cfg.Breaker.Multiplier, err = floatEnv("FLUXGATE_BREAKER_COOLDOWN_MULTIPLIER", cfg.Breaker.Multiplier, 1); err != nil {
+		return Config{}, err
+	}
+	if cfg.Failover.Enabled, err = boolEnv("FLUXGATE_FAILOVER_ENABLED", cfg.Failover.Enabled); err != nil {
+		return Config{}, err
+	}
+	if cfg.Failover.CrossUpstream, err = boolEnv("FLUXGATE_FAILOVER_CROSS_UPSTREAM", cfg.Failover.CrossUpstream); err != nil {
+		return Config{}, err
+	}
 	if cfg.IntegrityCheck, err = boolEnv("FLUXGATE_INTEGRITY_CHECK", cfg.IntegrityCheck); err != nil {
 		return Config{}, err
 	}
@@ -157,6 +167,7 @@ func Load() (Config, error) {
 // Default returns bounded settings suitable for production startup. WriteTimeout
 // is intentionally zero so long-lived server-sent event responses are not cut off.
 func Default() Config {
+	traffic := policy.Default()
 	return Config{
 		Address:               defaultAddress,
 		DatabasePath:          defaultDatabasePath,
@@ -171,29 +182,10 @@ func Default() Config {
 		WriteTimeout:          defaultWriteTimeout,
 		IdleTimeout:           defaultIdleTimeout,
 		ShutdownTimeout:       defaultShutdownTimeout,
-		Retry: domain.RetryPolicy{
-			MaxAttempts:           defaultMaxAttempts,
-			MaxAttemptsPerChannel: defaultMaxAttemptsPerChannel,
-			RetryStatuses: map[int]struct{}{
-				408: {},
-				409: {},
-				425: {},
-				429: {},
-				500: {},
-				502: {},
-				503: {},
-				504: {},
-			},
-			BaseBackoff: defaultBaseBackoff,
-			MaxBackoff:  defaultMaxBackoff,
-		},
-		Breaker: breaker.Policy{
-			Mode:         breaker.ModeCooldown,
-			Threshold:    defaultBreakerThreshold,
-			BaseCooldown: defaultBreakerBaseCooldown,
-			MaxCooldown:  defaultBreakerMaxCooldown,
-		},
-		IntegrityCheck: defaultIntegrityCheck,
+		Retry:                 traffic.Retry,
+		Failover:              traffic.Failover,
+		Breaker:               traffic.Breaker,
+		IntegrityCheck:        defaultIntegrityCheck,
 	}
 }
 
@@ -253,6 +245,18 @@ func int64Env(name string, fallback int64, positive bool) (int64, error) {
 			qualifier = "positive"
 		}
 		return 0, fmt.Errorf("%s must be a %s integer", name, qualifier)
+	}
+	return parsed, nil
+}
+
+func floatEnv(name string, fallback, minimum float64) (float64, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || parsed < minimum {
+		return 0, fmt.Errorf("%s must be a number of at least %g", name, minimum)
 	}
 	return parsed, nil
 }

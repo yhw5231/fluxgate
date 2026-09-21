@@ -323,6 +323,15 @@ type RetryPolicy struct {
 	MaxBackoff            time.Duration
 }
 
+// FailoverPolicy decides how far a request may travel after a channel failed.
+// Both flags are independent steps: switching off Enabled keeps the request on
+// the channel it started with, and switching off CrossUpstream keeps it on that
+// channel's upstream while still allowing its other keys to be tried.
+type FailoverPolicy struct {
+	Enabled       bool
+	CrossUpstream bool
+}
+
 // Request is the protocol-neutral input passed through selection and dispatch.
 type Request struct {
 	Method  string
@@ -363,6 +372,12 @@ type SelectionRequest struct {
 	Model    string
 	Policy   RoutingPolicy
 	Excluded map[string]struct{}
+	// OnlyChannel and OnlySiteID pin a lookup to one channel or to one upstream
+	// site. The retry loop uses them to hold a request on the channel it already
+	// started with when failover is switched off, or on that channel's upstream
+	// when only same-upstream failover is allowed.
+	OnlyChannel string
+	OnlySiteID  int64
 }
 
 // Selector supplies failover candidates while excluding channels already exhausted.

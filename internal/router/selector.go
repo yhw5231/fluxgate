@@ -196,10 +196,16 @@ func (s *MemorySelector) eligible(route domain.Route, request domain.SelectionRe
 		if !channel.Enabled {
 			continue
 		}
+		if request.OnlyChannel != "" && channel.ID != request.OnlyChannel {
+			continue
+		}
+		if request.OnlySiteID != 0 && channel.SiteID != request.OnlySiteID {
+			continue
+		}
 		if _, skip := request.Excluded[channel.ID]; skip {
 			continue
 		}
-		if !bypassSourceModel && !sourceModelSupports(channel.SourceModel, request.Model) {
+		if !bypassSourceModel && !channelAdmitsModel(route, channel, request.Model) {
 			continue
 		}
 		if request.Policy.ExcludesSite(channel.SiteID) {
@@ -267,6 +273,33 @@ func sourceModelSupports(sourceModel, requested string) bool {
 	return pattern.Match(requested, source)
 }
 
+// channelAdmitsModel reports whether a channel may serve the requested model.
+// Besides the source-model rule, a channel on an exact-model route is a
+// candidate whenever it names its own upstream model. That is what lets one
+// exposed model reach several upstreams that each spell it differently: the
+// route carries the name clients ask for, and the channel carries the name its
+// upstream knows.
+func channelAdmitsModel(route domain.Route, channel domain.Channel, requested string) bool {
+	if sourceModelSupports(channel.SourceModel, requested) {
+		return true
+	}
+	return hasExplicitSourceModel(route, channel)
+}
+
+// hasExplicitSourceModel reports whether a channel names its own upstream model
+// instead of inheriting the route's exact pattern.
+func hasExplicitSourceModel(route domain.Route, channel domain.Channel) bool {
+	source := strings.TrimSpace(channel.SourceModel)
+	if source == "" {
+		return false
+	}
+	routePattern := strings.TrimSpace(route.ModelPattern)
+	if routePattern == "" || !pattern.IsExact(routePattern) {
+		return false
+	}
+	return source != routePattern
+}
+
 // normalizeRoutableModelName drops a vendor prefix and a "-free" suffix so
 // "vendor/model" and "model" compare equal.
 func normalizeRoutableModelName(value string) string {
@@ -283,12 +316,15 @@ func aliasEquivalent(left, right string) bool {
 }
 
 // resolveActualModel picks the model written into the upstream request body. A
-// display-name request uses the channel source model, an exact route without a
-// mapping uses the source model or the route pattern, and everything else uses
-// the mapped model.
+// display-name request uses the channel source model, a channel that names its
+// own model on an exact route uses that name, and everything else uses the
+// mapped model.
 func resolveActualModel(requested string, route domain.Route, channel domain.Channel) string {
 	sourceModel := strings.TrimSpace(channel.SourceModel)
 	if displayNameMatches(requested, route.DisplayName) && sourceModel != "" {
+		return sourceModel
+	}
+	if hasExplicitSourceModel(route, channel) && pattern.Match(requested, route.ModelPattern) {
 		return sourceModel
 	}
 	mapped := route.ModelMapping.Resolve(requested)
