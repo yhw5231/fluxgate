@@ -95,6 +95,7 @@
         <button class="nav-item is-active" type="button" data-view="overview">概览</button>
         <button class="nav-item" type="button" data-view="upstream">上游</button>
         <button class="nav-item" type="button" data-view="routes">路由</button>
+        <button class="nav-item" type="button" data-view="requests">请求记录</button>
         <button class="nav-item" type="button" data-view="keys">客户端密钥</button>
         <button class="nav-item" type="button" data-view="settings">设置</button>
       </nav>
@@ -184,8 +185,7 @@
             <thead>
               <tr>
                 <th>作用域</th>
-                <th>通道</th>
-                <th>密钥</th>
+                <th>线路</th>
                 <th>模型</th>
                 <th class="num">失败次数</th>
                 <th class="num">熔断级别</th>
@@ -266,7 +266,7 @@
           </div>
           <button class="btn btn-primary" type="button" data-create="upstreams">添加上游</button>
         </header>
-        <p class="panel-help">一个上游填一处上游服务：名称、API 地址、权重、请求头、一组密钥，以及它提供哪些模型。保存后网关会按选中的模型自动建立路由，无需再手工配置通道。</p>
+        <p class="panel-help">一个上游填一处上游服务：名称、API 地址、权重、请求头、一组密钥，以及它提供哪些模型。保存后网关会按选中的模型自动建立路由，无需再手工配置通道。权重可以直接在表格里改：点开一行能看到这个上游的每条线路（每个密钥一条）和它们的当前状态。</p>
         <div class="table-wrap">
           <table class="data-table" data-table="upstreams"><tbody data-body="upstreams"></tbody></table>
         </div>
@@ -276,7 +276,7 @@
       </section>
     </main>
 
-    <!-- ===== 路由：由上游的模型自动生成，这里只读展示匹配结果 ===== -->
+    <!-- ===== 路由：由上游的模型自动生成，先给结论，展开才是每条线路 ===== -->
     <main class="container" data-view-panel="routes" hidden>
       <section class="panel" data-panel="routing">
         <header class="panel-header">
@@ -285,14 +285,46 @@
             <h2>模型路由</h2>
             <span class="panel-meta" data-meta></span>
           </div>
-          <span class="panel-note">由上游的模型自动匹配</span>
+          <div class="panel-actions">
+            <span class="panel-note">每 10 秒自动刷新 &middot; <span data-next-refresh>&mdash;</span></span>
+          </div>
         </header>
-        <p class="panel-help">选中某个模型后，网关自动建立对应的路由，并把该上游的每个密钥接上去；客户端请求这个模型名时，就在这些上游之间按权重分配，并在失败时转移。同一个模型由多个上游提供时会合并到同一条路由。</p>
+        <p class="panel-help">选中某个模型后，网关自动建立对应的路由，并把该上游的每个密钥接上去；客户端请求这个模型名时，就在这些上游之间按权重分配，并在失败时转移。同一个模型由多个上游提供时会合并到同一条路由。<strong>点模型名可以展开它下面的线路</strong>：每条线路是一个上游密钥，展开后能看到它走哪个上游模型名、优先级、权重，以及当前是可用、冷却还是已停用。</p>
         <div class="table-wrap">
           <table class="data-table" data-table="routing"><tbody data-body="routing"></tbody></table>
         </div>
         <div class="empty-state" data-empty="routing" hidden>
           <p data-empty-text>还没有可路由的模型。到「上游」页添加一个上游并选中模型。</p>
+        </div>
+      </section>
+    </main>
+
+    <!-- ===== 请求记录：网关服务过的每个请求，以及上游自己返回的报错 ===== -->
+    <main class="container" data-view-panel="requests" hidden>
+      <section class="panel" data-panel="requests">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="title-tick" aria-hidden="true"></span>
+            <h2>请求记录</h2>
+            <span class="panel-meta" data-meta></span>
+          </div>
+          <div class="panel-actions">
+            <span class="panel-note">每 10 秒自动刷新 &middot; <span data-next-refresh>&mdash;</span></span>
+          </div>
+        </header>
+        <p class="panel-help">网关服务过的每个请求都记在这里：结果、走的哪条线路、上游返回的原文，以及每一次尝试的耗时。客户端只拿到状态码和错误码，<strong>上游到底说了什么只在这里</strong>，所以排查报错从这里开始。点开一行能看到每次尝试的明细。</p>
+        <div class="panel-toolbar">
+          <button id="requests-failed" class="btn btn-ghost btn-small" type="button" aria-pressed="false">只看失败</button>
+          <input id="requests-model" class="filter-input" type="search" placeholder="按模型筛选…" aria-label="按模型筛选">
+          <span class="panel-note" data-retention></span>
+          <button id="requests-clear" class="btn btn-ghost btn-small" type="button">清空记录</button>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table" data-table="requests"><tbody data-requests-body></tbody></table>
+        </div>
+        <div class="empty-state" data-empty="requests" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M8 9h8M8 13h5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          <p data-empty-text>还没有请求记录。经过网关的每个请求都会记在这里。</p>
         </div>
       </section>
     </main>
@@ -308,7 +340,7 @@
           </div>
           <button class="btn btn-primary" type="button" data-create="keys">添加密钥</button>
         </header>
-        <p class="panel-help">客户端用这些密钥调用 <code>/v1/…</code> 接口。密钥只在创建或轮换时显示一次，之后仅显示末四位。</p>
+        <p class="panel-help">客户端用这些密钥调用 <code>/v1/…</code> 接口。列表里只显示掩码；需要看完整密钥时点该行的<strong>「显示」</strong>（读回后刷新页面会重新隐藏），或直接点<strong>「复制」</strong>把它放进剪贴板。密钥也可以随时轮换，旧值立即失效。</p>
         <div class="table-wrap">
           <table class="data-table" data-table="keys"><tbody data-body="keys"></tbody></table>
         </div>

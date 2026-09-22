@@ -2,9 +2,11 @@ package router
 
 import (
 	"errors"
+	"math/rand"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/yhw5231/fluxgate/internal/domain"
 	"github.com/yhw5231/fluxgate/internal/pattern"
@@ -25,14 +27,22 @@ type ChannelFilter interface {
 	IsBlocked(channel domain.Channel, model string) bool
 }
 
-// MemorySelector is a deterministic first-slice selector. It resolves the route
-// that owns the requested model, then prefers higher priority channels within
-// that route and uses smooth weighted round-robin among equals.
+// MemorySelector resolves the route that owns the requested model and picks one
+// of its channels.
+//
+// Selection is by priority first and by weight second, the way an operator
+// reasons about a pool of upstreams:
+//
+//  1. The highest upstream priority with an eligible channel wins. The channel's
+//     own priority is compared inside that: a key mode that orders one
+//     upstream's keys orders them within their upstream, never across upstreams.
+//  2. Among the channels that tie on both, one is drawn at random, each
+//     channel's chance proportional to its effective weight.
 type MemorySelector struct {
-	mu      sync.Mutex
-	routes  []domain.Route
-	current map[string]float64
-	filter  ChannelFilter
+	mu     sync.Mutex
+	routes []domain.Route
+	filter ChannelFilter
+	random *rand.Rand
 }
 
 func NewMemorySelector(routes []domain.Route) *MemorySelector {
@@ -44,14 +54,17 @@ func NewMemorySelector(routes []domain.Route) *MemorySelector {
 func NewMemorySelectorWithFilter(routes []domain.Route, filter ChannelFilter) *MemorySelector {
 	copied := append([]domain.Route(nil), routes...)
 	sort.SliceStable(copied, func(i, j int) bool { return copied[i].ID < copied[j].ID })
-	return &MemorySelector{routes: copied, current: make(map[string]float64), filter: filter}
+	return &MemorySelector{
+		routes: copied,
+		filter: filter,
+		random: rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
 }
 
 // SetRoutes replaces the routing table in place. The selector object itself is
 // never swapped, so a configuration change made in the management console takes
 // effect for the next request while requests already in flight finish against
-// the table they started with. Round-robin state is kept, because a channel that
-// survives the change should not lose its turn.
+// the table they started with.
 func (s *MemorySelector) SetRoutes(routes []domain.Route) {
 	copied := append([]domain.Route(nil), routes...)
 	sort.SliceStable(copied, func(i, j int) bool { return copied[i].ID < copied[j].ID })
@@ -76,28 +89,40 @@ func (s *MemorySelector) Select(request domain.SelectionRequest) (domain.Selecti
 		return domain.Selection{}, ErrNoChannel
 	}
 
-	highestPriority := eligible[0].Priority
+	selected := s.pickWeighted(highestPriorityTier(eligible), request.Policy)
+	return domain.Selection{
+		Channel: selected,
+		Model:   ActualModel(request.Model, route, selected),
+	}, nil
+}
+
+// highestPriorityTier keeps the channels a request should be tried on first: the
+// highest upstream priority present, and within it the highest channel priority.
+// A channel of a lower tier is only reached when every channel of the higher one
+// is unusable, which is what makes priority mean "try these first" rather than
+// "give these more traffic".
+func highestPriorityTier(eligible []domain.Channel) []domain.Channel {
+	bestSite, bestLine := eligible[0].SitePriority, eligible[0].Priority
 	for _, channel := range eligible {
-		if channel.Priority > highestPriority {
-			highestPriority = channel.Priority
+		if channel.SitePriority > bestSite {
+			bestSite, bestLine = channel.SitePriority, channel.Priority
+			continue
+		}
+		if channel.SitePriority == bestSite && channel.Priority > bestLine {
+			bestLine = channel.Priority
 		}
 	}
 	pool := make([]domain.Channel, 0, len(eligible))
 	for _, channel := range eligible {
-		if channel.Priority == highestPriority {
+		if channel.SitePriority == bestSite && channel.Priority == bestLine {
 			pool = append(pool, channel)
 		}
 	}
-
-	selected := s.pickWeighted(pool, request.Policy)
-	return domain.Selection{
-		Channel: selected,
-		Model:   resolveActualModel(request.Model, route, selected),
-	}, nil
+	return pool
 }
 
 // HasCandidate reports whether any channel could serve the model, without
-// consuming weighted round-robin state.
+// drawing a channel.
 func (s *MemorySelector) HasCandidate(model string, policy domain.RoutingPolicy) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -135,7 +160,7 @@ func (s *MemorySelector) findRoute(model string, policy domain.RoutingPolicy) (d
 		}
 	}
 	for _, route := range candidates {
-		if !route.IsGroup() && pattern.IsExact(route.ModelPattern) && pattern.Match(model, route.ModelPattern) {
+		if !route.IsGroup() && pattern.IsExact(route.ModelPattern) && pattern.MatchName(model, route.ModelPattern) {
 			return route, true
 		}
 	}
@@ -145,7 +170,7 @@ func (s *MemorySelector) findRoute(model string, policy domain.RoutingPolicy) (d
 		}
 	}
 	for _, route := range candidates {
-		if !route.IsGroup() && pattern.Match(model, route.ModelPattern) {
+		if !route.IsGroup() && pattern.MatchName(model, route.ModelPattern) {
 			return route, true
 		}
 	}
@@ -222,23 +247,39 @@ func (s *MemorySelector) eligible(route domain.Route, request domain.SelectionRe
 	return eligible
 }
 
-// pickWeighted applies smooth weighted round-robin. Contribution is the channel
-// weight scaled by the site weight and the downstream key's site multiplier.
+// pickWeighted draws one channel from a priority tier, each channel's chance
+// proportional to its effective weight: contribution is the channel weight
+// scaled by the site weight and the downstream key's site multiplier. A tier
+// that is a single channel, or whose weights are all unusable, is answered
+// without a draw.
 func (s *MemorySelector) pickWeighted(pool []domain.Channel, policy domain.RoutingPolicy) domain.Channel {
-	total := 0.0
-	selected := pool[0]
-	selectedScore := 0.0
-	for index, channel := range pool {
-		weight := effectiveWeight(channel, policy)
-		total += weight
-		s.current[channel.ID] += weight
-		if index == 0 || s.current[channel.ID] > selectedScore {
-			selected = channel
-			selectedScore = s.current[channel.ID]
-		}
+	if len(pool) == 0 {
+		// Callers only reach here with an eligible channel, so this is
+		// unreachable rather than a case with a meaning of its own.
+		return domain.Channel{}
 	}
-	s.current[selected.ID] -= total
-	return selected
+	if len(pool) == 1 {
+		return pool[0]
+	}
+	total := 0.0
+	weights := make([]float64, len(pool))
+	for index, channel := range pool {
+		weights[index] = effectiveWeight(channel, policy)
+		total += weights[index]
+	}
+	if !(total > 0) {
+		return pool[0]
+	}
+
+	draw := s.random.Float64() * total
+	for index, weight := range weights {
+		if draw < weight {
+			return pool[index]
+		}
+		draw -= weight
+	}
+	// Floating-point rounding can leave the draw a hair above the last weight.
+	return pool[len(pool)-1]
 }
 
 func effectiveWeight(channel domain.Channel, policy domain.RoutingPolicy) float64 {
@@ -256,7 +297,10 @@ func effectiveWeight(channel domain.Channel, policy domain.RoutingPolicy) float6
 // displayNameMatches reports whether the request named the route by its alias.
 func displayNameMatches(model, displayName string) bool {
 	trimmed := strings.TrimSpace(displayName)
-	return trimmed != "" && strings.EqualFold(trimmed, strings.TrimSpace(model))
+	if trimmed == "" {
+		return false
+	}
+	return strings.EqualFold(trimmed, strings.TrimSpace(model)) || pattern.Equivalent(trimmed, model)
 }
 
 // sourceModelSupports reports whether a channel's source_model admits the
@@ -267,10 +311,10 @@ func sourceModelSupports(sourceModel, requested string) bool {
 	if source == "" || source == requested {
 		return true
 	}
-	if aliasEquivalent(source, requested) {
+	if pattern.Equivalent(source, requested) {
 		return true
 	}
-	return pattern.Match(requested, source)
+	return pattern.MatchName(requested, source)
 }
 
 // channelAdmitsModel reports whether a channel may serve the requested model.
@@ -297,39 +341,27 @@ func hasExplicitSourceModel(route domain.Route, channel domain.Channel) bool {
 	if routePattern == "" || !pattern.IsExact(routePattern) {
 		return false
 	}
-	return source != routePattern
+	return !pattern.Equivalent(source, routePattern)
 }
 
-// normalizeRoutableModelName drops a vendor prefix and a "-free" suffix so
-// "vendor/model" and "model" compare equal.
-func normalizeRoutableModelName(value string) string {
-	name := strings.ToLower(strings.TrimSpace(value))
-	if index := strings.LastIndex(name, "/"); index >= 0 {
-		name = name[index+1:]
-	}
-	return strings.TrimSuffix(name, "-free")
-}
-
-func aliasEquivalent(left, right string) bool {
-	normalizedLeft := normalizeRoutableModelName(left)
-	return normalizedLeft != "" && normalizedLeft == normalizeRoutableModelName(right)
-}
-
-// resolveActualModel picks the model written into the upstream request body. A
-// display-name request uses the channel source model, a channel that names its
-// own model on an exact route uses that name, and everything else uses the
-// mapped model.
-func resolveActualModel(requested string, route domain.Route, channel domain.Channel) string {
+// ActualModel picks the model written into the upstream request body, and with
+// it the name a per-model circuit is filed under. A display-name request uses
+// the channel source model, a channel that names its own model on an exact route
+// uses that name, and everything else uses the mapped model.
+//
+// It is exported so a management view can ask the same question about the model
+// a request would carry, instead of guessing it from the route's pattern.
+func ActualModel(requested string, route domain.Route, channel domain.Channel) string {
 	sourceModel := strings.TrimSpace(channel.SourceModel)
 	if displayNameMatches(requested, route.DisplayName) && sourceModel != "" {
 		return sourceModel
 	}
-	if hasExplicitSourceModel(route, channel) && pattern.Match(requested, route.ModelPattern) {
+	if hasExplicitSourceModel(route, channel) && pattern.MatchName(requested, route.ModelPattern) {
 		return sourceModel
 	}
 	mapped := route.ModelMapping.Resolve(requested)
 	routePattern := strings.TrimSpace(route.ModelPattern)
-	if mapped == requested && pattern.IsExact(routePattern) && pattern.Match(requested, routePattern) {
+	if mapped == requested && pattern.IsExact(routePattern) && pattern.MatchName(requested, routePattern) {
 		if sourceModel != "" {
 			return sourceModel
 		}

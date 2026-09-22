@@ -52,6 +52,9 @@ type ConfigurationStore interface {
 	// UpstreamKey reads the first key of a stored upstream, for the model probe
 	// that has to present a credential the console is never shown.
 	UpstreamKey(ctx context.Context, id int64) (string, error)
+	// DownstreamKey reads the stored value of one client key, for the console
+	// action that shows an operator a credential of their own back.
+	DownstreamKey(ctx context.Context, id int64) (string, error)
 	LoadConfiguration(ctx context.Context) (store.Configuration, error)
 }
 
@@ -226,6 +229,44 @@ func (s *Server) handleConfigurationKeyRotate(w http.ResponseWriter, r *http.Req
 		"row":       maskRow(row, "keys"),
 		"generated": map[string]any{"key": generated},
 	})
+}
+
+// handleConfigurationKeyReveal answers with the stored value of one client key.
+//
+//	POST /management/configuration/keys/{id}/reveal
+//
+// A client key is the credential an operator hands out to callers, and the
+// listing only ever shows its mask. Losing one used to mean rotating it and
+// re-deploying every caller, so the value can be read back on demand. It is a
+// deliberate action rather than an unmasked listing on purpose: a listing is
+// fetched on every refresh, kept in the browser, and pasted into tickets, while
+// this answers one request, for one key, and is recorded in the audit log.
+//
+// Upstream keys are not readable this way. Those belong to the upstream rather
+// than to the operator, and the gateway is the only party that needs them.
+func (s *Server) handleConfigurationKeyReveal(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigurationWrite(w, r) {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	key, err := s.ConfigStore.DownstreamKey(r.Context(), id)
+	if err != nil {
+		s.writeConfigurationFailure(w, r, err)
+		return
+	}
+	if strings.TrimSpace(key) == "" {
+		// A key row without a value cannot authenticate anyone, so there is
+		// nothing to show; saying so beats answering with an empty string.
+		writeError(w, http.StatusNotFound, "configuration_not_found", "this client key has no stored value")
+		return
+	}
+	// The audit event names the row and the client, never the value: the log is
+	// read by more people than the console is.
+	s.logConfigurationChange(r, "console_key_revealed", "keys", id)
+	writeJSON(w, http.StatusOK, map[string]any{"key": key})
 }
 
 // authorizeConfigurationWrite applies the checks every write shares: a console

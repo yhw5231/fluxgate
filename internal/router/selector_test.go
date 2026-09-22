@@ -49,19 +49,53 @@ func TestMemorySelectorPrefersHighestPriorityAndMapsModel(t *testing.T) {
 	}
 }
 
-func TestMemorySelectorUsesSmoothWeightedRoundRobinWithinPriority(t *testing.T) {
+// drawCounts selects the model a number of times and counts what came back, so
+// a weighted choice is checked as a share rather than as a sequence.
+func drawCounts(t *testing.T, selector *MemorySelector, model string, policy domain.RoutingPolicy, draws int) map[string]int {
+	t.Helper()
+	counts := map[string]int{}
+	for index := 0; index < draws; index++ {
+		counts[selectChannel(t, selector, model, policy).Channel.ID]++
+	}
+	return counts
+}
+
+// withinShare reports whether a count is within a tolerance of the share of the
+// draws it should have taken.
+func withinShare(count, draws int, share, tolerance float64) bool {
+	ratio := float64(count) / float64(draws)
+	return ratio >= share-tolerance && ratio <= share+tolerance
+}
+
+// Lines of one priority are drawn at random, each in proportion to its weight:
+// a 3:1 pair takes about three quarters of the requests.
+func TestMemorySelectorDrawsWithinAPriorityTierByWeight(t *testing.T) {
 	selector := NewMemorySelector([]domain.Route{route(1, "*",
 		channel("heavy", 10, 3),
 		channel("light", 10, 1),
 	)})
 
-	counts := map[string]int{}
-	for index := 0; index < 8; index++ {
-		counts[selectChannel(t, selector, "model", domain.RoutingPolicy{}).Channel.ID]++
+	const draws = 4000
+	counts := drawCounts(t, selector, "model", domain.RoutingPolicy{}, draws)
+	if !withinShare(counts["heavy"], draws, 0.75, 0.05) {
+		t.Fatalf("heavy was drawn %d of %d times, want about three quarters", counts["heavy"], draws)
 	}
+	if counts["heavy"]+counts["light"] != draws {
+		t.Fatalf("counts = %#v, want every draw answered", counts)
+	}
+}
 
-	if counts["heavy"] != 6 || counts["light"] != 2 {
-		t.Fatalf("weighted counts = %#v, want heavy:6 light:2", counts)
+// The same model served by two upstreams of one priority stays one route, and
+// both upstreams keep being drawn from.
+func TestMemorySelectorKeepsEveryLineOfATierReachable(t *testing.T) {
+	selector := NewMemorySelector([]domain.Route{route(1, "*",
+		domain.Channel{ID: "a", Enabled: true, Weight: 10, SiteID: 1},
+		domain.Channel{ID: "b", Enabled: true, Weight: 10, SiteID: 2},
+	)})
+
+	counts := drawCounts(t, selector, "model", domain.RoutingPolicy{}, 200)
+	if counts["a"] == 0 || counts["b"] == 0 {
+		t.Fatalf("counts = %#v, want both lines to stay reachable", counts)
 	}
 }
 
@@ -199,9 +233,11 @@ func TestMemorySelectorTreatsSourceModelAsPatternAndAlias(t *testing.T) {
 
 func TestMemorySelectorAppliesDownstreamPolicyRestrictions(t *testing.T) {
 	tokenID := int64(42)
+	// Site 7 carries the higher priority, so which line answers is decided by
+	// the policy under test rather than by the draw between equals.
 	newSelector := func() *MemorySelector {
 		return NewMemorySelector([]domain.Route{route(1, "*",
-			domain.Channel{ID: "site-7", Enabled: true, Weight: 1, SiteID: 7, AccountID: 1, TokenID: &tokenID},
+			domain.Channel{ID: "site-7", Enabled: true, Weight: 1, SiteID: 7, AccountID: 1, TokenID: &tokenID, SitePriority: 10},
 			domain.Channel{ID: "site-8", Enabled: true, Weight: 1, SiteID: 8, AccountID: 2},
 		)})
 	}
@@ -281,23 +317,83 @@ func TestMemorySelectorAppliesDownstreamPolicyRestrictions(t *testing.T) {
 }
 
 func TestMemorySelectorUsesSiteWeightAndMultiplier(t *testing.T) {
-	selector := NewMemorySelector([]domain.Route{route(1, "*",
-		domain.Channel{ID: "base", Enabled: true, Weight: 10, SiteID: 1, SiteGlobalWeight: 1},
-		domain.Channel{ID: "double", Enabled: true, Weight: 10, SiteID: 2, SiteGlobalWeight: 2},
-	)})
-
-	// Site 2 carries twice the weight, so it wins the first draw.
-	if got := selectChannel(t, selector, "model", domain.RoutingPolicy{}).Channel.ID; got != "double" {
-		t.Fatalf("selected channel = %q, want double", got)
+	newSelector := func() *MemorySelector {
+		return NewMemorySelector([]domain.Route{route(1, "*",
+			domain.Channel{ID: "base", Enabled: true, Weight: 10, SiteID: 1, SiteGlobalWeight: 1},
+			domain.Channel{ID: "double", Enabled: true, Weight: 10, SiteID: 2, SiteGlobalWeight: 2},
+		)})
 	}
 
-	rebalanced := NewMemorySelector([]domain.Route{route(1, "*",
-		domain.Channel{ID: "base", Enabled: true, Weight: 10, SiteID: 1, SiteGlobalWeight: 1},
-		domain.Channel{ID: "double", Enabled: true, Weight: 10, SiteID: 2, SiteGlobalWeight: 2},
-	)})
+	// Site 2 carries twice the weight, so it answers about two draws in three.
+	const draws = 4000
+	counts := drawCounts(t, newSelector(), "model", domain.RoutingPolicy{}, draws)
+	if !withinShare(counts["double"], draws, 2.0/3.0, 0.05) {
+		t.Fatalf("double answered %d of %d draws, want about two thirds", counts["double"], draws)
+	}
+
+	// A downstream multiplier scales one site's share of the same draws: site 2
+	// falls to 10 × 2 × 0.1 against site 1's 10.
 	policy := domain.RoutingPolicy{SiteMultipliers: map[int64]float64{2: 0.1}}
-	if got := selectChannel(t, rebalanced, "model", policy).Channel.ID; got != "base" {
-		t.Fatalf("selected channel = %q, want base once the multiplier is lowered", got)
+	counts = drawCounts(t, newSelector(), "model", policy, draws)
+	if !withinShare(counts["base"], draws, 10.0/12.0, 0.05) {
+		t.Fatalf("base answered %d of %d draws, want about five sixths once the multiplier is lowered", counts["base"], draws)
+	}
+}
+
+// Priority is what an operator uses to say "use this upstream first", so every
+// line of a preferred upstream is tried before any line of a lower-priority one,
+// whatever their weights are.
+func TestMemorySelectorPrefersTheHigherUpstreamPriority(t *testing.T) {
+	selector := NewMemorySelector([]domain.Route{route(1, "*",
+		domain.Channel{ID: "preferred", Enabled: true, Weight: 1, SiteID: 1, SitePriority: 5},
+		domain.Channel{ID: "fallback", Enabled: true, Weight: 1000, SiteID: 2},
+	)})
+
+	counts := drawCounts(t, selector, "model", domain.RoutingPolicy{}, 200)
+	if counts["preferred"] != 200 {
+		t.Fatalf("counts = %#v, want every request on the preferred upstream", counts)
+	}
+
+	// The preferred upstream leaves the pool when it is excluded, which is what
+	// makes the lower priority the fallback rather than a second half of a split.
+	selection, err := selector.Select(domain.SelectionRequest{
+		Model: "model",
+		Excluded: map[string]struct{}{
+			"preferred": {},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+	if selection.Channel.ID != "fallback" {
+		t.Fatalf("selected channel = %q, want the fallback once the preferred one is out", selection.Channel.ID)
+	}
+}
+
+// A key mode orders one upstream's keys so the first one is tried first. That
+// ordering stays inside its upstream: it must not lift a key of a lower-priority
+// upstream past a preferred one.
+func TestMemorySelectorKeepsLinePriorityInsideItsUpstream(t *testing.T) {
+	selector := NewMemorySelector([]domain.Route{route(1, "*",
+		domain.Channel{ID: "preferred-key", Enabled: true, Weight: 1, SiteID: 1, SitePriority: 1},
+		domain.Channel{ID: "other-first-key", Enabled: true, Weight: 1, SiteID: 2, Priority: 9},
+		domain.Channel{ID: "other-second-key", Enabled: true, Weight: 1, SiteID: 2, Priority: 8},
+	)})
+
+	counts := drawCounts(t, selector, "model", domain.RoutingPolicy{}, 100)
+	if counts["preferred-key"] != 100 {
+		t.Fatalf("counts = %#v, want the preferred upstream's key throughout", counts)
+	}
+
+	// Inside one upstream the line priority still decides, so the higher of the
+	// two keys is the one taken while both are usable.
+	sameSite := NewMemorySelector([]domain.Route{route(1, "*",
+		domain.Channel{ID: "first-key", Enabled: true, Weight: 1, SiteID: 2, Priority: 9},
+		domain.Channel{ID: "second-key", Enabled: true, Weight: 1, SiteID: 2, Priority: 8},
+	)})
+	counts = drawCounts(t, sameSite, "model", domain.RoutingPolicy{}, 100)
+	if counts["first-key"] != 100 {
+		t.Fatalf("counts = %#v, want the higher-priority key of one upstream", counts)
 	}
 }
 
@@ -347,7 +443,7 @@ func TestMemorySelectorSendsEachUpstreamItsOwnModelName(t *testing.T) {
 	)})
 
 	seen := map[string]string{}
-	for index := 0; index < 8; index++ {
+	for index := 0; index < 40; index++ {
 		selection := selectChannel(t, selector, "claude-sonnet", domain.RoutingPolicy{})
 		seen[selection.Channel.ID] = selection.Model
 	}
@@ -409,5 +505,84 @@ func TestMemorySelectorHonoursThePin(t *testing.T) {
 	}
 	if _, err := selector.Select(domain.SelectionRequest{Model: "gpt-4.1", OnlySiteID: 99}); err == nil {
 		t.Error("Select() answered a pin that matches no upstream")
+	}
+}
+
+// A route exposes one model identity, so a client reaches it under any spelling
+// the upstreams use: the case it likes, a channel path, or a variant suffix.
+func TestMemorySelectorReachesARouteUnderEverySpellingOfTheModel(t *testing.T) {
+	selector := NewMemorySelector([]domain.Route{route(1, "deepseek-v4.1-flash", domain.Channel{
+		ID: "channel", Enabled: true, Weight: 1, SourceModel: "cline-free/deepseek-v4.1-flash:free",
+	})})
+
+	for _, requested := range []string{
+		"deepseek-v4.1-flash",
+		"DeepSeek-V4.1-Flash",
+		"cline-free/deepseek-v4.1-flash",
+		"cline-free/deepseek-v4.1-flash:free",
+	} {
+		selection := selectChannel(t, selector, requested, domain.RoutingPolicy{})
+		if selection.Channel.ID != "channel" {
+			t.Errorf("Select(%q) chose %q, want the route that exposes the model", requested, selection.Channel.ID)
+			continue
+		}
+		// Whatever the client called it, the upstream receives the spelling it
+		// listed.
+		if selection.Model != "cline-free/deepseek-v4.1-flash:free" {
+			t.Errorf("Select(%q) forwarded %q, want the upstream's own spelling", requested, selection.Model)
+		}
+	}
+
+	if selector.HasCandidate("deepseek-v4.1-pro", domain.RoutingPolicy{}) {
+		t.Error("a decorated spelling of another model reached the route")
+	}
+}
+
+// A glob route written for the plain model name covers the decorated spellings
+// of it too, which is how one route can serve a whole family of listings.
+func TestMemorySelectorMatchesAGlobRouteAgainstTheCanonicalName(t *testing.T) {
+	selector := NewMemorySelector([]domain.Route{route(1, "deepseek-*", channel("channel", 0, 1))})
+
+	if got := selectChannel(t, selector, "cline-free/deepseek-v4.1-flash:free", domain.RoutingPolicy{}).Channel.ID; got != "channel" {
+		t.Fatalf("selected channel = %q, want the glob route", got)
+	}
+}
+
+// An explicit group is named by its display name, and the same spelling rules
+// apply to it.
+func TestMemorySelectorMatchesAGroupDisplayNameByModelIdentity(t *testing.T) {
+	group := domain.Route{
+		ID:             10,
+		DisplayName:    "claude-sonnet",
+		Mode:           domain.RouteModeExplicitGroup,
+		Enabled:        true,
+		SourceRouteIDs: []int64{11},
+	}
+	source := route(11, "claude-sonnet", domain.Channel{
+		ID: "group-source", Enabled: true, Weight: 1, SourceModel: "anthropic/claude-sonnet:beta",
+	})
+	selector := NewMemorySelector([]domain.Route{group, source})
+
+	selection := selectChannel(t, selector, "anthropic/claude-sonnet:beta", domain.RoutingPolicy{})
+	if selection.Channel.ID != "group-source" {
+		t.Fatalf("selected channel = %q, want the group's source", selection.Channel.ID)
+	}
+}
+
+// A deny pattern written for the plain model name also covers the decorated
+// spellings, so a restricted model cannot be reached by asking for a channel's
+// own name for it.
+func TestMemorySelectorDeniesEverySpellingOfADeniedModel(t *testing.T) {
+	selector := NewMemorySelector([]domain.Route{route(1, "*", channel("channel", 0, 1))})
+	policy := domain.RoutingPolicy{DeniedModelPatterns: []string{"deepseek-v4.1-flash"}}
+
+	for _, requested := range []string{
+		"deepseek-v4.1-flash",
+		"DeepSeek-V4.1-Flash",
+		"cline-free/deepseek-v4.1-flash:free",
+	} {
+		if _, err := selector.Select(domain.SelectionRequest{Model: requested, Policy: policy}); err != ErrModelNotRoutable {
+			t.Errorf("Select(%q) error = %v, want ErrModelNotRoutable", requested, err)
+		}
 	}
 }

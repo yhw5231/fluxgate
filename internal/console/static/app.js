@@ -26,8 +26,14 @@
 
   /* 管理视图 = 概览之外的视图，它们读取的是可写的配置清单。设置页也读取配置，
    * 因为运行策略和配置一起返回。 */
-  var VIEWS = ['overview', 'upstream', 'routes', 'keys', 'settings'];
+  var VIEWS = ['overview', 'upstream', 'routes', 'requests', 'keys', 'settings'];
+  /* 请求记录页读的是网关自己的日志，不依赖配置清单，所以它不在 MANAGEMENT_VIEWS
+   * 里：配置读不出来的时候，记录仍然看得到。 */
   var MANAGEMENT_VIEWS = { upstream: true, routes: true, keys: true, settings: true };
+  /* 会自己刷新的视图：概览读取运行时快照，路由页读取每条线路的实时状态，请求
+   * 记录页读的是一份还在增长的日志。其余视图是可编辑的配置表，只能在操作者
+   * 自己触发时重画。 */
+  var LIVE_VIEWS = { overview: true, routes: true, requests: true };
 
   /* The settings view groups its panels by function and shows one group at a
    * time, so no single page carries the account, the runtime policy and the
@@ -47,7 +53,18 @@
     loading: false,
     editor: null,
     confirm: null,
-    policySignature: null
+    policySignature: null,
+    // requests holds the record of served requests: what the gateway answered,
+    // and the filters the operator narrowed the view with.
+    requests: { records: [], retention: null, error: null, failedOnly: false, model: '' },
+    // revealedKeys holds the client keys an operator asked to see, by row id.
+    // The listing only ever carries the mask, so a value lives here only after a
+    // deliberate read, and it is dropped again on the next configuration read.
+    revealedKeys: {},
+    // expanded remembers which rows were opened, by view and row id, so an
+    // automatic repaint does not fold the detail an operator is reading.
+    expanded: { routes: {}, upstreams: {}, requests: {} },
+    cdTimer: null
   };
 
   var els = {};
@@ -101,6 +118,16 @@
     els.routingEmpty = document.querySelector('[data-empty="routing"]');
     els.routingMeta = document.querySelector('[data-panel="routing"] [data-meta]');
     els.routingTable = document.querySelector('[data-table="routing"]');
+    els.upstreamsBody = document.querySelector('[data-management="upstreams"] [data-body]');
+
+    els.requestsBody = document.querySelector('[data-requests-body]');
+    els.requestsEmpty = document.querySelector('[data-empty="requests"]');
+    els.requestsMeta = document.querySelector('[data-panel="requests"] [data-meta]');
+    els.requestsTable = document.querySelector('[data-table="requests"]');
+    els.requestsFailed = $('requests-failed');
+    els.requestsModel = $('requests-model');
+    els.requestsRetention = document.querySelector('[data-panel="requests"] [data-retention]');
+    els.requestsClear = $('requests-clear');
 
     els.banner = $('error-banner');
     els.bannerTitle = els.banner.querySelector('[data-banner-title]');
@@ -139,7 +166,6 @@
       state.emptyText[node.getAttribute('data-empty')] = paragraph.textContent;
     });
 
-    els.nextRefresh = document.querySelector('[data-next-refresh]');
     els.footerGenerated = document.querySelector('[data-footer-generated]');
     els.footerLoaded = document.querySelector('[data-footer-loaded]');
 
@@ -301,8 +327,8 @@
 
   var CHOICE_LABELS = {
     route_mode: { pattern: '按模型匹配', explicit_group: '显式分组' },
-    routing_strategy: { weighted: '加权轮询', round_robin: '轮询', stable_first: '固定优先' },
-    key_mode: { available_first: '可用优先', round_robin: '轮询' },
+    routing_strategy: { weighted: '加权随机', round_robin: '加权随机', stable_first: '固定优先' },
+    key_mode: { available_first: '可用优先', round_robin: '加权随机' },
     protocol: { http: 'HTTP', https: 'HTTPS', socks5: 'SOCKS5', socks5h: 'SOCKS5H' }
   };
 
@@ -320,19 +346,19 @@
 
   var KEY_MODE_OPTIONS = [
     { value: 'available_first', label: '可用优先' },
-    { value: 'round_robin', label: '轮询' }
+    { value: 'round_robin', label: '加权随机' }
   ];
 
   function keyModeLabel(value) {
-    return value === 'available_first' ? '可用优先' : '轮询';
+    return value === 'available_first' ? '可用优先' : '加权随机';
   }
 
   /* 一条线路（一个上游密钥）的密钥模式，来自它所在路由的策略：可用优先的
-   * 上游让第一个密钥保持最高优先级，轮询的上游让所有密钥同权。 */
+   * 上游让第一个密钥保持最高优先级，其余上游的密钥同权随机。 */
   function channelKeyModeLabel(strategy) {
     if (strategy === 'stable_first') { return '可用优先'; }
-    if (strategy === 'round_robin') { return '轮询'; }
-    return '加权';
+    if (strategy === 'round_robin') { return '加权随机'; }
+    return '加权随机';
   }
 
   /* FIELDS[resource][column]
@@ -346,12 +372,13 @@
         label: 'API 地址', placeholder: 'https://api.example.com', normalize: normalizeAPIAddress,
         help: '上游服务的根地址。只填到域名时会自动补上 /v1，结尾多余的 / 会去掉；上游挂在子路径下时请把子路径写上（例如 https://example.com/openai）。'
       },
-      global_weight: { label: '权重', type: 'number', step: 'any', placeholder: '1', help: '权重越大分到的请求越多；同一个模型的多个上游之间按权重分配。' },
+      global_weight: { label: '权重', type: 'number', step: 'any', placeholder: '1', help: '优先级相同时按权重随机分配：权重越大，被选中的概率越高。' },
+      priority: { label: '优先级', type: 'number', step: '1', placeholder: '0', help: '数值越大越先用：只要优先级更高的上游还有可用线路，请求就不会落到优先级更低的上游；优先级相同（默认 0）的按权重随机分配。' },
       custom_headers: { label: '请求头', type: 'json', placeholder: '{"X-Custom": "value"}', help: 'JSON 对象，会附加到发往这个上游的每个请求上。' },
       proxy_url: { label: '代理', placeholder: 'http://127.0.0.1:7890', help: '留空表示直连；填 system 表示使用系统代理。获取模型和转发请求都走这个出口。' },
       status: { label: '状态', type: 'select', options: STATUS_OPTIONS, help: '停用后该上游的线路不再参与选路。' },
       keys: { label: '密钥', help: '一行一个，可以整段粘贴。留空表示保持已保存的密钥不变。' },
-      key_mode: { label: '密钥模式', type: 'select', options: KEY_MODE_OPTIONS, help: '可用优先：先用第一个密钥，失败或熔断后再用下一个。轮询：按权重在所有密钥之间分配。' },
+      key_mode: { label: '密钥模式', type: 'select', options: KEY_MODE_OPTIONS, help: '可用优先：先用第一个密钥，失败或熔断后再用下一个。加权随机：按权重在所有密钥之间随机分配。' },
       models: { label: '模型', help: '勾选这个上游提供的模型，保存后网关自动建立路由。' },
       model_mapping: { label: '模型映射', help: '把客户端请求的模型名换成上游认识的模型名。' }
     },
@@ -408,12 +435,21 @@
       columns: [
         { label: '名称', cell: function (row) { return element('span', 'cell-strong', text(row.name)); } },
         { label: 'API 地址', cell: function (row) { return element('span', 'mono', text(row.url)); } },
-        { label: '权重', className: 'num', cell: function (row) { return text(row.global_weight, '1'); } },
+        // 优先级和权重都就地改：它们是选路时最常调的两个值，改一次就写一次，
+        // 不用打开编辑框。
+        { label: '优先级', className: 'num', cell: function (row) { return priorityField(row); } },
+        { label: '权重', className: 'num', cell: function (row) { return weightField(row); } },
         { label: '密钥', cell: function (row) { return upstreamKeysCell(row); } },
         { label: '模型', cell: function (row) { return upstreamModelsCell(row); } },
+        { label: '线路状态', cell: function (row) { return lineSummary(upstreamLines(row.id)); } },
         { label: '状态', cell: function (row) { return statusBadge(row.status); } }
       ],
       actions: ['edit', 'delete'],
+      // 一个上游的每个密钥都是一条线路，各有自己的优先级和当前状态。展开的内容
+      // 只在真的展开时才构建，折叠着的一行不必付这个代价。
+      detail: function (row) {
+        return { node: function () { return upstreamDetail(row); } };
+      },
       describe: function (row) { return text(row.name, '#' + row.id); }
     },
     keys: {
@@ -423,13 +459,13 @@
       columns: [
         { label: 'ID', className: 'num', cell: function (row) { return '#' + row.id; } },
         { label: '名称', cell: function (row) { return element('span', 'cell-strong', text(row.name)); } },
-        { label: '密钥', cell: function (row) { return secretCell(row.key); } },
+        { label: '密钥', cell: function (row) { return clientKeyCell(row); } },
         { label: '状态', cell: function (row) { return enabledBadge(row.enabled); } },
         { label: '过期', cell: function (row) { return expiryCell(row.expires_at); } },
         { label: '用量', cell: function (row) { return usageCell(row); } },
         { label: '排除模型', className: 'num', cell: function (row) { return jsonSize(row.supported_models, 'array'); } }
       ],
-      actions: ['edit', 'rotate', 'delete'],
+      actions: ['edit', 'reveal', 'rotate', 'delete'],
       // The gateway generates the value when the create request omits it, so an
       // empty input is a valid create rather than a missing required field.
       optionalSecrets: ['key'],
@@ -477,6 +513,136 @@
     var count = tag(String(models.length));
     count.title = models.join('\n');
     return count;
+  }
+
+  /* ===== 上游优先级与权重 =====
+   *
+   * 选路先看优先级、再看权重：优先级决定「先用谁」，权重决定同一优先级之间各自
+   * 分到多少请求。两者都是上游最常调的值，所以都就地可改——改完按回车或点
+   * 「保存」，一次写一个字段。 */
+
+  function priorityField(row) {
+    return inlineNumberField(row, {
+      field: 'priority',
+      label: '优先级',
+      integer: true,
+      title: '上游优先级：数值越大越先用；数值相同的按权重随机分配。'
+    });
+  }
+
+  function weightField(row) {
+    return inlineNumberField(row, {
+      field: 'global_weight',
+      label: '权重',
+      integer: false,
+      positive: true,
+      title: '上游权重：同一优先级的上游之间按这个倍数随机分配请求。'
+    });
+  }
+
+  function inlineNumberField(row, options) {
+    var stored = number(row[options.field]);
+    if (options.positive && !(stored > 0)) { stored = 1; }
+    var wrapper = element('span', 'weight-field');
+    var input = document.createElement('input');
+    input.type = 'number';
+    input.step = options.integer ? '1' : 'any';
+    input.className = 'field-input weight-input';
+    input.value = formatWeight(stored);
+    input.setAttribute('aria-label', options.label);
+    input.title = options.title;
+
+    var save = element('button', 'btn btn-ghost btn-small weight-save', '保存');
+    save.type = 'button';
+    save.title = '保存' + options.label;
+    save.disabled = true;
+    wrapper.appendChild(input);
+    wrapper.appendChild(save);
+
+    function current() {
+      var value = Number(input.value);
+      if (!isFinite(value)) { return NaN; }
+      if (options.integer && Math.floor(value) !== value) { return NaN; }
+      if (options.positive && !(value > 0)) { return NaN; }
+      return value;
+    }
+    function refresh() {
+      var value = current();
+      var valid = isFinite(value);
+      var changed = valid && value !== stored;
+      wrapper.classList.toggle('is-invalid', !valid);
+      wrapper.classList.toggle('is-dirty', changed);
+      save.disabled = !changed;
+    }
+    input.addEventListener('input', refresh);
+    input.addEventListener('keydown', function (event) {
+      if (event.key === 'Enter') { event.preventDefault(); save.click(); return; }
+      if (event.key === 'Escape') { input.value = formatWeight(stored); refresh(); }
+    });
+    save.addEventListener('click', function () {
+      var value = current();
+      if (!isFinite(value) || value === stored) { return; }
+      saveUpstreamNumber(row, options, value, input, save, stored);
+    });
+    return wrapper;
+  }
+
+  /* formatWeight keeps a weight readable: whole numbers stay whole, and a
+   * fractional one keeps the digits that were stored. */
+  function formatWeight(value) {
+    return String(Number(value));
+  }
+
+  function saveUpstreamNumber(row, options, value, input, button, stored) {
+    var name = text(row.name, '#' + row.id);
+    var values = {};
+    values[options.field] = value;
+    setSubmitting(button, true, '保存');
+    put('/management/configuration/upstreams/' + row.id, values).then(function (result) {
+      if (result.ok) {
+        if (result.body && result.body.configuration) { applyConfiguration(result.body.configuration); }
+        renderManagement();
+        renderRouting();
+        showNotice('已把「' + name + '」的' + options.label + '改为 ' + formatWeight(value) + '，下一个请求就按它选路。');
+        return;
+      }
+      setSubmitting(button, false, '保存');
+      button.disabled = false;
+      if (result.status === 401) { showAuth('登录状态已过期，请重新登录后继续。'); return; }
+      if (result.status === 400) {
+        input.value = formatWeight(stored);
+        showBanner(options.label + '未保存', errorMessage(result.body, options.label + '的取值不合法。'));
+        return;
+      }
+      showBanner(options.label + '未保存', errorMessage(result.body, '网关拒绝了这次修改。'));
+    }).catch(function (err) {
+      setSubmitting(button, false, '保存');
+      button.disabled = false;
+      showBanner('无法连接网关', String(err && err.message ? err.message : err));
+    });
+  }
+
+  /* upstreamLines returns the lines of one upstream, the same way the routing
+   * table lists them. */
+  function upstreamLines(siteID) {
+    return channelLines().filter(function (line) { return line.siteID === String(siteID); });
+  }
+
+  /* upstreamDetail is what an expanded upstream shows: every line it holds, with
+   * the key, the model name, the priority, the weight and the state of each. */
+  function upstreamDetail(row) {
+    var wrapper = element('div', 'detail-body');
+    var lines = upstreamLines(row.id);
+    if (lines.length === 0) {
+      wrapper.appendChild(element('p', 'detail-note',
+        '这个上游还没有线路。点「编辑」勾选它提供的模型，网关会为每个密钥建立一条线路。'));
+      return wrapper;
+    }
+    wrapper.appendChild(element('p', 'detail-note',
+      '共 ' + lines.length + ' 条线路，按优先级从高到低：网关先用优先级最高的上游的线路，' +
+      '同一优先级之间按权重随机分配请求。'));
+    wrapper.appendChild(lineDetailTable(lines, LINE_LEADING_MODEL));
+    return wrapper;
   }
 
   /* ===== Configuration lookups ===== */
@@ -574,12 +740,115 @@
   function statusBadge(status) {
     var value = text(status, 'active');
     if (value === 'active') { return badge('已启用', 'success'); }
+    if (value === 'disabled') { return badge('已停用', 'muted'); }
     return badge(value, 'muted');
   }
 
   function secretCell(value) {
     if (!value) { return element('span', 'cell-muted', '未设置'); }
     return element('span', 'mono secret', value);
+  }
+
+  /* 客户端密钥默认只显示掩码。「显示」按需向网关读一次完整值，「复制」读一次
+   * 并放进剪贴板——两者都是一次明确的动作，明文不会跟着配置清单一起下发，也
+   * 就不会留在浏览器缓存或截图里。 */
+  function clientKeyCell(row) {
+    var revealed = state.revealedKeys[String(row.id)];
+    if (!revealed) { return secretCell(row.key); }
+    return element('span', 'mono secret key-revealed', revealed);
+  }
+
+  /* revealClientKey reads one client key from the gateway. It answers null when
+   * the read was refused, having already reported why. */
+  function revealClientKey(row) {
+    return post('/management/configuration/keys/' + row.id + '/reveal', {}).then(function (result) {
+      if (result.ok && result.body && result.body.key) { return String(result.body.key); }
+      if (result.status === 401) {
+        showAuth('登录状态已过期，请重新登录后继续。');
+        return null;
+      }
+      showBanner('读取密钥失败', errorMessage(result.body, '网关拒绝了这次读取。'));
+      return null;
+    }).catch(function (err) {
+      showBanner('无法连接网关', String(err && err.message ? err.message : err));
+      return null;
+    });
+  }
+
+  function toggleKeyReveal(row, button) {
+    var id = String(row.id);
+    if (state.revealedKeys[id]) {
+      delete state.revealedKeys[id];
+      renderManagement();
+      return;
+    }
+    setSubmitting(button, true, '显示');
+    revealClientKey(row).then(function (value) {
+      setSubmitting(button, false, '显示');
+      if (value === null) { return; }
+      state.revealedKeys[id] = value;
+      renderManagement();
+      showNotice('已显示「' + text(row.name, '#' + row.id) + '」的完整密钥；刷新后重新隐藏。');
+    });
+  }
+
+  function copyClientKey(row, button) {
+    var id = String(row.id);
+    var name = text(row.name, '#' + row.id);
+    var revealed = state.revealedKeys[id];
+    if (revealed) {
+      writeClipboard(revealed, function (copied) { reportKeyCopy(copied, name); });
+      return;
+    }
+    setSubmitting(button, true, '复制');
+    revealClientKey(row).then(function (value) {
+      setSubmitting(button, false, '复制');
+      if (value === null) { return; }
+      state.revealedKeys[id] = value;
+      writeClipboard(value, function (copied) { reportKeyCopy(copied, name); });
+    });
+  }
+
+  function reportKeyCopy(copied, name) {
+    if (copied) {
+      showNotice('已复制密钥「' + name + '」。');
+      return;
+    }
+    // 明文已经读回来了，只是浏览器不给写剪贴板：让它显示出来，由操作者自己复制。
+    renderManagement();
+    showBanner('无法自动复制', '浏览器不允许自动写入剪贴板，请从「密钥」列手动复制已显示的内容。');
+  }
+
+  /* writeClipboard copies a value that is not sitting in a form field. A gateway
+   * reached over plain HTTP has no navigator.clipboard — it is only defined in a
+   * secure context — so the fallback selects a temporary field and uses the
+   * legacy copy command. */
+  function writeClipboard(value, done) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(value).then(
+        function () { done(true); },
+        function () { done(copyThroughField(value)); }
+      );
+      return;
+    }
+    done(copyThroughField(value));
+  }
+
+  function copyThroughField(value) {
+    var field = document.createElement('textarea');
+    field.value = value;
+    field.setAttribute('readonly', '');
+    field.className = 'clipboard-proxy';
+    document.body.appendChild(field);
+    var copied = false;
+    try {
+      field.select();
+      copied = document.execCommand('copy');
+    } catch (error) {
+      copied = false;
+    }
+    document.body.removeChild(field);
+    return copied;
   }
 
   function proxyCell(proxyURL, useSystemProxy) {
@@ -681,6 +950,7 @@
 
   function showAuth(message) {
     stopAutoRefresh();
+    stopCooldownTicker();
     els.app.hidden = true;
     els.passwordRequired.hidden = true;
     els.authOverlay.hidden = false;
@@ -695,6 +965,7 @@
   function showConsole() {
     els.authOverlay.hidden = true;
     els.app.hidden = false;
+    startCooldownTicker();
     showView('overview');
   }
 
@@ -734,9 +1005,11 @@
       showSettingsView(state.settingsView);
       els.currentPassword.focus();
     }
-    // Only the overview is a live view: a management form must not be repainted
-    // from under the operator while it is being filled in.
-    if (name === 'overview') {
+    // Only the live views refresh on their own: a management form must not be
+    // repainted from under the operator while it is being filled in. The routing
+    // table is read-only, and it reports line states that change without an
+    // operator doing anything, so it counts as live.
+    if (LIVE_VIEWS[name]) {
       startAutoRefresh();
     } else {
       stopAutoRefresh();
@@ -768,6 +1041,7 @@
     stopAutoRefresh();
     state.snapshot = null;
     state.configuration = null;
+    state.revealedKeys = {};
     els.authUsername.value = '';
     els.authPassword.value = '';
     post('/management/logout').catch(function () { /* the cookie is cleared server-side */ })
@@ -959,13 +1233,25 @@
     els.refresh.classList.add('spinning');
 
     var wantsConfiguration = MANAGEMENT_VIEWS[state.view] || !state.configuration;
+    var wantsRequests = state.view === 'requests';
     var calls = [request('/management/status'), request('/management/snapshot')];
-    if (wantsConfiguration) { calls.push(request('/management/configuration')); }
+    // The index of each optional call is tracked rather than assumed, so a view
+    // that needs one of them cannot read another's answer.
+    var configurationIndex = -1;
+    if (wantsConfiguration) {
+      configurationIndex = calls.length;
+      calls.push(request('/management/configuration'));
+    }
+    var requestsIndex = -1;
+    if (wantsRequests) {
+      requestsIndex = calls.length;
+      calls.push(request(requestsQuery()));
+    }
 
     Promise.all(calls).then(function (results) {
       var status = results[0];
       var snapshot = results[1];
-      var configuration = results[2] || null;
+      var configuration = configurationIndex === -1 ? null : results[configurationIndex];
 
       if (status.status === 401 || snapshot.status === 401) {
         showAuth('登录状态已过期，请重新登录后继续。');
@@ -1000,11 +1286,16 @@
         }
       }
 
+      if (requestsIndex !== -1) {
+        applyRequestLog(results[requestsIndex]);
+      }
+
       hideBanner();
       state.snapshot = snapshot.body || {};
       render(status.body || {}, state.snapshot);
       renderManagement();
       renderRouting();
+      renderRequests();
       renderPolicy();
     }).catch(function (err) {
       showBanner('无法连接网关', String(err && err.message ? err.message : err));
@@ -1020,6 +1311,10 @@
   function applyConfiguration(configuration) {
     state.configuration = configuration || null;
     state.configurationError = null;
+    // A revealed client key is dropped with every configuration read, so the
+    // plaintext lives in the page only between the operator asking for it and the
+    // next refresh.
+    state.revealedKeys = {};
   }
 
   function renderUnavailable(message) {
@@ -1037,6 +1332,13 @@
     els.breakersMeta.textContent = '';
     els.channelsMeta.textContent = '';
     els.modelsMeta.textContent = '';
+    if (els.requestsMeta) {
+      els.requestsMeta.textContent = '';
+      els.requestsBody.textContent = '';
+      els.requestsTable.hidden = true;
+      els.requestsEmpty.hidden = false;
+      setEmptyText(els.requestsEmpty, 'requests', message);
+    }
     showBanner('管理接口不可用', message);
   }
 
@@ -1152,12 +1454,9 @@
       var open = isBreakerOpen(entry);
 
       cell(row, badge(enumLabel('scope', entry.scope, 'channel'), open ? 'warning' : 'muted'));
-
-      var channelID = entry.channel_id || '';
-      var channelName = state.channelNames[channelID] || channelID || '—';
-      cell(row, element('span', 'cell-strong', channelName));
-
-      cell(row, entry.key_id ? tag(entry.key_id) : '—');
+      // 熔断记录按上游密钥归档，密钥只有网关持有，所以这里显示的是受影响的
+      // 线路：按线路归档的记录用自己的名字，按密钥归档的记录用它覆盖的每一条。
+      cell(row, breakerLineCell(entry));
       cell(row, entry.model ? tag(entry.model) : '—');
       cell(row, String(entry.consecutive_failures || 0), 'num');
       cell(row, String(entry.cooldown_level || 0), 'num');
@@ -1187,6 +1486,21 @@
 
       els.breakersBody.appendChild(row);
     });
+  }
+
+  /* breakerLineCell names the lines a recorded circuit holds out of rotation. A
+   * circuit filed under a credential covers every line presenting it, and the
+   * gateway reports those lines rather than the credential it is filed under. */
+  function breakerLineCell(entry) {
+    var names = [];
+    if (Array.isArray(entry.lines)) { names = uniqueValues(entry.lines); }
+    if (names.length === 0 && entry.channel_id) {
+      names = [state.channelNames[entry.channel_id] || String(entry.channel_id)];
+    }
+    if (names.length === 0) { return element('span', 'cell-muted', '—'); }
+    var node = element('span', 'cell-strong', names.join('、'));
+    node.title = names.join('、');
+    return node;
   }
 
   /* resetBreaker clears one recorded circuit, by the identifiers the breaker
@@ -1231,15 +1545,22 @@
     });
   }
 
-  /* renderRouting shows the routing table the gateway derived from the upstreams:
-   * one row per model, with the upstreams that serve it and the name each of them
-   * knows it by. It is read-only because it is not configured — it is what the
-   * model selection on the upstream page produces. */
+  /* ===== 路由 =====
+   *
+   * 一行是一个模型，先只给结论：几个上游、几条线路、现在能不能用。点开它才是
+   * 线路本身——一个上游密钥一条线路，各有自己的优先级、权重和状态。
+   *
+   * 线路的状态由网关算好（见下面的 lineStatus）：熔断记录是按上游密钥记的，密钥
+   * 只有网关持有，所以「可用 / 冷却中 / 已熔断」这些判断不在页面上做。
+   */
+
+  /* renderRouting lays out one row per model. A model with no line at all is
+   * still listed, because a route an operator disabled is worth seeing. */
   function renderRouting() {
     if (!els.routingBody) { return; }
     els.routingBody.textContent = '';
-    var rows = routingRows();
-    els.routingMeta.textContent = rows.length + ' 个模型';
+    var routes = routingRows();
+    els.routingMeta.textContent = routes.length + ' 个模型';
 
     var empty = els.routingEmpty;
     if (state.configuration === null) {
@@ -1248,7 +1569,7 @@
       setEmptyText(empty, 'routing', state.configurationError || '尚未读取配置。');
       return;
     }
-    if (rows.length === 0) {
+    if (routes.length === 0) {
       els.routingTable.hidden = false;
       empty.hidden = false;
       setEmptyText(empty, 'routing', '还没有可路由的模型。到「上游」页添加一个上游并选中模型。');
@@ -1263,61 +1584,76 @@
       head = document.createElement('thead');
       els.routingTable.insertBefore(head, els.routingTable.firstChild);
     }
+    var columns = ['模型', '上游', '匹配方式', '线路', '状态', ''];
     var headerRow = document.createElement('tr');
-    ['模型', '上游', '上游模型名', '匹配方式', '线路数', '状态'].forEach(function (label) {
+    columns.forEach(function (label) {
       var th = document.createElement('th');
       th.textContent = label;
+      if (label === '线路') { th.className = 'num'; }
+      if (label === '') { th.className = 'actions'; }
       headerRow.appendChild(th);
     });
     head.appendChild(headerRow);
 
-    rows.forEach(function (entry) {
+    routes.forEach(function (entry) {
+      var key = String(entry.id);
+      var expanded = isExpanded('routes', key);
+
       var row = document.createElement('tr');
-      cell(row, element('span', 'cell-strong mono', entry.model));
+      row.className = 'row-expandable';
+      row.setAttribute('data-toggle-group', 'routes');
+      row.setAttribute('data-toggle-key', key);
+      if (expanded) { row.classList.add('is-expanded'); }
+
+      var nameCell = document.createElement('td');
+      nameCell.className = 'toggle-cell';
+      nameCell.appendChild(expandCaret(expanded, '模型 ' + entry.model));
+      nameCell.appendChild(element('span', 'cell-strong mono', entry.model));
+      row.appendChild(nameCell);
+
       cell(row, entry.upstreams.length ? entry.upstreams.join('、') : '—');
-      cell(row, entry.targets.length ? entry.targets.join('、') : '与左侧一致');
       cell(row, tag(entry.mode));
-      cell(row, String(entry.lines), 'num');
-      cell(row, enabledBadge(entry.enabled));
+      cell(row, String(entry.lines.length), 'num');
+      cell(row, lineSummary(entry.lines));
+
+      row.appendChild(expandActionCell('routes', key, expanded));
       els.routingBody.appendChild(row);
+
+      if (expanded) {
+        els.routingBody.appendChild(detailRow(columns.length, lineDetailTable(entry.lines)));
+      }
     });
   }
 
+  /* routingRows joins each route with the lines that serve it: the upstream each
+   * line belongs to, the key it presents, and the model name that upstream knows
+   * the model by. */
   function routingRows() {
-    var routes = resourceRows('routes');
-    var channels = resourceRows('channels');
-    var rows = [];
-    routes.forEach(function (route) {
-      var model = String(route.display_name || '').trim() || String(route.model_pattern || '').trim();
-      if (!model) { return; }
-      var upstreams = [];
-      var targets = [];
-      var lines = 0;
-      channels.forEach(function (channel) {
-        if (String(channel.route_id) !== String(route.id)) { return; }
-        lines += 1;
-        var owner = upstreamNameOfChannel(channel);
-        if (owner && upstreams.indexOf(owner) === -1) { upstreams.push(owner); }
-        var target = String(channel.source_model || '').trim();
-        if (target && target !== model && targets.indexOf(target) === -1) { targets.push(target); }
-      });
-      rows.push({
-        model: model,
-        upstreams: upstreams,
-        targets: targets,
-        lines: lines,
-        enabled: route.enabled !== false,
-        mode: routingMode(route)
-      });
+    var byRoute = {};
+    channelLines().forEach(function (line) {
+      if (!byRoute[line.routeID]) { byRoute[line.routeID] = []; }
+      byRoute[line.routeID].push(line);
     });
-    rows.sort(function (left, right) { return left.model < right.model ? -1 : (left.model > right.model ? 1 : 0); });
-    return rows;
+
+    return resourceRows('routes').map(function (route) {
+      var lines = byRoute[String(route.id)] || [];
+      return {
+        id: route.id,
+        model: routeModel(route),
+        mode: routingMode(route),
+        upstreams: uniqueValues(lines.map(function (line) { return line.upstream; })),
+        lines: lines
+      };
+    }).filter(function (entry) {
+      return entry.model !== '';
+    }).sort(function (left, right) {
+      return left.model < right.model ? -1 : (left.model > right.model ? 1 : 0);
+    });
   }
 
-  function upstreamNameOfChannel(channel) {
-    var account = rowByID('accounts', channel.account_id);
-    if (!account) { return ''; }
-    return siteName(account.site_id);
+  function routeModel(route) {
+    if (!route) { return ''; }
+    return String(route.display_name || '').trim() || String(route.model_pattern || '').trim();
   }
 
   function routingMode(route) {
@@ -1327,6 +1663,677 @@
     if (pattern.indexOf('re:') === 0) { return '正则'; }
     if (pattern.indexOf('*') !== -1 || pattern.indexOf('?') !== -1) { return '通配'; }
     return '精确';
+  }
+
+  /* ===== 线路 =====
+   *
+   * 一条线路是一个上游密钥在一个模型上的一次机会：网关按优先级挑最高的一批，
+   * 再按权重分配请求。状态来自快照（网关算的），配置侧只负责说清楚它是哪个
+   * 上游、哪个密钥，以及为什么被配置本身停用。
+   */
+
+  /* channelLines joins every configured line with what the running gateway
+   * reports about it: its effective state, and the circuit that holds it. The
+   * join is cached until the configuration it was built from is replaced, since
+   * every row of both pages asks for a slice of it. */
+  var linesCache = null;
+
+  function channelLines() {
+    if (linesCache && linesCache.configuration === state.configuration &&
+      linesCache.snapshot === state.snapshot) {
+      return linesCache.lines;
+    }
+
+    var live = {};
+    var snapshotChannels = state.snapshot && Array.isArray(state.snapshot.channels)
+      ? state.snapshot.channels : [];
+    snapshotChannels.forEach(function (channel) {
+      if (channel && channel.id) { live[String(channel.id)] = channel; }
+    });
+
+    var routes = indexByID(resourceRows('routes'));
+    var accounts = indexByID(resourceRows('accounts'));
+    var sites = indexByID(resourceRows('upstreams'));
+    var tokens = indexByID(resourceRows('tokens'));
+
+    var lines = resourceRows('channels').map(function (channel) {
+      var route = routes[String(channel.route_id)] || null;
+      var account = accounts[String(channel.account_id)] || null;
+      var site = account ? sites[String(account.site_id)] || null : null;
+      var token = channel.token_id ? tokens[String(channel.token_id)] || null : null;
+      var reported = live[String(channel.id)] || null;
+      return {
+        id: String(channel.id),
+        routeID: String(channel.route_id),
+        siteID: account ? String(account.site_id) : '',
+        upstream: site ? text(site.name, '#' + site.id) : '—',
+        key: token ? text(token.token) : (account ? text(account.access_token) : '—'),
+        keyLabel: channel.token_id ? ('令牌 #' + channel.token_id) : ('凭据 #' + channel.account_id),
+        model: routeModel(route),
+        sourceModel: String(channel.source_model || '').trim(),
+        priority: number(channel.priority),
+        sitePriority: site ? number(site.priority) : 0,
+        weight: number(channel.weight),
+        // The configuration row says whether the line itself is on; the snapshot
+        // adds whether the route, the key, the credential and the upstream are.
+        enabled: reported ? reported.enabled !== false : channel.enabled !== false,
+        state: reported && reported.state ? reported.state : null,
+        reasons: lineDisabledReasons(channel, route, account, site, token)
+      };
+    }).sort(function (left, right) {
+      // 与网关的选路顺序一致：先上游优先级，再线路优先级，最后按名称稳定排序。
+      if (left.sitePriority !== right.sitePriority) { return right.sitePriority - left.sitePriority; }
+      if (left.priority !== right.priority) { return right.priority - left.priority; }
+      if (left.upstream !== right.upstream) { return left.upstream < right.upstream ? -1 : 1; }
+      return left.id < right.id ? -1 : (left.id > right.id ? 1 : 0);
+    });
+
+    linesCache = { configuration: state.configuration, snapshot: state.snapshot, lines: lines };
+    return lines;
+  }
+
+  /* indexByID indexes rows by id, so the joins above stay linear instead of
+   * scanning a table once per row. */
+  function indexByID(rows) {
+    var byID = {};
+    rows.forEach(function (row) {
+      if (row && row.id !== null && row.id !== undefined) { byID[String(row.id)] = row; }
+    });
+    return byID;
+  }
+
+  /* lineDisabledReasons says why the configuration holds a line out of rotation,
+   * which the effective flag on its own does not say: a line is off when any of
+   * the five things it depends on is. */
+  function lineDisabledReasons(channel, route, account, site, token) {
+    var reasons = [];
+    if (route && route.enabled === false) { reasons.push('路由停用'); }
+    if (channel.enabled === false) { reasons.push('线路停用'); }
+    if (token && token.enabled === false) { reasons.push('密钥停用'); }
+    if (account && account.status && account.status !== 'active') { reasons.push('凭据停用'); }
+    if (site && site.status && site.status !== 'active') { reasons.push('上游停用'); }
+    return reasons;
+  }
+
+  /* lineStatus reads a line's state for display. */
+  function lineStatus(line) {
+    var state = line.state || {};
+    if (!line.enabled) {
+      return {
+        label: '已停用', variant: 'muted',
+        reason: line.reasons.length ? '（' + line.reasons.join('、') + '）' : '（配置停用）'
+      };
+    }
+    if (state.status === 'disabled') {
+      return { label: '已熔断', variant: 'danger', reason: '（需手动恢复）', tripped: true };
+    }
+    if (state.status === 'cooling') {
+      return {
+        label: '冷却中', variant: 'warning', tripped: true,
+        blockedUntil: state.blocked_until || '',
+        model: state.model || '',
+        reason: state.model ? '（模型 ' + state.model + '）' : ''
+      };
+    }
+    return { label: '可用', variant: 'success' };
+  }
+
+  /* lineSummary is the short answer a collapsed row gives: how many lines are in
+   * each state. It is the same widget on both pages, so a model and an upstream
+   * report their lines the same way. */
+  function lineSummary(lines) {
+    if (!lines || lines.length === 0) {
+      return element('span', 'cell-muted', '无线路');
+    }
+    var counts = { ready: 0, cooling: 0, tripped: 0, inactive: 0 };
+    var soonest = '';
+    lines.forEach(function (line) {
+      var status = lineStatus(line);
+      if (status.tripped) {
+        counts[status.label === '冷却中' ? 'cooling' : 'tripped'] += 1;
+      } else if (status.variant === 'success') {
+        counts.ready += 1;
+      } else {
+        counts.inactive += 1;
+      }
+      if (status.blockedUntil && (!soonest || status.blockedUntil < soonest)) {
+        soonest = status.blockedUntil;
+      }
+    });
+
+    var wrapper = element('span', 'tag-list');
+    if (counts.ready) { wrapper.appendChild(statusTag('可用 ' + counts.ready, 'success')); }
+    if (counts.cooling) {
+      var cooling = statusTag('冷却 ' + counts.cooling, 'warning');
+      if (soonest) { cooling.title = '最早在 ' + formatTimestamp(soonest) + ' 恢复'; }
+      wrapper.appendChild(cooling);
+    }
+    if (counts.tripped) { wrapper.appendChild(statusTag('已熔断 ' + counts.tripped, 'danger')); }
+    if (counts.inactive) { wrapper.appendChild(statusTag('已停用 ' + counts.inactive, 'muted')); }
+    return wrapper;
+  }
+
+  /* statusTag is a badge that reads as a count: 「可用 3」. */
+  function statusTag(label, variant) {
+    return element('span', 'badge badge-' + variant, label);
+  }
+
+  /* 展开的线路表前面那一列取决于从哪一页看：路由页一行本来就是一个模型，要知道
+   * 每条线路属于哪个上游；上游页一行本来就是一个上游，要知道每条线路服务哪个模型。 */
+  var LINE_LEADING_UPSTREAM = {
+    label: '上游',
+    cell: function (line) { return element('span', 'cell-strong', line.upstream); }
+  };
+  var LINE_LEADING_MODEL = {
+    label: '模型',
+    cell: function (line) { return element('span', 'cell-strong mono', line.model); }
+  };
+
+  /* lineDetailTable is what an expanded row shows: one row per line, ordered the
+   * way the gateway picks them (highest upstream priority first, then the
+   * line's own priority). */
+  function lineDetailTable(lines, leading) {
+    leading = leading || LINE_LEADING_UPSTREAM;
+    var table = element('table', 'data-table detail-table');
+    var head = document.createElement('thead');
+    var headerRow = document.createElement('tr');
+    [leading.label, '密钥', '上游模型名', '优先级', '权重', '状态', '冷却剩余', ''].forEach(function (label) {
+      var th = document.createElement('th');
+      th.textContent = label;
+      if (label === '优先级' || label === '权重') {
+        th.className = 'num';
+        th.title = '选路先看上游优先级，再看线路优先级；两者相同才按权重随机分配。';
+      }
+      if (label === '') { th.className = 'actions'; }
+      headerRow.appendChild(th);
+    });
+    head.appendChild(headerRow);
+    table.appendChild(head);
+
+    var body = document.createElement('tbody');
+    lines.forEach(function (line) { body.appendChild(lineDetailRow(line, leading)); });
+    table.appendChild(body);
+    if (lines.length === 0) {
+      var emptyRow = document.createElement('tr');
+      cell(emptyRow, element('span', 'cell-muted', '这条线路还没有建立。'), 'detail-empty');
+      body.appendChild(emptyRow);
+    }
+    return table;
+  }
+
+  function lineDetailRow(line, leading) {
+    var status = lineStatus(line);
+    var row = document.createElement('tr');
+
+    cell(row, leading.cell(line));
+    cell(row, element('span', 'mono', line.key));
+    cell(row, line.sourceModel ? element('span', 'mono', line.sourceModel) : element('span', 'cell-muted', '与模型名相同'));
+    var priorityCell = cell(row, String(line.priority), 'num');
+    if (line.sitePriority) {
+      // 选路先看上游优先级、再看线路优先级，所以非默认的上游优先级要一起
+      // 显示，否则这条线路为什么排在后面看不出来。
+      priorityCell.appendChild(element('span', 'status-note', '（上游 ' + line.sitePriority + '）'));
+    }
+    cell(row, String(line.weight), 'num');
+
+    var statusCell = document.createElement('td');
+    statusCell.appendChild(badge(status.label, status.variant));
+    if (status.reason) { statusCell.appendChild(element('span', 'status-note', status.reason)); }
+    row.appendChild(statusCell);
+
+    var countdown = cell(row, '—', 'cd');
+    if (status.blockedUntil) {
+      countdown.setAttribute('data-cd-until', status.blockedUntil);
+      countdown.textContent = cooldownText(status.blockedUntil);
+    }
+    row.appendChild(countdown);
+
+    var actionCell = document.createElement('td');
+    actionCell.className = 'actions';
+    if (status.tripped) {
+      var restore = busyButton('btn btn-ghost btn-small', '恢复');
+      restore.title = '清除这条线路的熔断记录，下一个请求会重新尝试它';
+      restore.addEventListener('click', function () { resetLine(line, restore); });
+      actionCell.appendChild(restore);
+    }
+    row.appendChild(actionCell);
+    return row;
+  }
+
+  /* cooldownText is the CD a line is serving: how long until it is tried again. */
+  function cooldownText(until) {
+    if (!until) { return '—'; }
+    var parsed = new Date(until);
+    if (isNaN(parsed.getTime())) { return '—'; }
+    var remaining = parsed.getTime() - Date.now();
+    if (remaining <= 0) { return '已到期'; }
+    return '剩 ' + formatDuration(remaining);
+  }
+
+  /* tickCooldowns re-renders every visible countdown once a second, so a cooling
+   * line counts down instead of showing the value it had when the panel was
+   * painted. */
+  function tickCooldowns() {
+    var nodes = document.querySelectorAll('[data-cd-until]');
+    for (var index = 0; index < nodes.length; index++) {
+      nodes[index].textContent = cooldownText(nodes[index].getAttribute('data-cd-until'));
+    }
+  }
+
+  /* resetLine clears the circuits that hold one line out of rotation. The line is
+   * named by its channel; which circuits those are is the gateway's to know,
+   * because the key they may be filed under never reaches the browser. */
+  function resetLine(line, button) {
+    var model = (line.state && line.state.model) || line.model;
+    setSubmitting(button, true, '恢复');
+    post('/management/breakers/reset', {
+      scope: 'channel',
+      channel_id: line.id,
+      model: model
+    }).then(function (result) {
+      setSubmitting(button, false, '恢复');
+      if (result.ok) {
+        showNotice('已恢复「' + line.upstream + '」上 ' + model + ' 的线路，下一个请求会重新尝试它。');
+        refresh();
+        return;
+      }
+      if (result.status === 401) { showAuth('登录状态已过期，请重新登录后继续。'); return; }
+      showBanner('恢复失败', errorMessage(result.body, '网关拒绝了这次恢复。'));
+    }).catch(function (err) {
+      setSubmitting(button, false, '恢复');
+      showBanner('无法连接网关', String(err && err.message ? err.message : err));
+    });
+  }
+
+  /* ===== 请求记录 =====
+   *
+   * 客户端拿到的只有状态码和错误码，上游自己返回的那句话只留在记录里，所以
+   * 排查一次报错从这里开始：先看是哪条线路、上游说了什么，再判断是地址写错、
+   * 密钥用尽还是被限流。 */
+
+  /* REQUEST_LOG_LIMIT 是一次读取返回的条数。网关保留的记录可能更多，页面一次
+   * 只展示最近这么多条，够覆盖最近几分钟的故障。 */
+  var REQUEST_LOG_LIMIT = 200;
+
+  function requestsQuery() {
+    var parts = ['limit=' + REQUEST_LOG_LIMIT];
+    if (state.requests.failedOnly) { parts.push('failed=1'); }
+    var model = state.requests.model.trim();
+    if (model !== '') { parts.push('model=' + encodeURIComponent(model)); }
+    return '/management/requests?' + parts.join('&');
+  }
+
+  /* applyRequestLog installs one answer of the request view. A gateway that keeps
+   * no log answers with a reason, which is shown instead of an empty table. */
+  function applyRequestLog(result) {
+    if (result && result.ok && result.body) {
+      state.requests.records = Array.isArray(result.body.requests) ? result.body.requests : [];
+      state.requests.retention = result.body.retention || null;
+      state.requests.error = null;
+      return;
+    }
+    state.requests.records = [];
+    state.requests.retention = null;
+    state.requests.error = result ? errorMessage(result.body, '读取请求记录失败。') : '读取请求记录失败。';
+  }
+
+  function renderRequests() {
+    if (!els.requestsBody) { return; }
+    els.requestsBody.textContent = '';
+
+    var records = state.requests.records;
+    var failed = records.filter(function (record) { return record && record.failed; }).length;
+    els.requestsMeta.textContent = records.length === 0
+      ? '暂无记录'
+      : '最近 ' + records.length + ' 条 · 失败 ' + failed;
+    els.requestsRetention.textContent = retentionText(state.requests.retention);
+    els.requestsFailed.classList.toggle('is-active', state.requests.failedOnly);
+    els.requestsFailed.setAttribute('aria-pressed', state.requests.failedOnly ? 'true' : 'false');
+
+    if (state.requests.error) {
+      els.requestsTable.hidden = true;
+      els.requestsEmpty.hidden = false;
+      setEmptyText(els.requestsEmpty, 'requests', state.requests.error);
+      return;
+    }
+    if (records.length === 0) {
+      els.requestsTable.hidden = true;
+      els.requestsEmpty.hidden = false;
+      setEmptyText(els.requestsEmpty, 'requests', emptyRequestsText());
+      return;
+    }
+    els.requestsTable.hidden = false;
+    els.requestsEmpty.hidden = true;
+    setEmptyText(els.requestsEmpty, 'requests', emptyRequestsText());
+
+    var columns = ['时间', '结果', '模型', '线路', '尝试', '耗时', '说明', ''];
+    var head = els.requestsTable.querySelector('thead');
+    if (head) { head.textContent = ''; } else {
+      head = document.createElement('thead');
+      els.requestsTable.insertBefore(head, els.requestsTable.firstChild);
+    }
+    var headerRow = document.createElement('tr');
+    columns.forEach(function (label) {
+      var th = document.createElement('th');
+      th.textContent = label;
+      if (label === '尝试' || label === '耗时') { th.className = 'num'; }
+      if (label === '') { th.className = 'actions'; }
+      headerRow.appendChild(th);
+    });
+    head.appendChild(headerRow);
+
+    records.forEach(function (record) {
+      var key = String(record.id);
+      var expanded = isExpanded('requests', key);
+
+      var row = document.createElement('tr');
+      row.className = 'row-expandable';
+      row.setAttribute('data-toggle-group', 'requests');
+      row.setAttribute('data-toggle-key', key);
+      if (expanded) { row.classList.add('is-expanded'); }
+
+      var timeCell = document.createElement('td');
+      timeCell.className = 'toggle-cell';
+      timeCell.appendChild(expandCaret(expanded, '请求 ' + text(record.request_id)));
+      var clock = element('span', 'cell-strong mono', formatClock(record.at));
+      // The exact timestamp and the request id a client can quote stay reachable
+      // without widening the column.
+      clock.title = formatTimestamp(record.at) + ' · ' + text(record.request_id);
+      timeCell.appendChild(clock);
+      row.appendChild(timeCell);
+
+      cell(row, requestStatusBadge(record));
+      cell(row, record.model ? element('span', 'mono', record.model) : element('span', 'cell-muted', '—'));
+      cell(row, requestLineSummary(record.attempts));
+      cell(row, String(record.attempts ? record.attempts.length : 0), 'num');
+      cell(row, formatMilliseconds(record.duration_ms), 'num');
+      cell(row, requestNote(record));
+
+      row.appendChild(expandActionCell('requests', key, expanded, renderRequests));
+      els.requestsBody.appendChild(row);
+
+      if (expanded) {
+        els.requestsBody.appendChild(detailRow(columns.length, requestDetail(record)));
+      }
+    });
+  }
+
+  /* retentionText says how far back the log reaches, which is the difference
+   * between "nothing failed" and "the evidence has already been dropped". */
+  function retentionText(retention) {
+    if (!retention) { return ''; }
+    if (retention.enabled === false) {
+      return '请求记录已关闭（设置 → 运行策略）';
+    }
+    return '保留最近 ' + number(retention.keep) + ' 条';
+  }
+
+  function emptyRequestsText() {
+    if (state.requests.failedOnly) { return '没有失败的请求。'; }
+    return '还没有请求记录。经过网关的每个请求都会记在这里。';
+  }
+
+  /* formatClock renders a record's time as a log line: the time of day is what
+   * orders the requests, and the date only matters once the day has changed. */
+  function formatClock(value) {
+    if (!value) { return '—'; }
+    var parsed = new Date(value);
+    if (isNaN(parsed.getTime())) { return String(value); }
+    var clock = pad(parsed.getHours()) + ':' + pad(parsed.getMinutes()) + ':' + pad(parsed.getSeconds());
+    var today = new Date();
+    if (parsed.toDateString() === today.toDateString()) { return clock; }
+    return pad(parsed.getMonth() + 1) + '-' + pad(parsed.getDate()) + ' ' + clock;
+  }
+
+  function formatMilliseconds(ms) {
+    var value = number(ms);
+    if (value < 0) { return '—'; }
+    if (value < 1) { return '<1 毫秒'; }
+    if (value < 1000) { return value + ' 毫秒'; }
+    return (value / 1000).toFixed(2) + ' 秒';
+  }
+
+  function requestStatusBadge(record) {
+    var status = number(record.status);
+    if (status === 0) {
+      // No attempt reached an upstream, so there is no upstream status to show.
+      return badge('未转发', 'muted');
+    }
+    var variant = status >= 500 ? 'danger' : (status >= 400 ? 'warning' : 'success');
+    var node = badge(String(status), variant);
+    if (record.error_code) { node.title = record.error_code; }
+    return node;
+  }
+
+  function requestLineSummary(attempts) {
+    var names = uniqueValues((attempts || []).map(function (attempt) {
+      return text(attempt.channel_name, attempt.channel_id);
+    }));
+    if (names.length === 0) { return element('span', 'cell-muted', '—'); }
+    var node = element('span', '', names.join('、'));
+    node.title = names.join('、');
+    return node;
+  }
+
+  function requestNote(record) {
+    var message = String(record.error_message || '').trim();
+    if (message === '') {
+      return element('span', 'cell-muted', record.failed ? '—' : '已转发');
+    }
+    var node = element('span', 'cell-muted request-note', message);
+    node.title = message;
+    return node;
+  }
+
+  /* requestDetail is what an expanded request shows: the facts that identify it,
+   * and every attempt it made in the order it made them. */
+  function requestDetail(record) {
+    var wrapper = element('div', 'detail-panel');
+    var facts = element('div', 'detail-facts');
+    facts.appendChild(detailFact('请求 ID', text(record.request_id)));
+    facts.appendChild(detailFact('客户端密钥', record.key_name || ('#' + number(record.key_id))));
+    if (record.client_ip) { facts.appendChild(detailFact('来源', record.client_ip)); }
+    facts.appendChild(detailFact('接口', text(record.path)));
+    if (record.stream) { facts.appendChild(detailFact('流式', '是')); }
+    if (record.error_code) { facts.appendChild(detailFact('错误码', record.error_code)); }
+    wrapper.appendChild(facts);
+    wrapper.appendChild(requestAttemptTable(record.attempts || []));
+    return wrapper;
+  }
+
+  function detailFact(label, value) {
+    var node = element('span', 'detail-fact');
+    node.appendChild(element('span', 'detail-fact-label', label));
+    node.appendChild(element('span', 'mono', value));
+    return node;
+  }
+
+  /* requestAttemptTable is the record of one request's attempts. The upstream's
+   * own answer is the column that matters: it is what names the cause. */
+  function requestAttemptTable(attempts) {
+    var table = element('table', 'data-table detail-table');
+    var head = document.createElement('thead');
+    var headerRow = document.createElement('tr');
+    ['序号', '线路', '上游模型', '状态', '耗时', '上游返回'].forEach(function (label) {
+      var th = document.createElement('th');
+      th.textContent = label;
+      if (label === '序号' || label === '耗时') { th.className = 'num'; }
+      headerRow.appendChild(th);
+    });
+    head.appendChild(headerRow);
+    table.appendChild(head);
+
+    var body = document.createElement('tbody');
+    attempts.forEach(function (attempt) {
+      var row = document.createElement('tr');
+      cell(row, '#' + number(attempt.number), 'num');
+
+      var lineCell = document.createElement('td');
+      lineCell.appendChild(element('span', 'cell-strong', text(attempt.channel_name, attempt.channel_id)));
+      lineCell.appendChild(element('span', 'cell-id', '#' + text(attempt.channel_id)));
+      row.appendChild(lineCell);
+
+      cell(row, attempt.model ? element('span', 'mono', attempt.model) : element('span', 'cell-muted', '—'));
+
+      var statusCell = document.createElement('td');
+      var status = number(attempt.status);
+      statusCell.appendChild(status === 0
+        ? badge('连接失败', 'danger')
+        : badge(String(status), attempt.retryable ? 'warning' : 'muted'));
+      if (attempt.retryable) { statusCell.appendChild(element('span', 'status-note', '已重试')); }
+      row.appendChild(statusCell);
+
+      cell(row, formatMilliseconds(attempt.duration_ms), 'num');
+      row.appendChild(attemptResponseCell(attempt));
+      body.appendChild(row);
+    });
+    table.appendChild(body);
+
+    if (attempts.length === 0) {
+      var emptyRow = document.createElement('tr');
+      cell(emptyRow, element('span', 'cell-muted', '这个请求没有发到上游：当时没有可用的线路。'), 'detail-empty');
+      body.appendChild(emptyRow);
+    }
+    return table;
+  }
+
+  function attemptResponseCell(attempt) {
+    var td = document.createElement('td');
+    var response = String(attempt.response || '').trim();
+    if (response !== '') {
+      var node = element('span', 'mono request-response', response);
+      node.title = response;
+      td.appendChild(node);
+      return td;
+    }
+    var failure = String(attempt.error || '').trim();
+    if (failure !== '') {
+      var errorNode = element('span', 'cell-muted request-response', failure);
+      errorNode.title = failure;
+      td.appendChild(errorNode);
+      return td;
+    }
+    td.appendChild(element('span', 'cell-muted', '—'));
+    return td;
+  }
+
+  /* clearRequestLog empties the log, which is how an operator puts a problem they
+   * have already fixed behind them. It goes through the confirm dialog because it
+   * is the one thing on this page that cannot be undone. */
+  function clearRequestLog() {
+    openConfirm({
+      title: '清空请求记录',
+      text: '将删除全部请求记录，包括每个请求的上游返回内容。确认清空？',
+      confirmLabel: '清空',
+      danger: true,
+      run: function () { return remove('/management/requests').then(handleClearedRequests); }
+    });
+  }
+
+  function handleClearedRequests(result) {
+    if (result.ok) {
+      var cleared = result.body && typeof result.body.cleared === 'number' ? result.body.cleared : 0;
+      showNotice(cleared > 0 ? '已清空 ' + cleared + ' 条请求记录。' : '请求记录已经是空的。');
+      refresh();
+      return null;
+    }
+    if (result.status === 401) {
+      showAuth('登录状态已过期，请重新登录后继续。');
+      return null;
+    }
+    throw new Error(errorMessage(result.body, '清空请求记录失败。'));
+  }
+
+  /* ===== 展开与收起 =====
+   *
+   * 展开状态存在 state.expanded 里，所以自动刷新重画表格时已经展开的行不会
+   * 自己收回去。
+   */
+
+  function isExpanded(group, key) {
+    return Boolean(state.expanded[group] && state.expanded[group][key]);
+  }
+
+  function toggleExpanded(group, key) {
+    if (!state.expanded[group]) { state.expanded[group] = {}; }
+    if (state.expanded[group][key]) {
+      delete state.expanded[group][key];
+    } else {
+      state.expanded[group][key] = true;
+    }
+  }
+
+  function expandCaret(expanded, label) {
+    var caret = element('span', 'caret' + (expanded ? ' is-open' : ''), expanded ? '▾' : '▸');
+    caret.setAttribute('aria-hidden', 'true');
+    caret.title = (expanded ? '收起' : '展开') + (label ? '：' + label : '');
+    return caret;
+  }
+
+  /* expandActionCell is the trailing 展开/收起 button of an expandable row. It
+   * repaints through the renderer that drew the table, so a click on one table
+   * never redraws another. */
+  function expandActionCell(group, key, expanded, render) {
+    var td = document.createElement('td');
+    td.className = 'actions';
+    var button = element('button', 'btn btn-ghost btn-small', expanded ? '收起' : '展开');
+    button.type = 'button';
+    button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    button.addEventListener('click', function (event) {
+      event.stopPropagation();
+      toggleExpanded(group, key);
+      (render || renderRouting)();
+    });
+    td.appendChild(button);
+    return td;
+  }
+
+  /* detailRow wraps a detail panel in the full-width row it occupies. */
+  function detailRow(columns, content) {
+    var row = document.createElement('tr');
+    row.className = 'detail-row';
+    var td = document.createElement('td');
+    td.colSpan = columns;
+    td.appendChild(content);
+    row.appendChild(td);
+    return row;
+  }
+
+  function setupRowToggles() {
+    toggleGroupRow(els.routingBody, 'routes', renderRouting);
+    toggleGroupRow(els.upstreamsBody, 'upstreams', renderManagement);
+    toggleGroupRow(els.requestsBody, 'requests', renderRequests);
+  }
+
+  /* toggleGroupRow makes a whole row a toggle for its own detail, so an operator
+   * can click anywhere on it; a control inside the row keeps its own behaviour. */
+  function toggleGroupRow(body, group, render) {
+    if (!body) { return; }
+    body.addEventListener('click', function (event) {
+      var target = event.target;
+      if (!target.closest || target.closest('button, input, select, a')) { return; }
+      var row = target.closest('[data-toggle-group]');
+      if (!row || row.getAttribute('data-toggle-group') !== group || !body.contains(row)) { return; }
+      toggleExpanded(group, row.getAttribute('data-toggle-key'));
+      render();
+    });
+  }
+
+  function uniqueValues(values) {
+    var seen = {};
+    var unique = [];
+    values.forEach(function (value) {
+      var name = String(value === null || value === undefined ? '' : value).trim();
+      if (name === '' || seen[name]) { return; }
+      seen[name] = true;
+      unique.push(name);
+    });
+    return unique;
+  }
+
+  function number(value) {
+    var parsed = typeof value === 'number' ? value : parseFloat(value);
+    return isFinite(parsed) ? parsed : 0;
   }
 
   function renderModels(models, filter) {
@@ -1381,7 +2388,18 @@
         return;
       }
 
+      // A resource may declare detail(row): what a row has to show when it is
+      // expanded — the upstream table uses it for its lines, because one upstream
+      // holds several keys and each of them is a line of its own. The panel itself
+      // is built by node() only when the row is open.
+      var hasDetail = typeof metadata.detail === 'function';
+
       var headerRow = document.createElement('tr');
+      if (hasDetail) {
+        var toggleHeader = document.createElement('th');
+        toggleHeader.className = 'toggle-cell';
+        headerRow.appendChild(toggleHeader);
+      }
       metadata.columns.forEach(function (column) {
         var th = document.createElement('th');
         th.textContent = column.label;
@@ -1412,17 +2430,33 @@
       setEmptyText(emptyState, resource, state.emptyText[resource] || '')
 
       rows.forEach(function (row) {
+        var key = String(row.id);
+        var detail = hasDetail ? metadata.detail(row) : null;
+        var expanded = Boolean(detail) && isExpanded(resource, key);
+
         var tr = document.createElement('tr');
-        metadata.columns.forEach(function (column) {
-          var content = column.cell(row);
-          if (content && content.nodeType) {
-            cell(tr, content, column.className);
-          } else {
-            cell(tr, content, column.className);
+        if (detail) {
+          tr.className = 'row-expandable' + (expanded ? ' is-expanded' : '');
+          tr.setAttribute('data-toggle-group', resource);
+          tr.setAttribute('data-toggle-key', key);
+        }
+        if (hasDetail) {
+          var toggleCell = document.createElement('td');
+          toggleCell.className = 'toggle-cell';
+          if (detail) {
+            toggleCell.appendChild(expandCaret(expanded, metadata.describe(row)));
           }
+          tr.appendChild(toggleCell);
+        }
+        metadata.columns.forEach(function (column) {
+          cell(tr, column.cell(row), column.className);
         });
         tr.appendChild(actionCell(resource, row, metadata));
         body.appendChild(tr);
+
+        if (expanded) {
+          body.appendChild(detailRow(metadata.columns.length + (hasDetail ? 2 : 1), detail.node()));
+        }
       });
     });
   }
@@ -1445,6 +2479,19 @@
       edit.type = 'button';
       edit.addEventListener('click', function () { openEditor(resource, row); });
       group.appendChild(edit);
+    }
+    if (metadata.actions.indexOf('reveal') !== -1) {
+      var reveal = element('button', 'btn btn-ghost btn-small', '显示');
+      reveal.type = 'button';
+      reveal.title = '显示完整密钥；明文只在这次查看期间保留，刷新后重新隐藏。';
+      reveal.addEventListener('click', function () { toggleKeyReveal(row, reveal); });
+      group.appendChild(reveal);
+
+      var copy = element('button', 'btn btn-ghost btn-small', '复制');
+      copy.type = 'button';
+      copy.title = '把完整密钥复制到剪贴板，用完可以点「显示」核对。';
+      copy.addEventListener('click', function () { copyClientKey(row, copy); });
+      group.appendChild(copy);
     }
     if (metadata.actions.indexOf('rotate') !== -1) {
       var rotate = element('button', 'btn btn-ghost btn-small', '轮换');
@@ -1612,6 +2659,20 @@
     };
   }
 
+  /* canonicalModelName is the name a model is exposed by, mirroring the
+   * gateway's own rule: case, the channel path before the last "/", the variant
+   * suffix after the last ":", and a trailing "-free" are a channel's own
+   * arrangement of the model rather than a different model. */
+  function canonicalModelName(value) {
+    var name = String(value === null || value === undefined ? '' : value).trim().toLowerCase();
+    var slash = name.lastIndexOf('/');
+    if (slash >= 0) { name = name.slice(slash + 1); }
+    var colon = name.lastIndexOf(':');
+    if (colon >= 0) { name = name.slice(0, colon); }
+    if (name.slice(-5) === '-free') { name = name.slice(0, -5); }
+    return name;
+  }
+
   /* createModelPicker builds the model section: fetch, filter, select, and name
    * the model the way the upstream knows it. */
   function createModelPicker(row) {
@@ -1620,7 +2681,10 @@
     var heading = element('span', 'field-label', (FIELDS.upstreams.models || {}).label || '模型');
     wrapper.appendChild(heading);
     wrapper.appendChild(element('p', 'field-help',
-      '勾选这个上游提供的模型；保存后网关会自动为它们建立路由。「上游模型名」填上游认识的写法，留空表示与模型名相同。'));
+      '勾选这个上游提供的模型；保存后网关会自动为它们建立路由。模型名会去掉大小写、' +
+      '渠道路径（/ 前面）和后缀（: 后面）的差别：cline-free/deepseek-v4.1-flash:free ' +
+      '和 DeepSeek-V4.1-Flash 都是同一个模型。「上游模型名」填上游认识的写法，' +
+      '留空表示与模型名相同。'));
 
     var rows = [];
     var known = {};
@@ -1632,7 +2696,6 @@
         addModel(String(name), true, mappingTarget(storedMapping, name));
       });
     }
-
     var toolbar = element('div', 'picker-toolbar');
     var fetchButton = busyButton('btn btn-ghost btn-small', '获取模型');
     fetchButton.addEventListener('click', function () { fetchModels(fetchButton); });
@@ -1678,16 +2741,22 @@
 
     paint();
 
+    /* addModel files a model under the name it is exposed by, which is its
+     * canonical form: the same model listed by another upstream as
+     * "cline-free/deepseek-v4.1-flash:free" is one entry, and the spelling this
+     * upstream uses is carried as the name to send it. */
     function addModel(name, checked, target) {
-      name = String(name || '').trim();
-      if (!name) { return; }
-      if (known[name]) {
-        if (checked) { known[name].checked = true; }
-        if (target && !known[name].target) { known[name].target = target; }
+      var listed = String(name || '').trim();
+      if (!listed) { return; }
+      var exposed = canonicalModelName(listed);
+      if (!target && exposed !== listed) { target = listed; }
+      if (known[exposed]) {
+        if (checked) { known[exposed].checked = true; }
+        if (target && !known[exposed].target) { known[exposed].target = target; }
         return;
       }
-      var entry = { name: name, checked: checked === true, target: target || '' };
-      known[name] = entry;
+      var entry = { name: exposed, listed: listed, checked: checked === true, target: target || '' };
+      known[exposed] = entry;
       rows.push(entry);
       rows.sort(function (left, right) { return left.name < right.name ? -1 : (left.name > right.name ? 1 : 0); });
     }
@@ -1715,7 +2784,14 @@
           updateStatus();
         });
         line.appendChild(box);
-        line.appendChild(element('span', 'model-name mono', entry.name));
+        var label = element('span', 'model-name mono', entry.name);
+        if (entry.listed && entry.listed !== entry.name) {
+          // 上游的写法与暴露的名字不同时说清楚原来叫什么，否则 operator 会觉得
+          // 自己勾选的模型被改掉了。
+          label.title = '上游列出的名字：' + entry.listed;
+          label.appendChild(element('span', 'model-listed', '（上游写法 ' + entry.listed + '）'));
+        }
+        line.appendChild(label);
         var target = document.createElement('input');
         target.type = 'text';
         target.className = 'field-input model-target';
@@ -2425,7 +3501,7 @@
    * how long a failing line is held out of rotation. The gateway owns the field
    * list, so a policy value added there shows up here without a change to this
    * file; only the labels and the wording of each section live here. */
-  var POLICY_SECTION_ORDER = ['failover', 'retry', 'breaker'];
+  var POLICY_SECTION_ORDER = ['failover', 'retry', 'breaker', 'request_log'];
 
   var POLICY_SECTIONS = {
     failover: {
@@ -2439,6 +3515,10 @@
     breaker: {
       title: '故障冷却与恢复',
       help: '连续失败达到阈值后，这条线路被暂时移出选路（熔断），冷却时间每次按倍数增长，到期自动恢复；作用域选「通道禁用」的线路不会自动恢复，需要在概览页手动恢复。'
+    },
+    request_log: {
+      title: '请求记录',
+      help: '记录网关服务过的每个请求，包括上游返回的原文。「请求记录」页读的就是它，排查报错靠它；流量大时可以关闭或缩短保留条数。'
     }
   };
 
@@ -2454,7 +3534,9 @@
     'gateway.breaker.threshold': { label: '连续失败多少次熔断', unit: 'count' },
     'gateway.breaker.base_cooldown_seconds': { label: '首次冷却时间', unit: 's' },
     'gateway.breaker.max_cooldown_seconds': { label: '冷却时间上限', unit: 's' },
-    'gateway.breaker.cooldown_multiplier': { label: '冷却倍数', unit: 'x', help: '每多熔断一次，冷却时间乘以此倍数，直到上限。' }
+    'gateway.breaker.cooldown_multiplier': { label: '冷却倍数', unit: 'x', help: '每多熔断一次，冷却时间乘以此倍数，直到上限。' },
+    'gateway.request_log.enabled': { label: '记录请求', help: '关闭后不再记录任何请求，已有的记录仍然可以在「请求记录」页查看和清空。' },
+    'gateway.request_log.keep': { label: '保留条数', unit: 'count', help: '只保留最近的这么多条，更早的记录在写入新记录时被删除。' }
   };
 
   var POLICY_UNITS = { count: '次', ms: '毫秒', s: '秒', x: '倍' };
@@ -2794,9 +3876,24 @@
     }
   }
 
+  /* ===== 自动刷新与倒计时 =====
+   *
+   * 两个每秒都在走的东西：离下次刷新还有多久（只在会自刷新的视图上），以及每条
+   * 冷却中的线路还剩多少时间。后者只有页面确实画出了倒计时才有节点可更新。
+   */
+
   function resetCountdown() {
     state.countdown = REFRESH_MS / 1000;
-    els.nextRefresh.textContent = formatCountdown(state.countdown);
+    setNextRefresh(formatCountdown(state.countdown));
+  }
+
+  /* setNextRefresh writes the countdown into every panel that shows one, since
+   * more than one view can be live. */
+  function setNextRefresh(label) {
+    var nodes = document.querySelectorAll('[data-next-refresh]');
+    for (var index = 0; index < nodes.length; index++) {
+      nodes[index].textContent = label;
+    }
   }
 
   function startAutoRefresh() {
@@ -2808,7 +3905,7 @@
         refresh();
         state.countdown = REFRESH_MS / 1000;
       }
-      els.nextRefresh.textContent = formatCountdown(state.countdown);
+      setNextRefresh(formatCountdown(state.countdown));
     }, 1000);
   }
 
@@ -2817,6 +3914,17 @@
       window.clearInterval(state.timer);
       state.timer = null;
     }
+  }
+
+  function startCooldownTicker() {
+    if (state.cdTimer !== null) { return; }
+    state.cdTimer = window.setInterval(tickCooldowns, 1000);
+  }
+
+  function stopCooldownTicker() {
+    if (state.cdTimer === null) { return; }
+    window.clearInterval(state.cdTimer);
+    state.cdTimer = null;
   }
 
   /* ===== Password change ===== */
@@ -3011,9 +4119,31 @@
     if (els.breakersResetAll) {
       els.breakersResetAll.addEventListener('click', resetAllBreakers);
     }
+    setupRowToggles();
     els.modelFilter.addEventListener('input', function () {
       renderModels(state.snapshot && state.snapshot.models ? state.snapshot.models : [], els.modelFilter.value);
     });
+    if (els.requestsFailed) {
+      els.requestsFailed.addEventListener('click', function () {
+        state.requests.failedOnly = !state.requests.failedOnly;
+        refresh();
+      });
+    }
+    if (els.requestsModel) {
+      // The model filter is a server-side filter, so it is applied when the
+      // operator stops typing rather than on every keystroke.
+      var modelTimer = null;
+      els.requestsModel.addEventListener('input', function () {
+        window.clearTimeout(modelTimer);
+        modelTimer = window.setTimeout(function () {
+          state.requests.model = els.requestsModel.value;
+          refresh();
+        }, 300);
+      });
+    }
+    if (els.requestsClear) {
+      els.requestsClear.addEventListener('click', clearRequestLog);
+    }
 
     els.editorForm.addEventListener('submit', submitEditor);
     els.editorClose.addEventListener('click', closeEditor);

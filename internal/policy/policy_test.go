@@ -52,6 +52,8 @@ func TestFromSettingsReadsBackEveryValue(t *testing.T) {
 		KeyBreakerBaseCooldownSeconds: "45",
 		KeyBreakerMaxCooldownSeconds:  "600",
 		KeyBreakerCooldownMultiplier:  "1.5",
+		KeyRequestLogEnabled:          "false",
+		KeyRequestLogKeep:             "250",
 	}
 	applied, warnings := FromSettings(stored, Default())
 	if len(warnings) != 0 {
@@ -75,6 +77,9 @@ func TestFromSettingsReadsBackEveryValue(t *testing.T) {
 		applied.Breaker.MaxCooldown != 10*time.Minute ||
 		applied.Breaker.Multiplier != 1.5 {
 		t.Errorf("breaker = %+v, want the stored values", applied.Breaker)
+	}
+	if applied.RequestLog.Enabled || applied.RequestLog.Keep != 250 {
+		t.Errorf("request log = %+v, want the stored values", applied.RequestLog)
 	}
 
 	// A hand-edited row that cannot be read is reported and skipped rather than
@@ -136,6 +141,16 @@ func TestValidateReportsTheFieldToChange(t *testing.T) {
 	mode.Breaker.Mode = "sometimes"
 	if err := Validate(mode); err == nil {
 		t.Error("Validate() accepted an unknown breaker mode")
+	}
+	// A log that keeps nothing is not a log: the retention has a floor of one.
+	retention := Default()
+	retention.RequestLog.Keep = 0
+	err = Validate(retention)
+	if err == nil {
+		t.Fatal("Validate() accepted a request log that keeps no records")
+	}
+	if constraint, ok := err.(ConstraintError); !ok || constraint.Key != KeyRequestLogKeep {
+		t.Errorf("Validate() error = %v, want a ConstraintError naming %s", err, KeyRequestLogKeep)
 	}
 }
 

@@ -49,6 +49,8 @@ type Config struct {
 	Retry                 domain.RetryPolicy
 	Failover              domain.FailoverPolicy
 	Breaker               breaker.Policy
+	// RequestLog bounds the gateway's record of the requests it served.
+	RequestLog policy.RequestLogPolicy
 	// IntegrityCheck verifies the shared SQLite database at startup so a
 	// damaged file fails loudly instead of serving wrong routing data.
 	IntegrityCheck bool
@@ -57,7 +59,7 @@ type Config struct {
 // Policy is the runtime traffic policy these settings produce. A console write
 // overrides individual values of it; the environment supplies the rest.
 func (c Config) Policy() policy.Policy {
-	return policy.Policy{Retry: c.Retry, Failover: c.Failover, Breaker: c.Breaker}
+	return policy.Policy{Retry: c.Retry, Failover: c.Failover, Breaker: c.Breaker, RequestLog: c.RequestLog}
 }
 
 // Load reads gateway settings from environment variables and applies bounded,
@@ -141,6 +143,12 @@ func Load() (Config, error) {
 	if cfg.IntegrityCheck, err = boolEnv("FLUXGATE_INTEGRITY_CHECK", cfg.IntegrityCheck); err != nil {
 		return Config{}, err
 	}
+	if cfg.RequestLog.Enabled, err = boolEnv("FLUXGATE_REQUEST_LOG_ENABLED", cfg.RequestLog.Enabled); err != nil {
+		return Config{}, err
+	}
+	if cfg.RequestLog.Keep, err = intEnv("FLUXGATE_REQUEST_LOG_KEEP", cfg.RequestLog.Keep, true); err != nil {
+		return Config{}, err
+	}
 
 	if value := strings.TrimSpace(os.Getenv("FLUXGATE_BREAKER_MODE")); value != "" {
 		cfg.Breaker.Mode = breaker.Mode(value)
@@ -185,6 +193,7 @@ func Default() Config {
 		Retry:                 traffic.Retry,
 		Failover:              traffic.Failover,
 		Breaker:               traffic.Breaker,
+		RequestLog:            traffic.RequestLog,
 		IntegrityCheck:        defaultIntegrityCheck,
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/yhw5231/fluxgate/internal/breaker"
+	"github.com/yhw5231/fluxgate/internal/domain"
 )
 
 // Bringing a channel back into service.
@@ -45,7 +46,7 @@ func (s *Server) handleBreakerReset(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	scopes, ok := breakerScopes(w, body)
+	scopes, ok := s.breakerScopes(w, body)
 	if !ok {
 		return
 	}
@@ -58,10 +59,17 @@ func (s *Server) handleBreakerReset(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"reset": removed})
 }
 
-// breakerScopes reads the circuit a request wants cleared. A request that names
+// breakerScopes reads the circuits a request wants cleared. A request that names
 // nothing clears every circuit, which is what the console's "全部恢复" action
 // sends.
-func breakerScopes(w http.ResponseWriter, body map[string]any) ([]breaker.Scope, bool) {
+//
+// A request that names a line clears every circuit that can hold that line out of
+// rotation. Which ones those are — the line's own, the one shared by every line
+// presenting the same credential, or that credential for one model — is something
+// only the gateway can answer, because the credential itself never leaves it. The
+// store's own circuit key is still accepted verbatim, for automation that
+// recorded a scope from the snapshot.
+func (s *Server) breakerScopes(w http.ResponseWriter, body map[string]any) ([]breaker.Scope, bool) {
 	scope, _ := body["scope"].(string)
 	scope = strings.TrimSpace(scope)
 	if scope == "" || scope == "all" {
@@ -77,7 +85,7 @@ func breakerScopes(w http.ResponseWriter, body map[string]any) ([]breaker.Scope,
 	}
 	switch scope {
 	case "channel":
-		return []breaker.Scope{{ChannelID: channelID}}, true
+		return s.lineScopes(channelID, model), true
 	case "key":
 		// The key scope carries no channel, which is how the breaker records it:
 		// a key-cooled circuit is shared by every channel presenting that key.
@@ -89,6 +97,58 @@ func breakerScopes(w http.ResponseWriter, body map[string]any) ([]breaker.Scope,
 			"scope must be all, channel, key, or key_model")
 		return nil, false
 	}
+}
+
+// lineScopes lists every circuit that can hold one line out of rotation: the
+// line's own, the credential's shared one, the credential's per-model one, and
+// every per-model circuit already recorded for that credential — a pattern route
+// is asked for many model names, and all of them reach the same line.
+func (s *Server) lineScopes(channelID, model string) []breaker.Scope {
+	scopes := []breaker.Scope{{ChannelID: channelID}}
+	channel, known := s.findChannel(channelID)
+	if !known || channel.APIKey == "" {
+		return scopes
+	}
+	scopes = append(scopes, breaker.Scope{KeyID: channel.APIKey})
+	if model != "" {
+		scopes = append(scopes, breaker.Scope{KeyID: channel.APIKey, Model: model})
+	}
+	if s.BreakerSnapshotter != nil {
+		for scope := range s.BreakerSnapshotter.Snapshot() {
+			if scope.KeyID == channel.APIKey && scope.Model != "" {
+				scopes = append(scopes, scope)
+			}
+		}
+	}
+	return dedupeScopes(scopes)
+}
+
+// findChannel returns the channel the running configuration knows by id, which
+// is how a request names the line it wants back in rotation.
+func (s *Server) findChannel(id string) (domain.Channel, bool) {
+	for _, route := range s.currentConfiguration().Routes {
+		for _, channel := range route.Channels {
+			if channel.ID == id {
+				return channel, true
+			}
+		}
+	}
+	return domain.Channel{}, false
+}
+
+// dedupeScopes removes the repeats a caller may have assembled, so a circuit is
+// cleared — and counted — once.
+func dedupeScopes(scopes []breaker.Scope) []breaker.Scope {
+	seen := make(map[breaker.Scope]struct{}, len(scopes))
+	unique := make([]breaker.Scope, 0, len(scopes))
+	for _, scope := range scopes {
+		if _, duplicate := seen[scope]; duplicate {
+			continue
+		}
+		seen[scope] = struct{}{}
+		unique = append(unique, scope)
+	}
+	return unique
 }
 
 func stringField(body map[string]any, name string) string {

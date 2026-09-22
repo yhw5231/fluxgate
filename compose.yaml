@@ -77,6 +77,10 @@ services:
       # 熔断基础冷却时长与上限（按失败次数指数递增）
       FLUXGATE_BREAKER_BASE_COOLDOWN: "${FLUXGATE_BREAKER_BASE_COOLDOWN:-30s}"
       FLUXGATE_BREAKER_MAX_COOLDOWN: "${FLUXGATE_BREAKER_MAX_COOLDOWN:-15m}"
+      # 请求记录：管理台「请求记录」页读的就是它，上游返回的报错原文只存在这里。
+      # 关闭后不再记录新请求；保留条数决定日志表最多留多少条，写满后自动删旧的。
+      FLUXGATE_REQUEST_LOG_ENABLED: "${FLUXGATE_REQUEST_LOG_ENABLED:-true}"
+      FLUXGATE_REQUEST_LOG_KEEP: "${FLUXGATE_REQUEST_LOG_KEEP:-1000}"
       # 出站代理（供部分上游站点需要走代理的场景）；NO_PROXY 排除本机地址
       HTTP_PROXY: "${HTTP_PROXY:-}"
       HTTPS_PROXY: "${HTTPS_PROXY:-}"

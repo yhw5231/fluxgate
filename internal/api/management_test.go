@@ -423,3 +423,74 @@ func TestManagementSnapshotReflectsAWrite(t *testing.T) {
 func itoa(value int64) string { return strconv.FormatInt(value, 10) }
 
 func nowUTCForTest() time.Time { return time.Now().UTC() }
+
+// An upstream is configured with the priority selection compares first and the
+// models its own listings name. Both travel through the console's write path:
+// the priority reaches the line the gateway routes on, and a model that the
+// upstream spells with a channel path and a variant suffix is exposed under one
+// canonical name that still forwards the spelling the upstream knows.
+func TestManagementUpstreamCarriesPriorityAndCanonicalModelNames(t *testing.T) {
+	server, persistent := managementServer(t)
+
+	created := callManagement(server, http.MethodPost, "/management/configuration/upstreams", "management-secret", map[string]any{
+		"name":     "Aggregator",
+		"url":      "https://api.aggregator.example.com/v1",
+		"priority": 5,
+		"keys":     []string{"aggregator-key"},
+		"models":   []string{"cline-free/deepseek-v4.1-flash:free"},
+	})
+	if created.status != http.StatusCreated {
+		t.Fatalf("create upstream status = %d, body = %v", created.status, created.body)
+	}
+	row, ok := created.body["row"].(map[string]any)
+	if !ok {
+		t.Fatalf("create upstream response has no row: %v", created.body)
+	}
+	if row["priority"] != float64(5) {
+		t.Errorf("priority = %#v, want 5", row["priority"])
+	}
+	models, _ := row["models"].([]any)
+	if len(models) != 1 || models[0] != "deepseek-v4.1-flash" {
+		t.Errorf("models = %v, want the canonical name", row["models"])
+	}
+	mapping, _ := row["model_mapping"].(map[string]any)
+	if mapping["deepseek-v4.1-flash"] != "cline-free/deepseek-v4.1-flash:free" {
+		t.Errorf("model_mapping = %v, want the upstream's own spelling kept", row["model_mapping"])
+	}
+
+	// The reloaded configuration is what the gateway routes on, so the line
+	// carries the priority and the model the upstream will receive.
+	loaded, err := persistent.LoadConfiguration(context.Background())
+	if err != nil {
+		t.Fatalf("LoadConfiguration() error = %v", err)
+	}
+	if len(loaded.Channels) != 1 {
+		t.Fatalf("loaded %d lines, want one", len(loaded.Channels))
+	}
+	if got := loaded.Channels[0].SitePriority; got != 5 {
+		t.Errorf("loaded line priority = %d, want the upstream's 5", got)
+	}
+	if got := loaded.Channels[0].SourceModel; got != "cline-free/deepseek-v4.1-flash:free" {
+		t.Errorf("loaded source model = %q, want the spelling the upstream listed", got)
+	}
+
+	// The routable model list is what clients ask for, so it names the model
+	// once, under its canonical name.
+	snapshot := callManagement(server, http.MethodGet, "/management/snapshot", "management-secret", nil)
+	if snapshot.status != http.StatusOK {
+		t.Fatalf("snapshot status = %d, body = %v", snapshot.status, snapshot.body)
+	}
+	listed, _ := snapshot.body["models"].([]any)
+	found := false
+	for _, name := range listed {
+		if name == "deepseek-v4.1-flash" {
+			found = true
+		}
+		if name == "cline-free/deepseek-v4.1-flash:free" {
+			t.Errorf("models = %v, want the upstream's spelling not exposed", listed)
+		}
+	}
+	if !found {
+		t.Errorf("models = %v, want the canonical model listed", listed)
+	}
+}

@@ -7,7 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
+
+	"github.com/yhw5231/fluxgate/internal/pattern"
 )
 
 // The console manages an upstream as one thing: a name, an address, a weight,
@@ -37,6 +40,14 @@ const (
 	// managedRoutesSetting names the settings row that records which routes the
 	// console created for the models upstreams serve.
 	managedRoutesSetting = "gateway.managed_routes"
+
+	// upstreamPrioritySetting names the settings row that records the priority of
+	// each upstream, as a JSON object of site id to whole number. Priority is
+	// what selection compares first — a higher-priority upstream's lines are all
+	// tried before a lower-priority one's — and the sites table has no column for
+	// it, so it lives beside the console's other bookkeeping rather than in a
+	// schema the gateway does not own.
+	upstreamPrioritySetting = "gateway.upstream_priorities"
 
 	// upstreamKeyModeAvailableFirst prefers the first key, moving to the next one
 	// only when it is unavailable. upstreamKeyModeRoundRobin spreads requests
@@ -92,6 +103,11 @@ var upstreamResource = Resource{
 		{Name: "url", Kind: KindText, Required: true, MaxLength: 2048, Validate: validateHTTPURL},
 		{Name: "platform", Kind: KindText, MaxLength: 64, DefaultValue: defaultPlatform},
 		{Name: "global_weight", Kind: KindReal, Validate: validatePositive},
+		// Priority is the upstream's own, and the first thing selection compares:
+		// a higher-priority upstream is used before a lower-priority one, and
+		// weight only decides between upstreams of the same priority. It is not a
+		// sites column, so it is a synthetic field stored in the settings table.
+		{Name: "priority", Kind: KindInt, Synthetic: true},
 		{Name: "custom_headers", Kind: KindJSONObject, MaxLength: 8192, Validate: validateStringMap},
 		{Name: "proxy_url", Kind: KindText, MaxLength: 2048, Validate: validateProxyURL},
 		// An upstream added from the console is enabled: a new upstream nobody
@@ -140,6 +156,7 @@ func checkUpstreamRow(ctx context.Context, tx *sql.Tx, id int64, row map[string]
 			return invalidField("models", "%s", err.Error())
 		}
 		seen := make(map[string]struct{}, len(models))
+		identities := make(map[string]struct{}, len(models))
 		for _, model := range models {
 			if len(model) > 512 {
 				return invalidValue("models", ReasonTooLong, map[string]any{"limit": 512}, "use at most %d bytes per model name", 512)
@@ -148,16 +165,22 @@ func checkUpstreamRow(ctx context.Context, tx *sql.Tx, id int64, row map[string]
 				return invalidField("models", "the model %q is listed twice", model)
 			}
 			seen[model] = struct{}{}
+			identities[modelIdentity(model)] = struct{}{}
 		}
 		// A mapping that names no selected model would be stored and never used,
-		// so it is refused rather than silently ignored.
+		// so it is refused rather than silently ignored. The key is the exposed
+		// name, and either spelling of it — as the operator picked it or as the
+		// model is exposed — is accepted.
 		if rawMapping, present := row["model_mapping"]; present && rawMapping != nil {
 			mapping, err := decodeStringMap(rawMapping)
 			if err != nil {
 				return invalidField("model_mapping", "%s", err.Error())
 			}
 			for model := range mapping {
-				if _, selected := seen[model]; !selected {
+				if _, selected := seen[model]; selected {
+					continue
+				}
+				if _, selected := identities[modelIdentity(model)]; !selected {
 					return invalidField("model_mapping", "%q is not one of the selected models", model)
 				}
 			}
@@ -169,9 +192,14 @@ func checkUpstreamRow(ctx context.Context, tx *sql.Tx, id int64, row map[string]
 /* ===== Write path ===== */
 
 // applyUpstream stores the composite fields of an upstream: its keys, the models
-// it serves, and the mapping from an exposed model name to the name this
-// upstream knows it by.
+// it serves, the mapping from an exposed model name to the name this upstream
+// knows it by, and the priority selection compares first.
 func applyUpstream(ctx context.Context, tx *sql.Tx, siteID int64, values map[string]any) error {
+	if raw, present := values["priority"]; present {
+		if err := applyUpstreamPriority(ctx, tx, siteID, raw); err != nil {
+			return err
+		}
+	}
 	accountID, err := ensureUpstreamAccount(ctx, tx, siteID)
 	if err != nil {
 		return err
@@ -305,6 +333,11 @@ func updateUpstreamKey(ctx context.Context, tx *sql.Tx, stored upstreamKeyRow, v
 // replaceUpstreamModels makes the routing table match the selection: one route
 // per exposed model, one channel per key, and the mapping written onto the
 // channel so this upstream receives the model name it knows.
+//
+// The route carries the model's canonical name while the channel keeps the
+// spelling this upstream listed, so two upstreams that call one model different
+// things — "cline-free/deepseek-v4.1-flash:free" and "deepseek-v4.1-flash" —
+// meet on one route and each still receives its own spelling.
 func replaceUpstreamModels(ctx context.Context, tx *sql.Tx, accountID int64, raw any, rawMapping any, rawMode any) error {
 	models, err := decodeStringArray(raw)
 	if err != nil {
@@ -338,8 +371,9 @@ func replaceUpstreamModels(ctx context.Context, tx *sql.Tx, accountID int64, raw
 
 	selected := make(map[string]struct{}, len(models))
 	for _, model := range models {
-		selected[model] = struct{}{}
-		routeID, created, err := findOrCreateRoute(ctx, tx, model)
+		exposed := modelIdentity(model)
+		selected[exposed] = struct{}{}
+		routeID, created, err := findOrCreateRoute(ctx, tx, exposed)
 		if err != nil {
 			return err
 		}
@@ -439,14 +473,30 @@ func routeChannelIDs(ctx context.Context, db queryer, routeID, accountID int64) 
 	return ids, rows.Err()
 }
 
-// upstreamModelTarget is the name the upstream knows a model by. An empty
-// mapping target means the upstream uses the exposed name itself.
-func upstreamModelTarget(model string, mapping map[string]string) string {
-	target := strings.TrimSpace(mapping[model])
-	if target == "" {
-		return model
+// modelIdentity is the name a selected model is exposed under: the canonical
+// form of whatever spelling the upstream listed. One model serves every
+// spelling of itself from one route, which is what keeps an upstream that calls
+// it "cline-free/deepseek-v4.1-flash:free" reachable as "deepseek-v4.1-flash".
+func modelIdentity(model string) string {
+	if canonical := pattern.Canonical(model); canonical != "" {
+		return canonical
 	}
-	return target
+	return strings.TrimSpace(model)
+}
+
+// upstreamModelTarget is the name the upstream knows a model by: the mapping
+// target when the operator wrote one, and otherwise the spelling the upstream
+// itself listed, which is the name that was submitted. A target equal to the
+// exposed name is stored as written; the loader treats the two as the same and
+// the channel then sends the exposed name.
+func upstreamModelTarget(model string, mapping map[string]string) string {
+	if target := strings.TrimSpace(mapping[model]); target != "" {
+		return target
+	}
+	if target := strings.TrimSpace(mapping[modelIdentity(model)]); target != "" {
+		return target
+	}
+	return strings.TrimSpace(model)
 }
 
 // upstreamRoutingStrategy expresses the key mode with the strategy the selector
@@ -594,6 +644,126 @@ func saveManagedRoutes(ctx context.Context, tx *sql.Tx, ids map[int64]struct{}) 
 	return nil
 }
 
+/* ===== Upstream priority =====
+ *
+ * Priority is an upstream's own, and the first thing selection compares: every
+ * line of a preferred upstream is tried before any line of a lower-priority one.
+ * It belongs to the site, but the sites table is not the gateway's to extend, so
+ * it is stored in the settings table as a JSON object of site id to whole
+ * number, next to the console's other bookkeeping. A site the object does not
+ * mention has priority 0, which is what every upstream had before the console
+ * could set one. */
+
+// upstreamPriorities reads the priority stored for each upstream.
+func upstreamPriorities(ctx context.Context, db queryer) (map[int64]int, error) {
+	var value string
+	err := db.QueryRowContext(ctx, `SELECT COALESCE(value, '') FROM settings WHERE key = ?`, upstreamPrioritySetting).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return map[int64]int{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read upstream priorities: %w", err)
+	}
+	return parseUpstreamPriorities(value)
+}
+
+// upstreamPrioritiesFrom reads the priorities out of an already-loaded settings
+// map, which is how the configuration loader reaches them: it has every settings
+// row in hand before it builds the routing table.
+func upstreamPrioritiesFrom(settings map[string]string) (map[int64]int, error) {
+	return parseUpstreamPriorities(settings[upstreamPrioritySetting])
+}
+
+// parseUpstreamPriorities decodes the stored object. An entry that is not a
+// whole number, or names no site, is skipped rather than failing the load: a
+// priority is an ordering hint, and one unreadable entry must not cost the
+// gateway its whole configuration.
+func parseUpstreamPriorities(value string) (map[int64]int, error) {
+	priorities := map[int64]int{}
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || trimmed == "null" {
+		return priorities, nil
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &decoded); err != nil {
+		return nil, fmt.Errorf("parse upstream priorities: %w", err)
+	}
+	for key, entry := range decoded {
+		siteID, err := strconv.ParseInt(strings.TrimSpace(key), 10, 64)
+		if err != nil || siteID <= 0 {
+			continue
+		}
+		number, ok := entry.(float64)
+		if !ok || number != float64(int64(number)) {
+			continue
+		}
+		// A priority of 0 is the default, so it is not stored.
+		if priority := int(number); priority != 0 {
+			priorities[siteID] = priority
+		}
+	}
+	return priorities, nil
+}
+
+func saveUpstreamPriorities(ctx context.Context, tx *sql.Tx, priorities map[int64]int) error {
+	if len(priorities) == 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, upstreamPrioritySetting); err != nil {
+			return fmt.Errorf("clear upstream priorities: %w", err)
+		}
+		return nil
+	}
+	encoded, err := json.Marshal(priorities)
+	if err != nil {
+		return fmt.Errorf("encode upstream priorities: %w", err)
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO settings (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, upstreamPrioritySetting, string(encoded))
+	if err != nil {
+		return fmt.Errorf("store upstream priorities: %w", err)
+	}
+	return nil
+}
+
+// applyUpstreamPriority stores one upstream's priority. Zero is the default, so
+// it removes the entry instead of writing one.
+func applyUpstreamPriority(ctx context.Context, tx *sql.Tx, siteID int64, raw any) error {
+	priority := 0
+	if raw != nil {
+		number, err := toInt64(raw)
+		if err != nil {
+			return invalidField("priority", "a whole number is required")
+		}
+		priority = int(number)
+	}
+	priorities, err := upstreamPriorities(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if priority == 0 {
+		if _, present := priorities[siteID]; !present {
+			return nil
+		}
+		delete(priorities, siteID)
+	} else {
+		priorities[siteID] = priority
+	}
+	return saveUpstreamPriorities(ctx, tx, priorities)
+}
+
+// forgetUpstreamPriority drops a deleted upstream's priority, so a site id the
+// database later reuses does not inherit it.
+func forgetUpstreamPriority(ctx context.Context, tx *sql.Tx, siteID int64) error {
+	priorities, err := upstreamPriorities(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if _, present := priorities[siteID]; !present {
+		return nil
+	}
+	delete(priorities, siteID)
+	return saveUpstreamPriorities(ctx, tx, priorities)
+}
+
 /* ===== Read path ===== */
 
 // UpstreamKey returns the first key of a stored upstream.
@@ -631,11 +801,16 @@ func (s *SQLiteStore) UpstreamKey(ctx context.Context, id int64) (string, error)
 // decorateUpstreams fills the fields an upstream assembles from its account,
 // its keys and the routes it serves.
 func decorateUpstreams(ctx context.Context, db queryer, rows []map[string]any) error {
+	priorities, err := upstreamPriorities(ctx, db)
+	if err != nil {
+		return err
+	}
 	for _, row := range rows {
 		siteID, ok := row["id"].(int64)
 		if !ok {
 			continue
 		}
+		row["priority"] = int64(priorities[siteID])
 		accountID, err := upstreamAccountID(ctx, db, siteID)
 		if err != nil {
 			return err
@@ -789,13 +964,17 @@ func upstreamServedRoutes(ctx context.Context, db queryer, accountID int64) (map
 /* ===== Delete path ===== */
 
 // cascadeDeleteUpstream removes everything that belonged to an upstream: its
-// channels, its account and keys, and the routes that no longer serve anything.
+// channels, its account and keys, its priority, and the routes that no longer
+// serve anything.
 func cascadeDeleteUpstream(ctx context.Context, tx *sql.Tx, siteID int64) (map[string]int64, error) {
+	removed := map[string]int64{}
+	if err := forgetUpstreamPriority(ctx, tx, siteID); err != nil {
+		return nil, err
+	}
 	accounts, err := siteAccountIDs(ctx, tx, siteID)
 	if err != nil {
 		return nil, err
 	}
-	removed := map[string]int64{}
 	if len(accounts) == 0 {
 		return removed, nil
 	}

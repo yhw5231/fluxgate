@@ -647,7 +647,15 @@ func (s *SQLiteStore) loadRoutes(ctx context.Context, configuration *Configurati
 		routeIndex[route.ID] = index
 	}
 
-	channels, err := s.loadChannelRows(ctx, routes, routeIndex)
+	// An upstream's priority is what selection compares first. The console keeps
+	// it beside its other bookkeeping in the settings table, which is already
+	// read by the time routes are built.
+	priorities, err := upstreamPrioritiesFrom(configuration.Settings)
+	if err != nil {
+		return err
+	}
+
+	channels, err := s.loadChannelRows(ctx, routes, routeIndex, priorities)
 	if err != nil {
 		return err
 	}
@@ -698,7 +706,7 @@ func (s *SQLiteStore) loadRouteRows(ctx context.Context, groupSources map[int64]
 	return routes, rows.Err()
 }
 
-func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route, routeIndex map[int64]int) ([]domain.Channel, error) {
+func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route, routeIndex map[int64]int, sitePriorities map[int64]int) ([]domain.Channel, error) {
 	rows, err := s.db.QueryContext(ctx, channelQuery)
 	if err != nil {
 		return nil, fmt.Errorf("load route channels: %w", err)
@@ -744,10 +752,20 @@ func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route
 			credential = accountToken.String
 		}
 
+		// A site may name an endpoint that overrides its address for upstream
+		// requests, which is how a deployment whose management address is not the
+		// one requests have to go to says so. It is a column of the sites resource
+		// an operator can edit, so the gateway dispatches to it rather than to an
+		// address that was replaced.
+		baseURL := siteURL
+		if forced := strings.TrimSpace(forcedEndpoint.String); forced != "" {
+			baseURL = forced
+		}
+
 		channel := domain.Channel{
 			ID:                 strconv.FormatInt(channelID, 10),
 			Name:               siteName,
-			BaseURL:            siteURL,
+			BaseURL:            baseURL,
 			APIKey:             credential,
 			Priority:           priority,
 			Weight:             weight,
@@ -757,6 +775,7 @@ func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route
 			SiteID:             siteID,
 			AccountID:          accountID,
 			SiteGlobalWeight:   siteGlobalWeight,
+			SitePriority:       sitePriorities[siteID],
 			SourceModel:        resolveSourceModel(sourceModel.String, route.ModelPattern),
 		}
 		switch route.RoutingStrategy {

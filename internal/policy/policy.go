@@ -43,11 +43,15 @@ const (
 	KeyBreakerMaxCooldownSeconds  = "gateway.breaker.max_cooldown_seconds"
 	KeyBreakerCooldownMultiplier  = "gateway.breaker.cooldown_multiplier"
 
+	KeyRequestLogEnabled = "gateway.request_log.enabled"
+	KeyRequestLogKeep    = "gateway.request_log.keep"
+
 	keyPrefix                    = "gateway."
 	maxAttemptsCeiling           = 64
 	maxAttemptsPerChannelCeiling = 64
 	maxBackoffCeilingMS          = int64(10 * 60 * 1000)
 	maxCooldownCeilingSeconds    = int64(7 * 24 * 60 * 60)
+	maxRequestLogKeep            = int64(100000)
 )
 
 // Kind classifies an editable value so a console can pick a widget and the
@@ -64,9 +68,10 @@ const (
 
 // Sections group the fields the way the console presents them.
 const (
-	SectionFailover = "failover"
-	SectionRetry    = "retry"
-	SectionBreaker  = "breaker"
+	SectionFailover   = "failover"
+	SectionRetry      = "retry"
+	SectionBreaker    = "breaker"
+	SectionRequestLog = "request_log"
 )
 
 // Field describes one editable policy value.
@@ -104,14 +109,29 @@ func Fields() []Field {
 		{Key: KeyBreakerBaseCooldownSeconds, Section: SectionBreaker, Kind: KindInt, Unit: "s", Min: number(1), Max: number(float64(maxCooldownCeilingSeconds))},
 		{Key: KeyBreakerMaxCooldownSeconds, Section: SectionBreaker, Kind: KindInt, Unit: "s", Min: number(1), Max: number(float64(maxCooldownCeilingSeconds))},
 		{Key: KeyBreakerCooldownMultiplier, Section: SectionBreaker, Kind: KindFloat, Unit: "x", Min: number(1), Max: number(100)},
+
+		{Key: KeyRequestLogEnabled, Section: SectionRequestLog, Kind: KindBool},
+		{Key: KeyRequestLogKeep, Section: SectionRequestLog, Kind: KindInt, Unit: "count", Min: number(1), Max: number(float64(maxRequestLogKeep))},
 	}
 }
 
 // Policy is the complete runtime traffic policy.
 type Policy struct {
-	Retry    domain.RetryPolicy
-	Failover domain.FailoverPolicy
-	Breaker  breaker.Policy
+	Retry      domain.RetryPolicy
+	Failover   domain.FailoverPolicy
+	Breaker    breaker.Policy
+	RequestLog RequestLogPolicy
+}
+
+// RequestLogPolicy bounds the gateway's record of the requests it serves. What
+// the record holds is what explains a failure after the fact, so it is on by
+// default; a gateway that serves enough traffic for the writes to matter can
+// switch it off or shorten how far back it reaches.
+type RequestLogPolicy struct {
+	Enabled bool
+	// Keep is how many records the log holds. The newest ones are kept and the
+	// rest are dropped as new ones are written.
+	Keep int
 }
 
 // Default is the policy a gateway runs with when nothing else configures it.
@@ -137,6 +157,7 @@ func Default() Policy {
 			MaxCooldown:  defaultBreakerMaxCooldown,
 			Multiplier:   defaultCooldownMultiplier,
 		},
+		RequestLog: RequestLogPolicy{Enabled: defaultRequestLogEnabled, Keep: defaultRequestLogKeep},
 	}
 }
 
@@ -148,6 +169,8 @@ const (
 	defaultMaxAttemptsPerChannel = 2
 	defaultBreakerThreshold      = 3
 	defaultCooldownMultiplier    = 2.0
+	defaultRequestLogEnabled     = true
+	defaultRequestLogKeep        = 1000
 )
 
 var (
@@ -175,6 +198,9 @@ func (p Policy) Values() map[string]any {
 		KeyBreakerBaseCooldownSeconds: int64(p.Breaker.BaseCooldown / time.Second),
 		KeyBreakerMaxCooldownSeconds:  int64(p.Breaker.MaxCooldown / time.Second),
 		KeyBreakerCooldownMultiplier:  p.Breaker.Multiplier,
+
+		KeyRequestLogEnabled: p.RequestLog.Enabled,
+		KeyRequestLogKeep:    int64(p.RequestLog.Keep),
 	}
 }
 
@@ -271,6 +297,8 @@ func Validate(p Policy) error {
 		return ConstraintError{KeyBreakerMaxCooldownSeconds, fmt.Sprintf("must not be less than %s", KeyBreakerBaseCooldownSeconds)}
 	case p.Breaker.Multiplier < 1:
 		return ConstraintError{KeyBreakerCooldownMultiplier, "must be at least 1"}
+	case p.RequestLog.Keep < 1 || p.RequestLog.Keep > int(maxRequestLogKeep):
+		return ConstraintError{KeyRequestLogKeep, fmt.Sprintf("must be between 1 and %d", maxRequestLogKeep)}
 	case !validBreakerMode(p.Breaker.Mode):
 		return ConstraintError{KeyBreakerMode, "must be one of " + strings.Join(fieldChoices(KeyBreakerMode), ", ")}
 	}
@@ -476,6 +504,18 @@ func setValue(current Policy, key, text string) (Policy, error) {
 			return current, err
 		}
 		next.Breaker.Multiplier = multiplier
+	case KeyRequestLogEnabled:
+		flag, err := strconv.ParseBool(text)
+		if err != nil {
+			return current, err
+		}
+		next.RequestLog.Enabled = flag
+	case KeyRequestLogKeep:
+		number, err := strconv.Atoi(text)
+		if err != nil {
+			return current, err
+		}
+		next.RequestLog.Keep = number
 	default:
 		return current, fmt.Errorf("unknown policy setting %q", key)
 	}

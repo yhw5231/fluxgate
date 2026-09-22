@@ -298,8 +298,11 @@ func TestEngineWithoutFailoverRetriesTheSameChannel(t *testing.T) {
 
 	engine := &Engine{
 		Selector: router.NewMemorySelector(routeFor(nil,
-			domain.Channel{ID: "first", Enabled: true, Weight: 10, BaseURL: first.URL, APIKey: "first-key"},
-			domain.Channel{ID: "second", Enabled: true, Weight: 10, BaseURL: second.URL, APIKey: "second-key"},
+			// The failing line is the preferred one, so which line the request
+			// starts on is decided by priority rather than by the draw between
+			// lines of one priority.
+			domain.Channel{ID: "first", Enabled: true, Weight: 10, Priority: 20, BaseURL: first.URL, APIKey: "first-key"},
+			domain.Channel{ID: "second", Enabled: true, Weight: 10, Priority: 10, BaseURL: second.URL, APIKey: "second-key"},
 		)),
 		Policy: domain.RetryPolicy{
 			MaxAttempts:           4,
@@ -333,7 +336,9 @@ func TestEngineCrossUpstreamFailoverCanBeLimitedToOneUpstream(t *testing.T) {
 
 	engine := &Engine{
 		Selector: router.NewMemorySelector(routeFor(nil,
-			domain.Channel{ID: "first", Enabled: true, Weight: 10, SiteID: 1, BaseURL: first.URL, APIKey: "first-key"},
+			// Site 1 is the preferred upstream, so the request always starts on
+			// the failing line rather than on whichever site was drawn.
+			domain.Channel{ID: "first", Enabled: true, Weight: 10, SiteID: 1, SitePriority: 10, BaseURL: first.URL, APIKey: "first-key"},
 			domain.Channel{ID: "other", Enabled: true, Weight: 10, SiteID: 2, BaseURL: other.URL, APIKey: "other-key"},
 		)),
 		Policy: domain.RetryPolicy{

@@ -653,6 +653,78 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   transform: translateY(-1px);
 }
 
+/* ===== 客户端密钥的显示与复制 =====
+   密钥平时只显示掩码；「显示」读回明文后要一眼看出来这是明文，所以给它一个
+   底色。复制用一个离屏字段兜底：明文 HTTP 下浏览器没有 navigator.clipboard。 */
+
+.key-revealed {
+  color: var(--text-primary);
+  background: rgba(56, 189, 248, 0.12);
+  border: 1px solid var(--border-accent);
+  border-radius: 4px;
+  padding: 1px 6px;
+  word-break: break-all;
+}
+
+.clipboard-proxy {
+  position: fixed;
+  top: 0;
+  left: -9999px;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+/* ===== 请求记录 =====
+   记录页先给结论（结果、模型、线路、耗时），点开一行才是每次尝试的明细。
+   上游返回的原文可能很长，所以它在单元格里截断显示，完整内容放在 title 上。 */
+
+.panel-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 0 20px 14px;
+}
+
+.panel-toolbar .filter-input { min-width: 160px; flex: 0 1 240px; }
+
+/* 「只看失败」是一个开关，按下状态要和普通按钮分得开。 */
+#requests-failed.is-active {
+  color: var(--accent);
+  border-color: var(--border-accent);
+  background: var(--accent-soft);
+}
+
+.detail-panel { padding: 12px 16px 14px; }
+
+.detail-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  padding: 0 2px 10px;
+}
+
+.detail-fact {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.detail-fact-label { color: var(--text-faint); font-size: 11.5px; }
+
+.request-note,
+.request-response {
+  display: inline-block;
+  max-width: 460px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
 /* ===== Filter input ===== */
 .filter-input {
   padding: 7px 12px;
@@ -930,6 +1002,75 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 .data-table th.actions,
 .data-table td.actions { text-align: right; white-space: nowrap; width: 1%; }
 
+/* ===== 可展开的行 =====
+ * 折叠时是结论（模型、几个上游、几条线路、当前状态），点开后是线路本身。
+ * 展开的行在自动刷新重画后保持展开，因为展开状态存在脚本里而不是 DOM 上。 */
+.data-table tbody tr.row-expandable { cursor: pointer; }
+.data-table tbody tr.row-expandable.is-expanded { background: rgba(56, 189, 248, 0.06); }
+.data-table tbody tr.row-expandable.is-expanded:hover { background: rgba(56, 189, 248, 0.09); }
+.data-table th.toggle-cell,
+.data-table td.toggle-cell { width: 1%; white-space: nowrap; padding-right: 0; }
+
+.caret {
+  display: inline-block;
+  width: 15px;
+  color: var(--text-faint);
+  font-size: 13px;
+  line-height: 1;
+}
+.caret.is-open { color: var(--accent); }
+
+/* 展开出来的线路表：不再重复外层表格的边框和表头样式，读起来像是这个模型的一
+ * 部分，而不是另一张表。 */
+.data-table tbody tr.detail-row > td { padding: 0; background: rgba(2, 6, 15, 0.35); }
+.data-table tbody tr.detail-row:hover > td { background: rgba(2, 6, 15, 0.35); }
+.detail-body { padding: 12px 16px 14px; }
+.detail-note { margin: 0 0 8px; font-size: 11.5px; line-height: 1.6; color: var(--text-faint); }
+.detail-table { width: 100%; border-collapse: collapse; }
+.detail-table thead th {
+  padding: 6px 12px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  text-align: left;
+  border-bottom: 1px solid var(--border-soft);
+  white-space: nowrap;
+}
+.detail-table thead th.num { text-align: right; }
+.detail-table tbody td {
+  padding: 8px 12px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  border-bottom: 1px solid rgba(148, 163, 184, 0.06);
+  vertical-align: middle;
+}
+.detail-table tbody tr:last-child td { border-bottom: none; }
+.detail-table tbody td.num { text-align: right; font-family: var(--font-mono); }
+.detail-table td.detail-empty { color: var(--text-faint); }
+.detail-table td.cd { font-family: var(--font-mono); font-size: 11.5px; color: var(--warning); white-space: nowrap; }
+.detail-table td.actions { text-align: right; white-space: nowrap; width: 1%; }
+.status-note { margin-left: 6px; font-size: 11px; color: var(--text-faint); }
+
+/* ===== 就地改权重 ===== */
+.weight-field { display: inline-flex; align-items: center; gap: 6px; justify-content: flex-end; }
+.weight-input {
+  width: 76px;
+  padding: 5px 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-align: right;
+}
+.weight-field.is-invalid .weight-input {
+  border-color: rgba(248, 113, 113, 0.55);
+  box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.12);
+}
+.weight-save { visibility: hidden; }
+.weight-field.is-dirty .weight-save { visibility: visible; }
+.weight-field:focus-within .weight-save { visibility: visible; }
+
 .btn-small { padding: 5px 10px; font-size: 12px; }
 .btn-danger { background: rgba(248, 113, 113, 0.16); border-color: rgba(248, 113, 113, 0.4); color: #fecaca; }
 .btn-danger:hover:not(:disabled) { background: rgba(248, 113, 113, 0.24); }
@@ -1080,6 +1221,14 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   font-size: 11.5px;
   color: var(--text-faint);
   white-space: nowrap;
+}
+
+/* 上游自己的模型写法，跟在暴露的模型名后面：两者不同时 operator 才知道勾选的
+ * 模型被记成了哪个名字。 */
+.model-listed {
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--text-faint);
 }
 
 .model-line .model-target { padding: 5px 8px; font-size: 12px; }

@@ -126,3 +126,60 @@ func TestAllowsModelIgnoresEmptyPolicy(t *testing.T) {
 		t.Fatal("an unrestricted policy rejected a model")
 	}
 }
+
+// A mapping written for one spelling of a model answers for the others, so an
+// operator who wrote the mapping once does not have to write it per channel.
+func TestModelMappingResolveMatchesEverySpellingOfTheModel(t *testing.T) {
+	mapping := ModelMapping{{Pattern: "deepseek-v4.1-flash", Target: "cline-free/deepseek-v4.1-flash:free"}}
+
+	for _, requested := range []string{
+		"deepseek-v4.1-flash",
+		"DeepSeek-V4.1-Flash",
+		"cline-free/deepseek-v4.1-flash:free",
+	} {
+		if got := mapping.Resolve(requested); got != "cline-free/deepseek-v4.1-flash:free" {
+			t.Errorf("Resolve(%q) = %q, want the mapped target", requested, got)
+		}
+	}
+	if got := mapping.Resolve("deepseek-v4.1-pro"); got != "deepseek-v4.1-pro" {
+		t.Errorf("Resolve(%q) = %q, want the requested name when nothing maps", "deepseek-v4.1-pro", got)
+	}
+}
+
+// A restriction written for the plain model name covers the decorated spellings
+// of it, or a key could reach a denied model by asking for a channel's own name
+// for it.
+func TestDeniedModelPatternsCoverEverySpelling(t *testing.T) {
+	policy := RoutingPolicy{DeniedModelPatterns: []string{"deepseek-v4.1-flash"}}
+
+	for _, model := range []string{
+		"deepseek-v4.1-flash",
+		"DeepSeek-V4.1-Flash",
+		"cline-free/deepseek-v4.1-flash:free",
+	} {
+		if !policy.DeniesModel(model) {
+			t.Errorf("DeniesModel(%q) = false, want the denied model refused", model)
+		}
+	}
+	if policy.DeniesModel("deepseek-v4.1-pro") {
+		t.Error("DeniesModel() refused a model the policy does not deny")
+	}
+}
+
+// A key scoped to a route reaches that route under every spelling of the model
+// the route exposes.
+func TestAllowsModelAcceptsEverySpellingOfAnAllowedRoute(t *testing.T) {
+	routes := []Route{{
+		ID:           9,
+		ModelPattern: "deepseek-v4.1-flash",
+		Mode:         RouteModePattern,
+		Enabled:      true,
+	}}
+	policy := RoutingPolicy{AllowedRouteIDs: []int64{9}}
+
+	for _, model := range []string{"deepseek-v4.1-flash", "DeepSeek-V4.1-Flash", "cline-free/deepseek-v4.1-flash:free"} {
+		if !AllowsModel(routes, policy, model) {
+			t.Errorf("AllowsModel(%q) = false, want the allowed route's model permitted", model)
+		}
+	}
+}

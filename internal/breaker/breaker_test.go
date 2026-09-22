@@ -1,6 +1,7 @@
 package breaker
 
 import (
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -248,5 +249,115 @@ func TestMemoryStoreConcurrentUpdates(t *testing.T) {
 	}
 	if state.ConsecutiveFailures != workers {
 		t.Fatalf("concurrent updates = %d, want %d", state.ConsecutiveFailures, workers)
+	}
+}
+
+// A management view has to name the circuit a line runs under to say whether it
+// is blocked, and the circuit a channel's failures are filed in is derived from
+// the mode it runs in.
+func TestScopeForModeNamesTheCircuitAChannelFileAndKeyShare(t *testing.T) {
+	cases := []struct {
+		name     string
+		mode     string
+		fallback Mode
+		want     Scope
+	}{
+		{name: "channel circuit", mode: string(ModeCooldown), fallback: ModeKeyCooldown, want: Scope{ChannelID: "7"}},
+		{name: "disable is channel scoped", mode: string(ModeDisable), fallback: ModeCooldown, want: Scope{ChannelID: "7"}},
+		{name: "shared key circuit", mode: string(ModeKeyCooldown), fallback: ModeCooldown, want: Scope{KeyID: "sk-key"}},
+		{name: "per model circuit", mode: string(ModeKeyModelCooldown), fallback: ModeCooldown, want: Scope{KeyID: "sk-key", Model: "gpt-4o"}},
+		{name: "a channel without a mode runs in the process mode", mode: "", fallback: ModeKeyCooldown, want: Scope{KeyID: "sk-key"}},
+		{name: "an unknown mode falls back too", mode: "nonsense", fallback: ModeKeyModelCooldown, want: Scope{KeyID: "sk-key", Model: "gpt-4o"}},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := ScopeForMode(testCase.mode, testCase.fallback, "7", "sk-key", "gpt-4o")
+			if got != testCase.want {
+				t.Errorf("ScopeForMode() = %+v, want %+v", got, testCase.want)
+			}
+		})
+	}
+}
+
+// A request that keeps failing on the same line trips the threshold once. The
+// attempts it makes after that are the retry loop's business, not the circuit's:
+// counting them would let one request that never succeeded walk a threshold of
+// three up three cooldown levels and hold the line out of rotation far longer
+// than the operator asked for.
+func TestBreakerCountsOneFailurePerRequest(t *testing.T) {
+	now := time.Date(2026, time.September, 18, 12, 0, 0, 0, time.UTC)
+	circuit := &Breaker{
+		Policy: Policy{
+			Mode:         ModeCooldown,
+			Threshold:    3,
+			BaseCooldown: 30 * time.Second,
+			MaxCooldown:  15 * time.Minute,
+		},
+		Store: NewMemoryStore(),
+		Now:   func() time.Time { return now },
+	}
+	channel := domain.Channel{ID: "channel-a", APIKey: "key-a"}
+
+	failure := retryableFailure(channel.ID, channel.APIKey, "model-a")
+	failure.Attempt.RequestID = "req-1"
+	for attempt := 0; attempt < 8; attempt++ {
+		circuit.RecordFailure(failure)
+	}
+	if circuit.IsBlocked(channel, "model-a") {
+		t.Fatal("one request tripped the circuit on its own")
+	}
+	state, _ := circuit.Store.Load(Scope{ChannelID: channel.ID})
+	if state.ConsecutiveFailures != 1 {
+		t.Fatalf("recorded failures = %d, want 1 for one request", state.ConsecutiveFailures)
+	}
+
+	// Three requests that each fail on the line are what the threshold counts.
+	for request := 2; request <= 3; request++ {
+		next := failure
+		next.Attempt.RequestID = "req-" + strconv.Itoa(request)
+		circuit.RecordFailure(next)
+	}
+	if !circuit.IsBlocked(channel, "model-a") {
+		t.Fatal("three failing requests did not trip the circuit")
+	}
+	state, _ = circuit.Store.Load(Scope{ChannelID: channel.ID})
+	if state.CooldownLevel != 1 {
+		t.Errorf("cooldown level = %d, want the first level", state.CooldownLevel)
+	}
+}
+
+// Two lines failing for one request are two failures: the request is the unit the
+// threshold counts in, and every line it could not use is one of them.
+func TestBreakerCountsEachLineARequestFailedOn(t *testing.T) {
+	now := time.Date(2026, time.September, 18, 12, 0, 0, 0, time.UTC)
+	circuit := &Breaker{
+		Policy: Policy{Mode: ModeCooldown, Threshold: 1, BaseCooldown: time.Minute, MaxCooldown: time.Minute},
+		Store:  NewMemoryStore(),
+		Now:    func() time.Time { return now },
+	}
+	for _, channelID := range []string{"channel-a", "channel-b"} {
+		failure := retryableFailure(channelID, "key-a", "model-a")
+		failure.Attempt.RequestID = "req-1"
+		circuit.RecordFailure(failure)
+	}
+	for _, channelID := range []string{"channel-a", "channel-b"} {
+		if !circuit.IsBlocked(domain.Channel{ID: channelID, APIKey: "key-a"}, "model-a") {
+			t.Errorf("line %s was not blocked by the request that failed on it", channelID)
+		}
+	}
+}
+
+// A request without an identity is counted on its own, which is what a caller
+// that does not identify its requests gets: the threshold then counts attempts.
+func TestBreakerCountsUnidentifiedFailuresSeparately(t *testing.T) {
+	now := time.Date(2026, time.September, 18, 12, 0, 0, 0, time.UTC)
+	circuit := newTestBreaker(ModeCooldown, &now)
+	failure := retryableFailure("channel-a", "key-a", "model-a")
+
+	circuit.RecordFailure(failure)
+	circuit.RecordFailure(failure)
+	if !circuit.IsBlocked(domain.Channel{ID: "channel-a", APIKey: "key-a"}, "model-a") {
+		t.Fatal("unidentified failures were deduplicated, want each one counted")
 	}
 }

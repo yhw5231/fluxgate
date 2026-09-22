@@ -34,6 +34,50 @@ func IsExact(pat string) bool {
 	return !strings.ContainsAny(trimmed, "*?")
 }
 
+// Canonical reduces a model name to the identity that every spelling of it
+// shares. One model is routinely written several ways: a listing may call it
+// "cline-free/deepseek-v4.1-flash:free" while a client asks for
+// "DeepSeek-V4.1-Flash". The channel path before the last "/", the variant
+// suffix after the last ":" and a trailing "-free" name a channel's own
+// arrangement of the model rather than a different model, so dropping them makes
+// the spellings compare equal.
+//
+// An empty result means the value carried nothing else, which a caller should
+// treat as no model name at all rather than as one that matches everything.
+func Canonical(value string) string {
+	name := strings.ToLower(strings.TrimSpace(value))
+	if index := strings.LastIndex(name, "/"); index >= 0 {
+		name = name[index+1:]
+	}
+	if index := strings.LastIndex(name, ":"); index >= 0 {
+		name = name[:index]
+	}
+	return strings.TrimSuffix(name, "-free")
+}
+
+// Equivalent reports whether two names are two spellings of one model: equal
+// after Canonical. Two values that canonicalize to nothing are never equivalent.
+func Equivalent(left, right string) bool {
+	canonical := Canonical(left)
+	return canonical != "" && canonical == Canonical(right)
+}
+
+// MatchName reports whether a requested model satisfies a pattern, testing the
+// name as it was sent and then the name with its channel decorations removed, so
+// "cline-free/deepseek-v4.1-flash:free" reaches a route or a policy written for
+// "deepseek-v4.1-flash". A regex is matched against the name as sent only: it is
+// written against what the client spells out.
+func MatchName(model, pat string) bool {
+	if Match(model, pat) {
+		return true
+	}
+	if IsRegex(pat) {
+		return false
+	}
+	canonical := Canonical(model)
+	return canonical != "" && canonical != Normalize(model) && Match(canonical, pat)
+}
+
 // Match reports whether a model name satisfies a pattern. An empty or invalid
 // pattern never matches.
 func Match(model, pat string) bool {

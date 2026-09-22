@@ -467,3 +467,120 @@ func TestUpstreamEditClearsTheCircuitsOfReplacedChannels(t *testing.T) {
 		t.Errorf("breaker states after the lines were replaced = %d, want none", count)
 	}
 }
+
+// Priority is what selection compares first, and it travels with the upstream
+// rather than with any one line, so a key mode that orders an upstream's keys
+// cannot lift them past a preferred upstream.
+func TestUpstreamPriorityIsStoredAndLoadedOntoItsLines(t *testing.T) {
+	store := prepareUpstreamStore(t)
+	row := createUpstream(t, store, map[string]any{
+		"name":     "Preferred",
+		"url":      "https://api.example.com",
+		"priority": 7,
+		"keys":     []any{"key"},
+		"models":   []any{"gpt-4.1"},
+	})
+	if row["priority"] != int64(7) {
+		t.Fatalf("priority = %#v, want 7", row["priority"])
+	}
+	siteID := row["id"].(int64)
+
+	loaded, err := store.LoadConfiguration(context.Background())
+	if err != nil {
+		t.Fatalf("LoadConfiguration() error = %v", err)
+	}
+	if len(loaded.Channels) != 1 {
+		t.Fatalf("loaded %d channels, want 1", len(loaded.Channels))
+	}
+	if got := loaded.Channels[0].SitePriority; got != 7 {
+		t.Fatalf("loaded channel SitePriority = %d, want 7", got)
+	}
+
+	// An upstream nobody gave a priority to sits at the default, which is what
+	// every upstream had before the console could set one.
+	plain := createUpstream(t, store, map[string]any{
+		"name": "Plain", "url": "https://api.other.com", "keys": []any{"key"}, "models": []any{"gpt-4.1"},
+	})
+	if plain["priority"] != int64(0) {
+		t.Fatalf("priority = %#v, want 0 by default", plain["priority"])
+	}
+
+	// Clearing it puts the upstream back at the default rather than storing 0.
+	updated, err := store.UpdateResource(context.Background(), "upstreams", siteID, map[string]any{"priority": 0})
+	if err != nil {
+		t.Fatalf("UpdateResource(priority) error = %v", err)
+	}
+	if updated["priority"] != int64(0) {
+		t.Fatalf("priority = %#v, want 0 after clearing", updated["priority"])
+	}
+	stored, err := store.LoadSettings(context.Background())
+	if err != nil {
+		t.Fatalf("LoadSettings() error = %v", err)
+	}
+	if value := stored[upstreamPrioritySetting]; value != "" && value != "{}" {
+		t.Fatalf("stored priorities = %q, want the cleared upstream left out", value)
+	}
+
+	// Deleting the upstream forgets its priority, so a reused site id cannot
+	// inherit it.
+	if _, err := store.UpdateResource(context.Background(), "upstreams", siteID, map[string]any{"priority": 3}); err != nil {
+		t.Fatalf("UpdateResource(priority) error = %v", err)
+	}
+	if _, err := store.DeleteResource(context.Background(), "upstreams", siteID); err != nil {
+		t.Fatalf("DeleteResource(upstreams) error = %v", err)
+	}
+	priorities, err := upstreamPriorities(context.Background(), store.db)
+	if err != nil {
+		t.Fatalf("upstreamPriorities() error = %v", err)
+	}
+	if _, present := priorities[siteID]; present {
+		t.Fatalf("priorities = %v, want the deleted upstream forgotten", priorities)
+	}
+}
+
+// A model is exposed under its canonical name while the upstream keeps the
+// spelling it listed, so two upstreams that call one model different things meet
+// on one route.
+func TestUpstreamExposesTheCanonicalModelName(t *testing.T) {
+	store := prepareUpstreamStore(t)
+	first := createUpstream(t, store, map[string]any{
+		"name": "OpenRouter-like", "url": "https://api.one.example.com",
+		"keys": []any{"key"}, "models": []any{"cline-free/deepseek-v4.1-flash:free"},
+	})
+	second := createUpstream(t, store, map[string]any{
+		"name": "Direct", "url": "https://api.two.example.com",
+		"keys": []any{"key"}, "models": []any{"DeepSeek-V4.1-Flash"},
+	})
+
+	models := stringsOf(t, first["models"])
+	if len(models) != 1 || models[0] != "deepseek-v4.1-flash" {
+		t.Fatalf("models = %v, want the canonical name", models)
+	}
+	if got := stringsOf(t, second["models"]); len(got) != 1 || got[0] != "deepseek-v4.1-flash" {
+		t.Fatalf("models = %v, want both upstreams on the same exposed name", got)
+	}
+
+	// One route for the model, carrying a line per upstream.
+	routes := rowsOf(t, store, "routes")
+	if len(routes) != 1 {
+		t.Fatalf("routes = %v, want one route for one model", routes)
+	}
+	routeID := routes[0]["id"].(int64)
+	channels := 0
+	sources := map[string]bool{}
+	for _, channel := range rowsOf(t, store, "channels") {
+		if channel["route_id"] != routeID {
+			continue
+		}
+		channels++
+		sources[channel["source_model"].(string)] = true
+	}
+	if channels != 2 {
+		t.Fatalf("route has %d lines, want one per upstream", channels)
+	}
+	// Each line keeps the name its own upstream listed, which is what the
+	// gateway forwards to it.
+	if !sources["cline-free/deepseek-v4.1-flash:free"] || !sources["DeepSeek-V4.1-Flash"] {
+		t.Fatalf("line source models = %v, want each upstream's own spelling", sources)
+	}
+}

@@ -11,17 +11,29 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/yhw5231/fluxgate/internal/domain"
 	"github.com/yhw5231/fluxgate/internal/transform"
 )
 
-const maxBufferedErrorBody = int64(1 << 20)
+const (
+	maxBufferedErrorBody = int64(1 << 20)
+	// errorSnippetBytes bounds how much of a failed upstream response is kept as
+	// the explanation of the failure. An upstream names its cause in the first few
+	// hundred bytes; keeping more would only fill the request log with text nobody
+	// reads.
+	errorSnippetBytes = 512
+)
 
 // Result contains the final upstream response and the successful attempt.
 type Result struct {
 	Response *http.Response
 	Attempt  domain.Attempt
+	// Trace lists every upstream attempt the request made, in order, including the
+	// attempts that failed. It is filled in on the error path as well, so a caller
+	// can record what happened to a request that could not be served.
+	Trace domain.RequestTrace
 }
 
 // DispatchPolicy is everything the engine consults while a request is being
@@ -101,6 +113,9 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 	excluded := make(map[string]struct{})
 	attemptsByChannel := make(map[string]int)
 	var lastFailure domain.Failure
+	// trace is what the request log keeps: every attempt this request made, in
+	// order, whichever way the request ends.
+	var trace domain.RequestTrace
 	// pinned records the channel the request started on, which is what a request
 	// with failover switched off, or with cross-upstream failover switched off,
 	// has to stay with.
@@ -110,9 +125,9 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 		selection, err := e.Selector.Select(e.selectionRequest(input, excluded, pinned, policy.Failover))
 		if err != nil {
 			if lastFailure.Err != nil || lastFailure.StatusCode != 0 {
-				return Result{}, finalError(lastFailure)
+				return Result{Trace: trace}, finalError(lastFailure)
 			}
-			return Result{}, err
+			return Result{Trace: trace}, err
 		}
 		if pinned.Channel.ID == "" {
 			pinned = selection
@@ -129,15 +144,23 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 			Model:        selection.Model,
 			BreakerMode:  channel.BreakerMode,
 			StartedAt:    now(),
+			RequestID:    input.RequestID,
+		}
+		traced := domain.AttemptTrace{
+			Number:      attemptNumber,
+			ChannelID:   channel.ID,
+			ChannelName: channel.Name,
+			Model:       selection.Model,
+			StartedAt:   attempt.StartedAt,
 		}
 
 		body, err := transform.ApplyJSON(input.Body, selection.Model, channel.Transform)
 		if err != nil {
-			return Result{}, err
+			return Result{Trace: trace}, err
 		}
 		request, cancelRequest, err := buildRequest(ctx, input, channel, body)
 		if err != nil {
-			return Result{}, err
+			return Result{Trace: trace}, err
 		}
 
 		dispatchClient := client
@@ -145,7 +168,7 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 			resolved, resolveErr := e.ProxyResolver.Resolve(ProxyRequest{KeyID: channel.APIKey, TargetURL: request.URL})
 			if resolveErr != nil {
 				cancelRequest()
-				return Result{}, resolveErr
+				return Result{Trace: trace}, resolveErr
 			}
 			pool := e.TransportPool
 			if pool == nil {
@@ -154,7 +177,7 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 			dispatchClient, err = pool.Client(resolved)
 			if err != nil {
 				cancelRequest()
-				return Result{}, err
+				return Result{Trace: trace}, err
 			}
 		}
 
@@ -164,11 +187,14 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 		} else {
 			cancelRequest()
 		}
+		traced.DurationMS = now().Sub(attempt.StartedAt).Milliseconds()
 		if dispatchErr == nil && response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
+			traced.StatusCode = response.StatusCode
+			trace.Attempts = append(trace.Attempts, traced)
 			if e.Observer != nil {
 				e.Observer.RecordSuccess(attempt)
 			}
-			return Result{Response: response, Attempt: attempt}, nil
+			return Result{Response: response, Attempt: attempt, Trace: trace}, nil
 		}
 
 		statusCode := 0
@@ -186,8 +212,20 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 			e.Observer.RecordFailure(lastFailure)
 		}
 
+		traced.StatusCode = statusCode
+		traced.Retryable = retryable
+		if dispatchErr != nil {
+			traced.Error = dispatchErr.Error()
+		}
+		// The upstream's own words are the explanation of the failure, so they are
+		// read before the response is either passed on or dropped.
+		if response != nil && statusCode >= http.StatusBadRequest {
+			traced.Response = recordErrorBody(response, channel.APIKey)
+		}
+		trace.Attempts = append(trace.Attempts, traced)
+
 		if !retryable {
-			return Result{Response: response, Attempt: attempt}, nil
+			return Result{Response: response, Attempt: attempt, Trace: trace}, nil
 		}
 		if response != nil {
 			drainAndClose(response.Body)
@@ -201,11 +239,11 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 			break
 		}
 		if err := sleep(ctx, backoff(retry, attemptNumber)); err != nil {
-			return Result{}, err
+			return Result{Trace: trace}, err
 		}
 	}
 
-	return Result{}, finalError(lastFailure)
+	return Result{Trace: trace}, finalError(lastFailure)
 }
 
 // selectionRequest builds one lookup, restricted to the channel or the upstream
@@ -233,11 +271,7 @@ func buildRequest(ctx context.Context, input domain.Request, channel domain.Chan
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse channel base URL: %w", err)
 	}
-	pathURL, err := url.Parse("/" + strings.TrimLeft(input.Path, "/"))
-	if err != nil {
-		return nil, nil, fmt.Errorf("parse upstream path: %w", err)
-	}
-	target := baseURL.ResolveReference(pathURL)
+	target := upstreamTarget(baseURL, input.Path)
 
 	requestContext := ctx
 	cancel := func() {}
@@ -254,6 +288,35 @@ func buildRequest(ctx context.Context, input domain.Request, channel domain.Chan
 		return io.NopCloser(bytes.NewReader(body)), nil
 	}
 	return request, cancel, nil
+}
+
+// upstreamTarget resolves the path of one downstream request against a channel's
+// base address.
+//
+// The base address is the upstream's API root — the value an OpenAI client would
+// be configured with, such as "https://host/v1", or "https://host/openai/v1" for
+// an upstream mounted under a sub-path. That path is part of where the request
+// has to go and is never dropped: a site whose API lives under /openai must not
+// be called at its host root.
+//
+// The gateway's own routes carry the version segment, so the base address
+// supplies it once: a request for /v1/chat/completions reaches
+// "<base path>/chat/completions". A base address without a path keeps the
+// request path as it arrived, because the upstream schema itself stores a site
+// as a bare host and the version segment is then the only thing naming the API.
+func upstreamTarget(baseURL *url.URL, requestPath string) *url.URL {
+	requested := "/" + strings.TrimLeft(requestPath, "/")
+	target := *baseURL
+	basePath := strings.TrimRight(target.Path, "/")
+	if basePath == "" {
+		target.Path = requested
+	} else {
+		target.Path = basePath + strings.TrimPrefix(requested, "/v1")
+	}
+	// The path is rebuilt from decoded segments, so a stale escape of the base
+	// address would describe a path this URL no longer has.
+	target.RawPath = ""
+	return &target
 }
 
 func normalizePolicy(policy domain.RetryPolicy) domain.RetryPolicy {
@@ -317,6 +380,74 @@ func (body *cancelReadCloser) Close() error {
 	err := body.ReadCloser.Close()
 	body.cancel()
 	return err
+}
+
+// prefixedBody re-emits bytes that were read ahead and put back, so a response
+// whose beginning was read for the request log still reaches the client whole.
+type prefixedBody struct {
+	io.Reader
+	io.Closer
+}
+
+// recordErrorBody reads the beginning of a failed upstream response for the
+// request log and puts it back, so the upstream's own explanation of the failure
+// can be recorded while the response still reaches the client unchanged. The
+// response's body is replaced by one that yields the same bytes.
+//
+// The credential the attempt presented is redacted from the text: an upstream
+// that echoes the key it rejected would otherwise put it into the record, and
+// into the error the client is answered with.
+func recordErrorBody(response *http.Response, credential string) string {
+	original := response.Body
+	if original == nil {
+		return ""
+	}
+	prefix := make([]byte, errorSnippetBytes)
+	count, _ := io.ReadFull(original, prefix)
+	prefix = prefix[:count]
+	if count == 0 {
+		return ""
+	}
+	response.Body = &prefixedBody{
+		Reader: io.MultiReader(bytes.NewReader(prefix), original),
+		Closer: original,
+	}
+	snippet := sanitizeSnippet(prefix)
+	if key := strings.TrimSpace(credential); key != "" {
+		snippet = strings.ReplaceAll(snippet, key, "[redacted]")
+	}
+	return snippet
+}
+
+// sanitizeSnippet renders the beginning of an upstream body as text a record can
+// hold: whitespace runs collapse to one space, so a JSON error stays on one line,
+// and anything that is not printable text is replaced, so a compressed or binary
+// body cannot put control characters into the log. A body with nothing readable
+// in it at all is dropped rather than recorded as a row of replacement
+// characters.
+func sanitizeSnippet(raw []byte) string {
+	decoded := strings.ToValidUTF8(string(raw), "\uFFFD")
+	builder := strings.Builder{}
+	builder.Grow(len(decoded))
+	spaced := false
+	for _, character := range decoded {
+		if unicode.IsSpace(character) || character < 0x20 || character == 0x7f {
+			spaced = true
+			continue
+		}
+		if spaced && builder.Len() > 0 {
+			builder.WriteRune(' ')
+		}
+		spaced = false
+		builder.WriteRune(character)
+	}
+	text := builder.String()
+	for _, character := range text {
+		if character != '\uFFFD' && unicode.IsGraphic(character) {
+			return text
+		}
+	}
+	return ""
 }
 
 func drainAndClose(body io.ReadCloser) {

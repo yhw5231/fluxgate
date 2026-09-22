@@ -28,6 +28,11 @@ func ApplyHeaders(source http.Header, rules domain.TransformRules, apiKey string
 	}
 	result.Del("Host")
 	result.Del("Content-Length")
+	// Accept-Encoding is not forwarded. Go's transport asks for gzip itself and
+	// decompresses what it asked for, while a client's own value would hand the
+	// gateway a body it cannot read: an upstream error, the text that explains a
+	// failure, would reach the request log as compressed bytes.
+	result.Del("Accept-Encoding")
 	if strings.TrimSpace(apiKey) != "" {
 		result.Set("Authorization", "Bearer "+strings.TrimSpace(apiKey))
 	}

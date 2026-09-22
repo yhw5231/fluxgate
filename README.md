@@ -1,6 +1,6 @@
 # Fluxgate
 
-Fluxgate is a lightweight, independently deployable Go gateway that reads the existing upstream SQLite configuration and provides OpenAI-compatible proxy endpoints, bounded server-side retries, weighted routing, proxy selection, and persistent circuit-breaker state. It ships with an embedded management console that both shows the running state and edits that configuration: upstreams with their keys and models, the routing the gateway derives from them, client keys, proxy profiles, and the retry, failover, and circuit-breaker policy the gateway applies while it runs.
+Fluxgate is a lightweight, independently deployable Go gateway that reads the existing upstream SQLite configuration and provides OpenAI-compatible proxy endpoints, bounded server-side retries, priority-then-weight routing, proxy selection, and persistent circuit-breaker state. It ships with an embedded management console that both shows the running state and edits that configuration: upstreams with their priorities, weights, keys and models, the routing the gateway derives from them, client keys, proxy profiles, and the retry, failover, and circuit-breaker policy the gateway applies while it runs.
 
 ## Requirements
 
@@ -293,7 +293,8 @@ The management console is a self-contained, embedded web UI served directly by t
 gateway binary. It requires no separate build step, static file directory, or Node
 runtime. Open it in a browser, sign in with the administrator account, and the
 dashboard shows gateway readiness and uptime, circuit-breaker state, upstream
-channels, and routable models, refreshing itself every ten seconds. The interface is
+lines, routable models, and the record of the requests it served, refreshing itself
+every ten seconds. The interface is
 in Simplified Chinese; the endpoints it calls are unchanged, and the gateway's own
 error codes stay stable for automation while the console renders them in Chinese.
 
@@ -301,16 +302,33 @@ error codes stay stable for automation while the console renders them in Chinese
 
 The console is also where the configuration is edited. Its main view is 上游
 (upstreams): one row per upstream service, holding everything that upstream needs
-— a name, an API address, a weight, request headers, an optional proxy, its keys,
-and the models it serves. Adding an upstream and picking its models is all it takes
-to route them; the routes appear by themselves. Every accepted write reloads the
-configuration and hands the result to the routing engine, so an upstream added in
-the console serves traffic on the next request.
+— a name, an API address, a priority, a weight, request headers, an optional
+proxy, its keys, and the models it serves. Adding an upstream and picking its
+models is all it takes to route them; the routes appear by themselves. Every
+accepted write reloads the configuration and hands the result to the routing
+engine, so an upstream added in the console serves traffic on the next request.
 
 The views are 概览 (the live dashboard), 上游 (upstreams), 路由 (the routing table
-the gateway derived, shown read-only), 客户端密钥 (client keys), and 设置. The
-settings view is grouped by function and shows one group at a time: 账号 (the
-administrator account), 运行策略 (the runtime policy), and 代理 (proxy profiles).
+the gateway derived), 客户端密钥 (client keys), and 设置. The settings view is
+grouped by function and shows one group at a time: 账号 (the administrator
+account), 运行策略 (the runtime policy), and 代理 (proxy profiles).
+
+The 路由 view answers one question per model and shows the details behind it. A
+collapsed row is a model and its headline: which upstreams serve it, how it is
+matched, how many lines it has, and how those lines currently stand (可用 / 冷却 /
+已熔断 / 已停用, with the counts). Expanding it lists the lines themselves — one per
+upstream key — with the upstream, the masked key, the model name that upstream knows,
+the priority, the weight, the state, and the remaining cooldown counted down to the
+second. The priority column shows the line's own, and the upstream's when it is not
+the default, because the gateway compares the upstream's first. A line the gateway is
+holding out of rotation can be brought back from there (恢复), which clears every
+circuit that can hold it. The view refreshes itself every ten seconds, like 概览,
+because a line's state changes without an operator doing anything.
+
+The 上游 view shows the same lines from the upstream's side. The priority and the
+weight are both edited in place: type a number in the row, press Enter or 保存, and
+the change is stored and applied for the next request. A 线路状态 column summarizes
+how that upstream's lines currently stand, and expanding a row lists them.
 
 The upstream form is built around the four things that actually vary between
 upstreams:
@@ -328,12 +346,16 @@ upstreams:
   key it stands for, a changed line replaces it, an added line is stored, and a
   removed line retires that key.
 - **Key selection has two modes.** 可用优先 (available first) prefers the first key
-  and moves to the next one only when it fails or is cooling down; 轮询 (round
-  robin) spreads requests across every key by weight.
+  and moves to the next one only when it fails or is cooling down; 加权随机
+  (weighted random) spreads requests across every key in proportion to its weight.
 - **Models are picked, not typed.** 获取模型 asks the upstream itself for its model
   list, so the operator selects from what it really serves; a model can also be
-  typed in by hand. Each selected model takes an optional upstream model name —
-  the spelling that upstream knows, when it differs from the name clients use. The
+  typed in by hand. A picked name is filed under the model's canonical name — the
+  part after any `channel/` path, without a `:variant` suffix, lowercased — so
+  `cline-free/deepseek-v4.1-flash:free` and `DeepSeek-V4.1-Flash` are one model
+  exposed once, and the spelling the upstream listed is carried as the name to send
+  it. Each selected model takes an optional upstream model name, prefilled with that
+  spelling and editable, so it can be pointed somewhere else. The
   probe goes out the way a real request to that upstream would: through the proxy
   in the form, or the default proxy profile when the form leaves it open, and the
   answer names the address that served the listing. A probe that fails says which
@@ -352,9 +374,10 @@ so editing a key cannot drop a restriction by accident.
 
 Each editable table has an 添加 button, and every row has 编辑 and 删除 actions;
 client keys additionally have 轮换, which mints a new value and invalidates the old
-one immediately. The 概览 view lists the recorded circuits and can clear one (恢复)
-or all of them (全部恢复), which is how a cooled-down or disabled line returns to
-service before its cooldown would have expired.
+one immediately. A line that is cooling down, or disabled by a `disable` circuit, is
+brought back from 概览 (where every recorded circuit is listed and can be cleared one
+by one or all at once with 全部恢复) or from the line itself on the 路由 and 上游 views
+(恢复), so it returns to service before its cooldown would have expired.
 
 A few rules the console enforces, all of them on the server rather than in the
 browser:
@@ -461,9 +484,12 @@ Management endpoints:
 - `PUT /management/configuration/{resource}/{id}`
 - `DELETE /management/configuration/{resource}/{id}`
 - `POST /management/configuration/keys/{id}/rotate`
+- `POST /management/configuration/keys/{id}/reveal`
 - `PUT /management/policy`
 - `POST /management/upstreams/models`
 - `POST /management/breakers/reset`
+- `GET /management/requests`
+- `DELETE /management/requests`
 - `GET /management/session`
 - `POST /management/login`
 - `POST /management/logout`
@@ -480,29 +506,59 @@ the resource marks as required and takes the schema default for the rest; an upd
 applies only the fields the request carries, so a partial update from automation never
 clears what it did not mention.
 
+A client key stays readable after it was created: `POST
+/management/configuration/keys/{id}/reveal` answers with the stored value, which is how
+the console's 显示 and 复制 actions work for the operator who lost one. The listing is
+never unmasked — a listing is fetched on every refresh and kept in the browser, while
+this answers one request for one key and is recorded in the audit log as
+`console_key_revealed` with the row id and the client address, never with the value. The
+gate is the one writes use: a console credential, a configured write store, and the
+gateway's own origin. Upstream keys cannot be read this way; those belong to the
+upstream, and the gateway is the only party that needs them.
+
+`GET /management/snapshot` reports the running state: the routable models, the recorded
+circuits, and one entry per line with its effective `enabled` flag alongside a `state`
+block saying what the gateway would do with it right now — `ready`, `cooling` (with the
+`blocked_until` deadline and the `cooldown_level` it reached), `disabled` (a `disable`
+circuit, which only an operator clears), or `inactive` (the configuration itself holds
+the line out of rotation). A circuit is filed by the credential the line presents, so
+the state is resolved per line by the gateway and the `scope` it names is where the
+circuit lives; the credential itself is never part of a line's entry.
+
 `upstreams` is the composite resource the console's upstream form writes, and the only
 one whose fields are assembled from several tables. Alongside the columns of `sites` it
-carries four synthetic fields: `keys` (a JSON array of strings, one per key, matched by
+carries five synthetic fields: `keys` (a JSON array of strings, one per key, matched by
 position), `key_mode` (`available_first` or `round_robin`), `models` (the exposed model
-names the upstream serves), and `model_mapping` (a JSON object of exposed name to the
-name that upstream knows). Writing `keys` or `models` creates the account, the token
+names the upstream serves), `model_mapping` (a JSON object of exposed name to the
+name that upstream knows), and `priority` (the whole number selection compares first).
+Writing `keys` or `models` creates the account, the token
 rows, the routes, and the channels behind them; the route ids the console created are
 recorded in the settings table under `gateway.managed_routes`, so an edit prunes only
-what it owns. The tables themselves remain addressable one by one for a detail the form
+what it owns. A selected model is exposed under its canonical name — the part after any
+`channel/` path, without a `:variant` suffix, lowercased — while the spelling it was
+picked by becomes the name that upstream receives, so two upstreams that call one model
+different things meet on one route. `priority` is stored in the settings table under
+`gateway.upstream_priorities` as a JSON object of upstream id to whole number, because
+it is not a `sites` column; an upstream the object does not mention has priority `0`.
+The tables themselves remain addressable one by one for a detail the form
 does not show, such as a forced endpoint or a per-key proxy.
 
 `PUT /management/policy` stores runtime policy overrides, and `POST
-/management/breakers/reset` clears one recorded circuit (`scope` of `channel`, `key`, or
-`key_model` with the identifying fields) or every circuit (`scope: "all"`). `POST
-/management/upstreams/models` asks an upstream for its model list: the body carries the
-`url`, one `key`, the `proxy_url`, and any `headers` from the form before it is saved, or
-an `id` and a masked key so the gateway probes with the key it already stores. An empty
-`proxy_url` probes through the default proxy profile, which is how the gateway would
-reach that upstream anyway. The key is used for that one outbound request and is never
-part of a response. The answer names the `endpoint` that served the listing; a failure
-answers with a stable `reason` and its `params`, including the `endpoint` that was tried,
-the `proxy_source` (`direct`, `system`, or `default` with `proxy_url`) the request left
-through, and the underlying error.
+/management/breakers/reset` clears recorded circuits: `scope: "all"` clears every one,
+while a `channel` scope naming a `channel_id` clears every circuit that can hold that
+line out of rotation — the line's own, the circuit shared by every line presenting the
+same credential, and that credential's per-model circuits — because bringing one line
+back is what an operator means and which circuit filed the failure is the gateway's to
+know. The `key` and `key_model` scopes stay available for automation that read a scope
+from the snapshot. `POST /management/upstreams/models` asks an upstream for its model
+list: the body carries the `url`, one `key`, the `proxy_url`, and any `headers` from the
+form before it is saved, or an `id` and a masked key so the gateway probes with the key
+it already stores. An empty `proxy_url` probes through the default proxy profile, which
+is how the gateway would reach that upstream anyway. The key is used for that one
+outbound request and is never part of a response. The answer names the `endpoint` that
+served the listing; a failure answers with a stable `reason` and its `params`, including
+the `endpoint` that was tried, the `proxy_source` (`direct`, `system`, or `default` with
+`proxy_url`) the request left through, and the underlying error.
 
 The write endpoints refuse a request that changes nothing valid: `400` with
 `invalid_configuration` for a bad value (the body names the `field` and a stable
@@ -510,6 +566,66 @@ The write endpoints refuse a request that changes nothing valid: `400` with
 configuration_referenced` when a delete would orphan other rows, `409
 configuration_conflict` for a duplicate value such as a client key, and `403
 cross_origin_rejected` for a state-changing request from another origin.
+
+### Request records
+
+Every proxied request leaves a record. A client only ever sees a status code and a
+gateway error code; the upstream's own message — `insufficient balance`, `invalid api
+key`, `model not found` — is what names the cause of a failure, and the record is where
+it is kept. The console shows it under 请求记录, and `GET /management/requests` returns
+it as JSON.
+
+`GET /management/requests` accepts:
+
+| Query | Meaning |
+| --- | --- |
+| `limit` | How many records to return, newest first. Default `200`, at most `2000`. |
+| `since` | Return only records newer than this row id, which is how a caller polls. |
+| `failed=1` | Only the requests that were not served. |
+| `model` | Only the requests for one model, compared without case. |
+
+Each record carries the request id, the time, the path and client address, the client key
+by name (never by secret), the requested model, whether it streamed, the final status,
+the gateway error code and message, the duration, and one entry per upstream attempt:
+the line by name, the model that was sent, the upstream's status, the duration, whether
+the attempt was retried, and as much of the upstream's own response body as explains the
+failure (512 bytes, whitespace collapsed, with the credential the attempt presented
+redacted if the upstream echoed it). No upstream credential appears anywhere in a
+record: the line an attempt ran on identifies the key, and the gateway is the only party
+that ever holds the secret.
+
+The answer also carries `retention` — whether records are being kept and how many — so a
+view can say how far back the log reaches rather than implying it holds everything ever
+served. `DELETE /management/requests` empties the log.
+
+A proxied response carries `X-Fluxgate-Request-Id`, and a failed one carries the same id
+inside its error body:
+
+```json
+{
+  "error": {
+    "code": "upstream_unavailable",
+    "message": "upstream request failed after attempt 2 with status 429: {\"error\":{\"message\":\"insufficient balance\"}}",
+    "type": "gateway_error",
+    "request_id": "9f2c1a7b4e8d0356",
+    "attempts": 2,
+    "upstream_status": 429,
+    "upstream_message": "{\"error\":{\"message\":\"insufficient balance\"}}"
+  }
+}
+```
+
+The upstream's answer travels to the client as well as to the log, because an opaque
+`502 upstream_unavailable` costs an operator a trip through the gateway's console for
+something the upstream had already spelled out. Quote the `request_id` to find the full
+record, including the lines that were tried before the one that failed. A client of the
+gateway is an authenticated caller of the operator's own deployment, which is why its own
+upstream's error text is shared with it; the credential that attempt presented is redacted
+from that text.
+
+The record is on by default and keeps the newest 1000 requests; see
+`FLUXGATE_REQUEST_LOG_ENABLED` and `FLUXGATE_REQUEST_LOG_KEEP`, or the 请求记录 section
+of 设置 → 运行策略 in the console.
 
 `/management/session`, `/management/login`, and `/management/logout` manage the console
 session itself and are therefore not themselves protected by one. `/management/password`
@@ -632,11 +748,48 @@ is answered with `503` and the error code `no_available_channel`; no upstream is
 contacted. The same applies when a route matches but every channel is blocked,
 excluded, or in cooldown.
 
+### Upstream addresses
+
+A channel's base address is the upstream's API root — the value an OpenAI client would be
+configured with, such as `https://api.example.com/v1`, or
+`https://example.com/openai/v1` for an upstream mounted under a sub-path. The gateway's
+own routes already carry the version segment, so it is not repeated: a request for
+`/v1/chat/completions` reaches `<base>/chat/completions`. A base address with a path is
+honored in full, so an upstream mounted under `/openai` is called under `/openai` and not
+at its host root; a bare host keeps the request path as it arrived, because the upstream
+schema stores a site as a bare host and the version segment is then the only thing naming
+the API.
+
+`sites.forced_upstream_endpoint` overrides that address for upstream requests when it is
+set, which is how a deployment whose stored address is not the one requests have to go to
+says so. It is not on the console's upstream form; it is written through
+`PUT /management/configuration/sites/{id}`. The console's model probe asks the address in
+the form, not the forced endpoint, so a probe before saving answers for what was typed.
+
+### Model names
+
+One model is routinely spelled several ways, so a request is matched by model
+identity rather than as a string. Case, the channel path before the last `/`, the
+variant suffix after the last `:`, and a trailing `-free` are naming rather than a
+different model, so `DeepSeek-V4.1-Flash`, `cline-free/deepseek-v4.1-flash`, and
+`cline-free/deepseek-v4.1-flash:free` all reach the route that exposes
+`deepseek-v4.1-flash`, and that name is what the gateway exposes and lists. Route
+patterns, group display names, `source_model` checks, `model_mapping` keys, and a
+downstream key's deny list are all compared this way, so a restriction written for
+the plain name covers every decorated spelling of it. A `re:` pattern is the
+exception: it is matched against the name as sent, because it is written against
+what the client spells out.
+
+The upstream still receives the spelling it knows: a channel's `source_model` (or
+the name the console stored when the model was picked) is written into the request
+body, so one exposed model can reach several upstreams that each call it something
+different.
+
 Candidate channels are then filtered by:
 
 - `route_channels.source_model`: when set, the channel only serves models that
-  equal it, are alias-equivalent (a `vendor/` prefix and a trailing `-free` are
-  ignored), or match it as a pattern. A channel on an exact-pattern route
+  equal it, are the same model under another spelling (case, channel path, variant
+  suffix, `-free`), or match it as a pattern. A channel on an exact-pattern route
   inherits that pattern as its source model when the column is empty. A channel
   that names its own model on an exact-pattern route is a candidate for that
   route regardless, which is what lets one exposed model reach several upstreams
@@ -659,6 +812,31 @@ The model written into the upstream request body is resolved in this order:
 then the first matching pattern. Order is preserved rather than relying on map
 iteration, so overlapping patterns resolve deterministically.
 
+### Channel selection
+
+Selection is by priority first and by weight second, which is what lets an
+operator say "use this upstream first" and "spread what is left":
+
+1. The highest **upstream priority** with a usable line wins. Priority travels
+   with the upstream (`priority` on the `upstreams` resource), not with a line,
+   so every line of a preferred upstream is tried before any line of a
+   lower-priority one.
+2. Inside that, the highest **line priority** (`route_channels.priority`) wins.
+   This is the key mode: 可用优先 gives an upstream's keys descending priorities,
+   which orders them within their upstream rather than across upstreams.
+3. Among the lines that tie on both, one is drawn **at random**, each line's
+   chance proportional to its effective weight: `route_channels.weight ×
+   sites.global_weight × site_weight_multipliers[site]`, with a line weight of
+   `0` treated as `10` and a site weight of `0` as `1`. A priority tier is
+   therefore not a share of traffic — a lower tier is reached only when every
+   line above it is unusable — while weight divides the traffic of one tier.
+
+A line that is disabled, blocked by a circuit, excluded by the downstream key, or
+already tried by the retry loop is filtered out before the tiers are computed, so
+a request falls to the next tier instead of failing while a preferred line cools
+down. An upstream that has never been given a priority has `0`, which is what
+every upstream had before priorities existed.
+
 ### Downstream key restrictions
 
 - `supported_models` is an **exclusion** list. A requested model matching any
@@ -674,7 +852,8 @@ iteration, so overlapping patterns resolve deterministically.
   Malformed entries are ignored.
 - `site_weight_multipliers` scales the selection weight of the named sites.
   Weight is `route_channels.weight × sites.global_weight × multiplier`, with a
-  multiplier of `1` when a site has no entry.
+  multiplier of `1` when a site has no entry, and it decides the draw among lines
+  of one priority tier.
 
 `GET /v1/models` lists the public model names of enabled routes, minus denied
 models and minus models with no channel the key may use.
@@ -710,7 +889,24 @@ Retryable status codes are `408`, `409`, `425`, `429`, `500`, `502`, `503`, and 
 - `FLUXGATE_BREAKER_MAX_COOLDOWN`: Maximum exponential cooldown duration. Default: `15m`.
 - `FLUXGATE_BREAKER_COOLDOWN_MULTIPLIER`: Factor the cooldown of a repeatedly failing circuit grows by, until the maximum. Default: `2`.
 
+The threshold counts **failed requests**, not failed attempts: a request that is retried
+eight times against one line counts once against that line's circuit. The retry budget is
+how hard the gateway tries to serve one request; the threshold is how much evidence an
+operator wants before a line is taken out of rotation, and a single request that never
+succeeded is one piece of evidence. Without that rule one `429` would walk a threshold of
+three up three cooldown levels and hold the line for minutes.
+
 Channel-specific breaker modes loaded from the existing configuration can override the default mode. Breaker state is persisted in the Go-owned `gateway_breaker_states` table and restored after restart. A `disable` circuit does not return to service by itself; it is cleared from the console (恢复) or through `POST /management/breakers/reset`.
+
+### Request-log settings
+
+- `FLUXGATE_REQUEST_LOG_ENABLED`: Whether the gateway records the requests it serves. Default: `true`. With it off, nothing new is recorded; existing records stay readable and can be cleared from the console.
+- `FLUXGATE_REQUEST_LOG_KEEP`: How many records the log holds. Default: `1000`. The newest records are kept and the rest are dropped as new ones are written, so a long-running gateway cannot grow the shared database without limit.
+
+The log is a gateway-owned table (`gateway_request_log`), created at startup beside
+`gateway_breaker_states`. It is written once per proxied request, after the response, and
+a write that fails is reported in the process log as `request_log_write_failed` — it never
+changes what the client was told.
 
 ### Runtime policy
 
@@ -735,6 +931,8 @@ back; restoring a section's defaults does that for every value in it.
 | `gateway.breaker.base_cooldown_seconds` | First cooldown, in seconds. |
 | `gateway.breaker.max_cooldown_seconds` | Upper bound of the cooldown, in seconds. |
 | `gateway.breaker.cooldown_multiplier` | Growth factor applied per consecutive trip. |
+| `gateway.request_log.enabled` | Whether the gateway records the requests it serves. |
+| `gateway.request_log.keep` | How many records the log holds, newest kept. |
 
 A policy value is validated twice: on its own against the field's range or choice list,
 and as a whole against the rules that tie two values together — a per-line attempt
@@ -744,9 +942,13 @@ change, and nothing is stored. The same parser reads the table at startup, so a 
 was edited by hand and cannot be read is reported once in the log as
 `policy_setting_ignored` and the value it tried to set keeps its environment default.
 
-Two settings the console does not write are worth knowing about: the console records the
-routes it created in `gateway.managed_routes`, and it is the only thing that prunes
-them.
+Two settings the console writes are worth knowing about: it records the routes it
+created in `gateway.managed_routes`, and the priority of each upstream in
+`gateway.upstream_priorities`. Both are the console's bookkeeping rather than gateway
+configuration, and the console is the only thing that prunes or clears them.
+`gateway.upstream_priorities` is a JSON object of upstream id to whole number; an
+upstream it does not mention has priority `0`, and setting an upstream back to `0`
+removes its entry rather than storing one.
 
 ### Network timeout settings
 
@@ -798,7 +1000,8 @@ go test -race ./...
 ## Security notes
 
 - Do not place downstream or upstream API keys in URLs, command histories, logs, or screenshots.
-- The gateway does not return upstream API keys or authenticated proxy URLs through its operational endpoints. The console's configuration listing masks every stored secret to its last four characters, and a client key is returned in full only in the response that created or rotated it.
+- The gateway does not return upstream API keys or authenticated proxy URLs through its operational endpoints. The console's configuration listing masks every stored secret to its last four characters, and a client key is returned in full only in the response that created or rotated it, or in the response to a deliberate `…/keys/{id}/reveal` read, which is audited by row and never by value. A recorded circuit names the lines it holds out of rotation rather than the credential it is filed under, so the snapshot never carries an upstream key either.
+- A request record names the client key by its row and the upstream by the line an attempt ran on; it holds no credential. It does hold the beginning of an upstream's error response, which is the point of the log, so treat `GET /management/requests` (and the database file) with the same care as the rest of the configuration.
 - The console HTML shell is served without authentication but contains no gateway data; channel names, priorities, and breaker state are only returned by the authenticated management endpoints.
 - Configuration writes are authenticated like any other management request, validated field by field against the tables they touch, and refused from a foreign origin. Because the console authenticates with a cookie, `SameSite=Lax` and the origin check are what keep a cross-site page from driving a write; a request that carries the management token in a header sends no `Origin` and is accepted, which is the automation path.
 - Writes are audited by event with the resource, the row id, and the client address, and never with the values, because a request body carries credentials.
@@ -815,8 +1018,9 @@ go test -race ./...
 
 The Go gateway is an independent service that can run alongside the existing React
 and TypeScript application during gradual migration. It reads the same SQLite
-configuration and owns two additional tables of its own: `gateway_breaker_states`
-for circuit-breaker persistence and the `gateway_admin_*` tables for the console
+configuration and owns three additional tables of its own: `gateway_breaker_states`
+for circuit-breaker persistence, `gateway_request_log` for the record of served
+requests, and the `gateway_admin_*` tables for the console
 credential and its sessions.
 
 The console can also edit that configuration, which makes the gateway a writer of

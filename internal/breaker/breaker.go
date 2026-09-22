@@ -86,6 +86,17 @@ type Breaker struct {
 	// the traffic that follows the write while a request already in flight
 	// finishes with the policy it started under.
 	installed atomic.Pointer[Policy]
+
+	// counted remembers which request last counted a failure against each circuit,
+	// so a request that keeps failing on the same line trips the threshold once
+	// rather than once per attempt. Without it, one request retried eight times
+	// would walk a threshold of three up three cooldown levels, and an operator
+	// would see the line held out of rotation by a request that never succeeded.
+	//
+	// It is deliberately per-process and in memory: the entry lives only as long
+	// as the request that made it, and a restart loses nothing an operator needs.
+	countedMu sync.Mutex
+	counted   map[Scope]string
 }
 
 // SetPolicy replaces the policy the breaker applies. It is safe to call while
@@ -135,6 +146,9 @@ func (b *Breaker) RecordFailure(failure domain.Failure) {
 	current := b.currentPolicy()
 	policy := normalizePolicy(b.policyForMode(modeOrDefault(failure.Attempt.BreakerMode, current.Mode)))
 	scope := scopeForMode(policy.Mode, failure.Attempt.ChannelID, failure.Attempt.KeyID, failure.Attempt.Model)
+	if b.alreadyCounted(scope, failure.Attempt.RequestID) {
+		return
+	}
 	now := time.Now
 	if b.Now != nil {
 		now = b.Now
@@ -155,17 +169,57 @@ func (b *Breaker) RecordFailure(failure domain.Failure) {
 	})
 }
 
+// alreadyCounted reports whether this request has already had a failure counted
+// against this circuit, recording it if not. A request without an identity is
+// never deduplicated: it is counted on its own, which is what a caller that does
+// not identify its requests gets.
+func (b *Breaker) alreadyCounted(scope Scope, requestID string) bool {
+	if requestID == "" {
+		return false
+	}
+	b.countedMu.Lock()
+	defer b.countedMu.Unlock()
+	if b.counted == nil {
+		b.counted = make(map[Scope]string)
+	}
+	if b.counted[scope] == requestID {
+		return true
+	}
+	b.counted[scope] = requestID
+	return false
+}
+
 func (b *Breaker) RecordSuccess(attempt domain.Attempt) {
 	if b == nil || b.Store == nil {
 		return
 	}
 	mode := modeOrDefault(attempt.BreakerMode, b.currentPolicy().Mode)
-	b.Store.Update(scopeForMode(mode, attempt.ChannelID, attempt.KeyID, attempt.Model), func(State) State { return State{} })
+	scope := scopeForMode(mode, attempt.ChannelID, attempt.KeyID, attempt.Model)
+	b.forget(scope)
+	b.Store.Update(scope, func(State) State { return State{} })
+}
+
+// forget drops the counted request of a circuit that has just succeeded, so the
+// next request that fails on it counts again even if it carries the same
+// identity.
+func (b *Breaker) forget(scope Scope) {
+	b.countedMu.Lock()
+	defer b.countedMu.Unlock()
+	delete(b.counted, scope)
 }
 
 func (b *Breaker) scope(channel domain.Channel, model string) Scope {
-	mode := modeOrDefault(channel.BreakerMode, b.currentPolicy().Mode)
-	return scopeForMode(mode, channel.ID, channel.APIKey, model)
+	return ScopeForMode(channel.BreakerMode, b.currentPolicy().Mode, channel.ID, channel.APIKey, model)
+}
+
+// ScopeForMode returns the circuit a channel's failures are recorded under. An
+// empty or unrecognized mode falls back to the given default, which is the
+// process-wide mode a channel without one of its own runs in.
+//
+// It is exported so a management view can name the circuit that holds a line out
+// of rotation without holding the credential the circuit is filed under.
+func ScopeForMode(mode string, fallback Mode, channelID, keyID, model string) Scope {
+	return scopeForMode(modeOrDefault(mode, fallback), channelID, keyID, model)
 }
 
 func (b *Breaker) policyForMode(mode Mode) Policy {

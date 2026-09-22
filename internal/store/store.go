@@ -20,6 +20,13 @@ type Store interface {
 	// when the list is empty, returning how many were removed.
 	DeleteBreakerStates(ctx context.Context, scopes []breaker.Scope) (int64, error)
 	CleanupBreakerStates(ctx context.Context, before time.Time) (int64, error)
+	// EnsureRequestLogSchema creates the gateway-owned record of served requests.
+	EnsureRequestLogSchema(ctx context.Context) error
+	// AppendRequestRecord stores one request record, keeping the log bounded to
+	// the newest keep records.
+	AppendRequestRecord(ctx context.Context, record domain.RequestRecord, keep int) error
+	ListRequestRecords(ctx context.Context, filter RequestLogFilter) ([]domain.RequestRecord, error)
+	ClearRequestRecords(ctx context.Context) (int64, error)
 	Close() error
 }
 

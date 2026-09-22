@@ -443,6 +443,13 @@ func TestConsoleCarriesTheManagementViewsAndEditor(t *testing.T) {
 		`data-body="routing"`,
 		`id="policy-panels"`,
 		`id="breakers-reset-all"`,
+		// 请求记录页：记录表、筛选和清空都要在脚本跑起来之前就存在。
+		`data-table="requests"`,
+		`data-requests-body`,
+		`data-empty="requests"`,
+		`id="requests-failed"`,
+		`id="requests-model"`,
+		`id="requests-clear"`,
 	} {
 		if !strings.Contains(page, wanted) {
 			t.Errorf("console is missing %q", wanted)
@@ -450,7 +457,7 @@ func TestConsoleCarriesTheManagementViewsAndEditor(t *testing.T) {
 	}
 	// Each view toggles as a whole, so the container and its navigation entry
 	// have to exist even before the script runs.
-	for _, view := range []string{"overview", "upstream", "routes", "keys", "settings"} {
+	for _, view := range []string{"overview", "upstream", "routes", "requests", "keys", "settings"} {
 		if !strings.Contains(page, `data-view="`+view+`"`) {
 			t.Errorf("console navigation has no %q entry", view)
 		}
@@ -481,8 +488,14 @@ func TestConsoleScriptWritesConfigurationThroughTheApi(t *testing.T) {
 		}
 	}
 	// A stored secret arrives as a mask and the field itself submits empty, so
-	// the only credential the script ever holds is one it just created.
+	// the only credential the script ever holds is one it just created — plus one
+	// client key it read back on the operator's explicit request.
 	for _, wanted := range []string{"openSecret(", "留空保持不变", "当前值："} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("console script is missing %q", wanted)
+		}
+	}
+	for _, wanted := range []string{"'/reveal'", "revealClientKey(", "copyClientKey(", "writeClipboard("} {
 		if !strings.Contains(script, wanted) {
 			t.Errorf("console script is missing %q", wanted)
 		}

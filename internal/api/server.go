@@ -65,7 +65,11 @@ type Server struct {
 	// PolicyDefaults is the runtime policy the environment configured. A console
 	// write overrides individual values of it; it is also what a cleared override
 	// returns to.
-	PolicyDefaults      policy.Policy
+	PolicyDefaults policy.Policy
+	// RequestLog keeps the record of the requests the gateway served, which is
+	// what the console's request view reads and what explains a failure after the
+	// fact. When nil, no record is kept and the request endpoints answer 503.
+	RequestLog          RequestLog
 	Models              []string
 	MaxRequestBodyBytes int64
 	Logger              *slog.Logger
@@ -135,6 +139,18 @@ func (s *Server) limiter() *loginLimiter {
 	return s.loginLimiter
 }
 
+// discardLogger is what a server assembled without one logs to.
+var discardLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+// logger returns the server's logger, or one that discards, so a call site does
+// not have to check for the nil a test-assembled server carries.
+func (s *Server) logger() *slog.Logger {
+	if s.Logger != nil {
+		return s.Logger
+	}
+	return discardLogger
+}
+
 // Handler returns an isolated HTTP handler without modifying the TypeScript server.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -165,12 +181,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /management/configuration/{resource}/{id}", s.handleConfigurationUpdate)
 	mux.HandleFunc("DELETE /management/configuration/{resource}/{id}", s.handleConfigurationDelete)
 	mux.HandleFunc("POST /management/configuration/keys/{id}/rotate", s.handleConfigurationKeyRotate)
+	// Reading a client key back, for the operator who lost one. It is a POST
+	// because it is a deliberate action on one row rather than a listing.
+	mux.HandleFunc("POST /management/configuration/keys/{id}/reveal", s.handleConfigurationKeyReveal)
 	// The runtime policy is stored like configuration but is not a row of a
 	// table, so it has its own endpoint rather than a resource name.
 	mux.HandleFunc("PUT /management/policy", s.handlePolicyUpdate)
 	// Asking an upstream what it serves, so a model can be picked rather than
 	// typed.
 	mux.HandleFunc("POST /management/upstreams/models", s.handleUpstreamModels)
+	// The record of the requests the gateway served, which is where a failure is
+	// looked up: the upstream's own answer to a failed request is kept here and
+	// nowhere else.
+	mux.HandleFunc("GET /management/requests", s.handleRequestLog)
+	mux.HandleFunc("DELETE /management/requests", s.handleRequestLogClear)
 	// Clearing a recorded circuit, which is the manual half of breaker recovery.
 	mux.HandleFunc("POST /management/breakers/reset", s.handleBreakerReset)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -347,6 +371,18 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 		Pattern string `json:"pattern"`
 		Target  string `json:"target"`
 	}
+	// lineCircuitSnapshot is the circuit state that applies to one line, resolved
+	// where the credential is known. It is what lets a view say whether a line is
+	// usable, cooling down, or waiting for an operator, without ever naming the
+	// credential the circuit is filed under.
+	type lineCircuitSnapshot struct {
+		Status              string `json:"status"`
+		Scope               string `json:"scope,omitempty"`
+		Model               string `json:"model,omitempty"`
+		BlockedUntil        string `json:"blocked_until,omitempty"`
+		CooldownLevel       int    `json:"cooldown_level"`
+		ConsecutiveFailures int    `json:"consecutive_failures"`
+	}
 	type channelSnapshot struct {
 		ID              string                 `json:"id"`
 		Name            string                 `json:"name"`
@@ -357,20 +393,38 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 		BreakerMode     string                 `json:"breaker_mode"`
 		ProxySource     string                 `json:"proxy_source"`
 		ModelMappings   []modelMappingSnapshot `json:"model_mappings"`
+		State           lineCircuitSnapshot    `json:"state"`
 	}
 	type breakerSnapshot struct {
-		Scope               string `json:"scope"`
-		ChannelID           string `json:"channel_id,omitempty"`
-		KeyID               string `json:"key_id,omitempty"`
-		Model               string `json:"model,omitempty"`
-		ConsecutiveFailures int    `json:"consecutive_failures"`
-		CooldownLevel       int    `json:"cooldown_level"`
-		BlockedUntil        string `json:"blocked_until,omitempty"`
-		Disabled            bool   `json:"disabled"`
+		Scope string `json:"scope"`
+		// ChannelID names the line a line-scoped circuit belongs to. A circuit
+		// filed under a credential is shared by every line presenting it, so it
+		// names those lines instead — the credential itself never leaves the
+		// gateway.
+		ChannelID           string   `json:"channel_id,omitempty"`
+		Lines               []string `json:"lines,omitempty"`
+		Model               string   `json:"model,omitempty"`
+		ConsecutiveFailures int      `json:"consecutive_failures"`
+		CooldownLevel       int      `json:"cooldown_level"`
+		BlockedUntil        string   `json:"blocked_until,omitempty"`
+		Disabled            bool     `json:"disabled"`
 	}
 
 	configuration := s.currentConfiguration()
+	// One read of the recorded circuits feeds both the per-line state and the
+	// breaker list, so the two views cannot disagree about the same moment.
+	circuits := map[breaker.Scope]breaker.State{}
+	if s.BreakerSnapshotter != nil {
+		circuits = s.BreakerSnapshotter.Snapshot()
+	}
+	fallbackMode := s.currentPolicy().Breaker.Mode
+	now := time.Now()
+
 	channels := make([]channelSnapshot, 0, len(configuration.Channels))
+	// A circuit filed under a credential is named by the lines that present it.
+	// The credential is what the circuit is keyed by, so it is the only thing that
+	// can resolve one to the other, and it never leaves the gateway.
+	linesByKey := map[string][]string{}
 	for _, route := range configuration.Routes {
 		mappings := make([]modelMappingSnapshot, 0, len(route.ModelMapping))
 		for _, entry := range route.ModelMapping {
@@ -384,6 +438,9 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 		})
 
 		for _, channel := range route.Channels {
+			if channel.APIKey != "" && !containsString(linesByKey[channel.APIKey], channel.Name) {
+				linesByKey[channel.APIKey] = append(linesByKey[channel.APIKey], channel.Name)
+			}
 			proxySource := "direct"
 			switch {
 			case channel.ProxyURL != "":
@@ -395,6 +452,28 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 			case channel.SiteUseSystemProxy:
 				proxySource = "system"
 			}
+			state := lineCircuitSnapshot{Status: "ready"}
+			if circuit, scope, known := lineCircuit(circuits, channel, route, fallbackMode, now); known {
+				state.Scope = circuitScopeName(scope)
+				state.Model = scope.Model
+				state.CooldownLevel = circuit.CooldownLevel
+				state.ConsecutiveFailures = circuit.ConsecutiveFailures
+				if !circuit.BlockedUntil.IsZero() {
+					state.BlockedUntil = circuit.BlockedUntil.UTC().Format(time.RFC3339Nano)
+				}
+				switch {
+				case circuit.Disabled:
+					state.Status = "disabled"
+				case circuit.BlockedUntil.After(now):
+					state.Status = "cooling"
+				}
+			}
+			if !channel.Enabled {
+				// A line the configuration itself holds out of rotation is
+				// reported as such whatever a circuit says: bringing it back is
+				// the operator's action, not a recovery.
+				state.Status = "inactive"
+			}
 			channels = append(channels, channelSnapshot{
 				ID:              channel.ID,
 				Name:            channel.Name,
@@ -405,6 +484,7 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 				BreakerMode:     channel.BreakerMode,
 				ProxySource:     proxySource,
 				ModelMappings:   mappings,
+				State:           state,
 			})
 		}
 	}
@@ -420,38 +500,30 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 		return channels[i].ID < channels[j].ID
 	})
 
-	breakers := make([]breakerSnapshot, 0)
-	if s.BreakerSnapshotter != nil {
-		states := s.BreakerSnapshotter.Snapshot()
-		breakers = make([]breakerSnapshot, 0, len(states))
-		for scope, state := range states {
-			scopeName := "channel"
-			if scope.KeyID != "" && scope.Model != "" {
-				scopeName = "key_model"
-			} else if scope.KeyID != "" {
-				scopeName = "key"
-			}
-			blockedUntil := ""
-			if !state.BlockedUntil.IsZero() {
-				blockedUntil = state.BlockedUntil.UTC().Format(time.RFC3339Nano)
-			}
-			breakers = append(breakers, breakerSnapshot{
-				Scope:               scopeName,
-				ChannelID:           scope.ChannelID,
-				KeyID:               scope.KeyID,
-				Model:               scope.Model,
-				ConsecutiveFailures: state.ConsecutiveFailures,
-				CooldownLevel:       state.CooldownLevel,
-				BlockedUntil:        blockedUntil,
-				Disabled:            state.Disabled,
-			})
+	breakers := make([]breakerSnapshot, 0, len(circuits))
+	for scope, state := range circuits {
+		blockedUntil := ""
+		if !state.BlockedUntil.IsZero() {
+			blockedUntil = state.BlockedUntil.UTC().Format(time.RFC3339Nano)
 		}
-		sort.Slice(breakers, func(i, j int) bool {
-			left := breakers[i].Scope + "\x00" + breakers[i].ChannelID + "\x00" + breakers[i].KeyID + "\x00" + breakers[i].Model
-			right := breakers[j].Scope + "\x00" + breakers[j].ChannelID + "\x00" + breakers[j].KeyID + "\x00" + breakers[j].Model
-			return left < right
+		lines := append([]string(nil), linesByKey[scope.KeyID]...)
+		sort.Strings(lines)
+		breakers = append(breakers, breakerSnapshot{
+			Scope:               circuitScopeName(scope),
+			ChannelID:           scope.ChannelID,
+			Lines:               lines,
+			Model:               scope.Model,
+			ConsecutiveFailures: state.ConsecutiveFailures,
+			CooldownLevel:       state.CooldownLevel,
+			BlockedUntil:        blockedUntil,
+			Disabled:            state.Disabled,
 		})
 	}
+	sort.Slice(breakers, func(i, j int) bool {
+		left := breakers[i].Scope + "\x00" + breakers[i].ChannelID + "\x00" + strings.Join(breakers[i].Lines, ",") + "\x00" + breakers[i].Model
+		right := breakers[j].Scope + "\x00" + breakers[j].ChannelID + "\x00" + strings.Join(breakers[j].Lines, ",") + "\x00" + breakers[j].Model
+		return left < right
+	})
 
 	models := append([]string(nil), s.currentModels()...)
 	sort.Strings(models)
@@ -462,6 +534,115 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 		"models":       models,
 		"breakers":     breakers,
 	})
+}
+
+// lineCircuit resolves the circuit that holds one line out of rotation, together
+// with the scope it was filed under.
+//
+// A line's failures are recorded under one of three circuits: the line itself, the
+// credential it presents (shared by every line presenting it), or that credential
+// for one upstream model. Only the gateway holds the credential, so the answer is
+// resolved here and reported per line rather than by credential to the console.
+//
+// The circuit the line runs in is asked for first, but a circuit filed under
+// another scope still holds it out of rotation — a mode that changed, or a
+// per-model circuit for a name a pattern route also matches — so every circuit
+// that can block the line is a candidate and the most restrictive one wins.
+func lineCircuit(circuits map[breaker.Scope]breaker.State, channel domain.Channel, route domain.Route, fallback breaker.Mode, now time.Time) (breaker.State, breaker.Scope, bool) {
+	if len(circuits) == 0 {
+		return breaker.State{}, breaker.Scope{}, false
+	}
+	candidates := []breaker.Scope{
+		breaker.ScopeForMode(channel.BreakerMode, fallback, channel.ID, channel.APIKey, router.ActualModel(routedModelName(route), route, channel)),
+		{ChannelID: channel.ID},
+	}
+	if channel.APIKey != "" {
+		candidates = append(candidates, breaker.Scope{KeyID: channel.APIKey})
+		for scope := range circuits {
+			if scope.KeyID == channel.APIKey && scope.Model != "" {
+				candidates = append(candidates, scope)
+			}
+		}
+	}
+
+	var (
+		selected      breaker.State
+		selectedScope breaker.Scope
+		selectedRank  = -1
+		found         bool
+	)
+	for _, scope := range candidates {
+		state, known := circuits[scope]
+		if !known {
+			continue
+		}
+		rank := circuitRank(state, now)
+		if !found || rank > selectedRank ||
+			(rank == selectedRank && circuitStricter(state, selected, now)) {
+			selected, selectedScope, selectedRank, found = state, scope, rank, true
+		}
+	}
+	return selected, selectedScope, found
+}
+
+// circuitRank orders circuits by how long they hold a line out of rotation: a
+// disabled circuit never recovers on its own, a cooling one recovers when its
+// deadline passes, and a circuit with failures recorded but no deadline does not
+// hold the line at all.
+func circuitRank(state breaker.State, now time.Time) int {
+	switch {
+	case state.Disabled:
+		return 2
+	case state.BlockedUntil.After(now):
+		return 1
+	default:
+		return 0
+	}
+}
+
+// circuitStricter breaks a tie between two circuits of the same rank: the one
+// that releases later, then the one that failed further into its backoff.
+func circuitStricter(candidate, current breaker.State, now time.Time) bool {
+	if !candidate.BlockedUntil.Equal(current.BlockedUntil) {
+		return candidate.BlockedUntil.After(now) && !current.BlockedUntil.After(now) ||
+			candidate.BlockedUntil.After(current.BlockedUntil)
+	}
+	if candidate.CooldownLevel != current.CooldownLevel {
+		return candidate.CooldownLevel > current.CooldownLevel
+	}
+	return candidate.ConsecutiveFailures > current.ConsecutiveFailures
+}
+
+// circuitScopeName names the kind of circuit a scope describes, which is how a
+// recovery request addresses it.
+func circuitScopeName(scope breaker.Scope) string {
+	switch {
+	case scope.KeyID != "" && scope.Model != "":
+		return "key_model"
+	case scope.KeyID != "":
+		return "key"
+	default:
+		return "channel"
+	}
+}
+
+// containsString reports whether a list already holds a value.
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+// routedModelName is the name the routing table lists a route under, which is
+// what a client asks for and therefore what a per-model circuit is filed under.
+func routedModelName(route domain.Route) string {
+	if name := strings.TrimSpace(route.DisplayName); name != "" {
+		return name
+	}
+	return strings.TrimSpace(route.ModelPattern)
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -510,6 +691,36 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Every request that got past authentication leaves a record, whichever way it
+	// ends. The record is filled in as the request is handled and written once, so
+	// a refusal the gateway itself makes — an unreadable body, a model this key
+	// may not use — is as findable as an upstream failure.
+	started := time.Now()
+	record := domain.RequestRecord{
+		RequestID: newRequestID(),
+		At:        started.UTC(),
+		Method:    r.Method,
+		Path:      r.URL.Path,
+		ClientIP:  clientIP(r),
+		KeyID:     key.ID,
+		KeyName:   key.Name,
+	}
+	// refuse answers the client and records why, so the two cannot disagree about
+	// what happened.
+	refuse := func(status int, code, message string, details map[string]any) {
+		record.Status = status
+		record.ErrorCode = code
+		record.ErrorMessage = message
+		writeErrorDetails(w, status, code, message, details)
+	}
+	// The client is told which request this was, so a failure it reports can be
+	// looked up rather than guessed at from a timestamp.
+	w.Header().Set("X-Fluxgate-Request-Id", record.RequestID)
+	defer func() {
+		record.DurationMS = time.Since(started).Milliseconds()
+		s.recordProxiedRequest(r, record)
+	}()
+
 	limit := s.MaxRequestBodyBytes
 	if limit <= 0 {
 		limit = 8 << 20
@@ -518,10 +729,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var maxBytesError *http.MaxBytesError
 		if errors.As(err, &maxBytesError) {
-			writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds the configured limit")
+			refuse(http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds the configured limit", nil)
 			return
 		}
-		writeError(w, http.StatusBadRequest, "invalid_request", "failed to read request body")
+		refuse(http.StatusBadRequest, "invalid_request", "failed to read request body", nil)
 		return
 	}
 
@@ -530,39 +741,41 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		Stream bool   `json:"stream"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", "request body must be a JSON object")
+		refuse(http.StatusBadRequest, "invalid_json", "request body must be a JSON object", nil)
 		return
 	}
-	if strings.TrimSpace(envelope.Model) == "" {
-		writeError(w, http.StatusBadRequest, "missing_model", "request model is required")
+	record.Model = strings.TrimSpace(envelope.Model)
+	record.Stream = envelope.Stream
+	if record.Model == "" {
+		refuse(http.StatusBadRequest, "missing_model", "request model is required", nil)
 		return
 	}
 	policy := key.Policy()
-	if !domain.AllowsModel(s.currentRoutes(), policy, envelope.Model) {
-		writeError(w, http.StatusForbidden, "model_not_allowed", "requested model is not allowed for this API key")
+	if !domain.AllowsModel(s.currentRoutes(), policy, record.Model) {
+		refuse(http.StatusForbidden, "model_not_allowed", "requested model is not allowed for this API key", nil)
 		return
 	}
 
 	result, err := s.Engine.Forward(r.Context(), domain.Request{
-		Method:  http.MethodPost,
-		Path:    r.URL.Path,
-		Headers: sanitizedHeaders(r.Header),
-		Body:    body,
-		Model:   envelope.Model,
-		Policy:  policy,
+		Method:    http.MethodPost,
+		Path:      r.URL.Path,
+		Headers:   sanitizedHeaders(r.Header),
+		Body:      body,
+		Model:     envelope.Model,
+		Policy:    policy,
+		RequestID: record.RequestID,
 	})
+	record.Attempts = result.Trace.Attempts
 	if err != nil {
 		// A model with no usable route or channel is an availability problem,
 		// not a bad gateway: no upstream request was attempted.
-		if errors.Is(err, router.ErrNoChannel) || errors.Is(err, router.ErrModelNotRoutable) {
-			writeError(w, http.StatusServiceUnavailable, "no_available_channel", "no upstream channel can serve the requested model")
-			return
-		}
-		writeError(w, http.StatusBadGateway, "upstream_unavailable", "upstream request failed")
+		failure := classifyDispatchError(err, result.Trace, record.RequestID)
+		refuse(failure.Status, failure.Code, failure.Message, failure.Details)
 		return
 	}
 	defer result.Response.Body.Close()
 
+	record.Status = result.Response.StatusCode
 	copyResponseHeaders(w.Header(), result.Response.Header)
 	w.Header().Set("X-Fluxgate-Upstream-Channel", result.Attempt.ChannelID)
 	w.WriteHeader(result.Response.StatusCode)
@@ -716,13 +929,26 @@ func isHopByHopHeader(name string) bool {
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
-	writeJSON(w, status, map[string]any{
-		"error": map[string]string{
-			"code":    code,
-			"message": message,
-			"type":    "gateway_error",
-		},
-	})
+	writeErrorDetails(w, status, code, message, nil)
+}
+
+// writeErrorDetails answers with a gateway error, with whatever the caller knows
+// about the failure beside it. The extra fields are how an error that names its
+// cause — the upstream's own message, the request an operator can look up —
+// reaches the client instead of only the console.
+func writeErrorDetails(w http.ResponseWriter, status int, code, message string, details map[string]any) {
+	body := map[string]any{
+		"code":    code,
+		"message": message,
+		"type":    "gateway_error",
+	}
+	for name, value := range details {
+		if _, taken := body[name]; taken {
+			continue
+		}
+		body[name] = value
+	}
+	writeJSON(w, status, map[string]any{"error": body})
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

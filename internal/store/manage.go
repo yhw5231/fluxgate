@@ -491,6 +491,25 @@ func (s *SQLiteStore) ListResource(ctx context.Context, name string) ([]map[stri
 	return listed, nil
 }
 
+// DownstreamKey returns the stored credential of one client key.
+//
+// It exists for the console's reveal action. A client key is the credential the
+// operator hands out, so an operator who lost one reads it back rather than
+// rotating it and re-deploying every caller. Upstream keys are the opposite case
+// and stay masked: those belong to the upstream, and the console never needs the
+// value.
+func (s *SQLiteStore) DownstreamKey(ctx context.Context, id int64) (string, error) {
+	var key string
+	err := s.db.QueryRowContext(ctx, `SELECT key FROM downstream_api_keys WHERE id = ?`, id).Scan(&key)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("%w: keys %d", ErrResourceNotFound, id)
+	}
+	if err != nil {
+		return "", fmt.Errorf("read client key: %w", err)
+	}
+	return key, nil
+}
+
 // CreateResource inserts one row and returns it as stored.
 func (s *SQLiteStore) CreateResource(ctx context.Context, name string, values map[string]any) (map[string]any, error) {
 	resource, ok := FindResource(name)
