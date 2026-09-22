@@ -315,15 +315,7 @@ func hasAncestorIn(page, marker, ancestor string) bool {
 // A credential must not be persisted by the console itself: the session is an
 // HTTP-only cookie, so no token may be written to web storage.
 func TestConsoleDoesNotPersistCredentialsInWebStorage(t *testing.T) {
-	request := httptest.NewRequest(http.MethodGet, "/console/app.js", nil)
-	response := httptest.NewRecorder()
-	Handler().ServeHTTP(response, request)
-
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-	script := string(body)
+	script := consoleScript(t)
 
 	for _, unwanted := range []string{"sessionStorage", "localStorage"} {
 		if strings.Contains(script, unwanted) {
@@ -405,15 +397,7 @@ func TestConsoleGroupsSettingsByFunction(t *testing.T) {
 // The settings sub navigation is switched by the script, so the script has to
 // know the groups and carry the function that shows one.
 func TestConsoleScriptSwitchesSettingsGroups(t *testing.T) {
-	request := httptest.NewRequest(http.MethodGet, "/console/app.js", nil)
-	response := httptest.NewRecorder()
-	Handler().ServeHTTP(response, request)
-
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-	script := string(body)
+	script := consoleScript(t)
 
 	for _, wanted := range []string{
 		"SETTINGS_VIEWS",
@@ -487,15 +471,7 @@ func TestConsoleCarriesTheManagementViewsAndEditor(t *testing.T) {
 // The management script must write through the same origin-relative paths it
 // reads, and it must never fall back to storing a credential in the browser.
 func TestConsoleScriptWritesConfigurationThroughTheApi(t *testing.T) {
-	request := httptest.NewRequest(http.MethodGet, "/console/app.js", nil)
-	response := httptest.NewRecorder()
-	Handler().ServeHTTP(response, request)
-
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-	script := string(body)
+	script := consoleScript(t)
 
 	// Writes reach the API through the relative helper, so a mounted prefix
 	// keeps working.
@@ -597,15 +573,7 @@ func TestConsoleHasForcedPasswordChangeScreen(t *testing.T) {
 
 // The console must send the password change to the documented endpoint.
 func TestConsolePostsPasswordChange(t *testing.T) {
-	request := httptest.NewRequest(http.MethodGet, "/console/app.js", nil)
-	response := httptest.NewRecorder()
-	Handler().ServeHTTP(response, request)
-
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-	script := string(body)
+	script := consoleScript(t)
 
 	for _, wanted := range []string{
 		"management/password",
@@ -615,6 +583,112 @@ func TestConsolePostsPasswordChange(t *testing.T) {
 	} {
 		if !strings.Contains(script, wanted) {
 			t.Errorf("console script is missing %q", wanted)
+		}
+	}
+}
+
+// consoleScript reads the management script, which is where the form behaviour
+// under test lives.
+func consoleScript(t *testing.T) string {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodGet, "/console/app.js", nil)
+	response := httptest.NewRecorder()
+	Handler().ServeHTTP(response, request)
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return string(body)
+}
+
+// A credential field is not a place a browser may fill in. The console's own
+// login password is the credential saved for this origin, so a password manager
+// would put it into the key editor and the value would be stored as a key.
+func TestCredentialFieldsRefuseToBeAutofilled(t *testing.T) {
+	script := consoleScript(t)
+
+	for _, wanted := range []string{
+		`data-bwignore`,
+		`data-1p-ignore`,
+		`data-lpignore`,
+		`data-form-type`,
+		`autocomplete = 'new-password'`,
+		// The field is read-only until it is focused and anything that appears
+		// without a keystroke is cleared, which is what actually stops the
+		// managers that ignore the attributes.
+		"readOnly",
+		"keepUnfilled(",
+	} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("the console script is missing %q", wanted)
+		}
+	}
+}
+
+// 排除模型、限定路由、排除上游 are chosen from a list the console already holds:
+// a restriction typed as JSON by hand is how a policy ends up naming a route or
+// a model that does not exist.
+func TestKeyRestrictionsArePickedFromFetchedLists(t *testing.T) {
+	script := consoleScript(t)
+
+	for _, field := range []string{"supported_models", "allowed_route_ids", "excluded_site_ids"} {
+		if !strings.Contains(script, field+": {") {
+			t.Errorf("the console declares no field metadata for %s", field)
+		}
+	}
+	for _, wanted := range []string{
+		"createChoiceList",
+		"type: 'choice_list'",
+		"candidates: modelCandidates",
+		"candidates: routeCandidates",
+		"candidates: upstreamCandidates",
+		// The lists come from the configuration the console has read.
+		"function resourceRows(",
+		"state.configuration.models",
+		"不在当前列表中",
+	} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("the console script is missing %q", wanted)
+		}
+	}
+	// The JSON textarea renderer the id lists used to have is gone: leaving it in
+	// place would let a field fall back to typing ids by hand.
+	if strings.Contains(script, "类型: 'id_list'") || strings.Contains(script, "type === 'id_list'") {
+		t.Error("the console still renders an id list as raw JSON")
+	}
+}
+
+// An upstream address is written the way the operator thinks of it, and the form
+// makes one canonical address of the spellings that mean the same upstream.
+func TestUpstreamAddressIsCompletedInTheForm(t *testing.T) {
+	script := consoleScript(t)
+
+	for _, wanted := range []string{
+		"function normalizeAPIAddress(",
+		"normalize: normalizeAPIAddress",
+		"ENDPOINT_SUFFIX",
+		// The probe asks with the normalized address and the proxy from the form,
+		// so it goes out the way a real request would.
+		"proxy_url: editorFieldValue('proxy_url')",
+		"url: url",
+	} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("the console script is missing %q", wanted)
+		}
+	}
+}
+
+// A create shows the value the gateway would store for an omitted field, so an
+// upstream added in the console is enabled rather than left unset.
+func TestConsoleShowsTheServerDefaultInTheForm(t *testing.T) {
+	script := consoleScript(t)
+
+	for _, wanted := range []string{
+		"field.default_value",
+		"!row && field.default_value",
+	} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("the console script is missing %q", wanted)
 		}
 	}
 }

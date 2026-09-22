@@ -253,6 +253,92 @@ func TestUpstreamModelProbeReportsItsOwnRefusals(t *testing.T) {
 	}
 }
 
+// A probe goes out the way a real request to that upstream would: through the
+// proxy the form carries. The form is where an operator sets it, so a probe that
+// ignored it would fail on exactly the upstreams that need one.
+func TestUpstreamModelProbeCarriesTheFormProxy(t *testing.T) {
+	server, _ := managementServer(t)
+	prober := &recordingProber{result: upstream.Result{Models: []string{"gpt-4.1"}}}
+	server.Prober = prober
+
+	response := callManagement(server, http.MethodPost, "/management/upstreams/models", "management-secret", map[string]any{
+		"url": "https://api.example.com", "key": "typed-key", "proxy_url": "http://127.0.0.1:7890",
+	})
+	if response.status != http.StatusOK {
+		t.Fatalf("probe status = %d, body = %v", response.status, response.body)
+	}
+	if prober.request.ProxyURL != "http://127.0.0.1:7890" {
+		t.Errorf("probe proxy = %q, want the one from the form", prober.request.ProxyURL)
+	}
+}
+
+// A form that leaves the proxy open probes the way the routing engine would
+// reach that upstream: through the default proxy profile.
+func TestUpstreamModelProbeFallsBackToTheDefaultProxy(t *testing.T) {
+	server, _ := managementServer(t)
+	prober := &recordingProber{result: upstream.Result{Models: []string{"gpt-4.1"}}}
+	server.Prober = prober
+
+	created := callManagement(server, http.MethodPost, "/management/configuration/proxies", "management-secret", map[string]any{
+		"name": "默认出口", "protocol": "http", "url": "http://127.0.0.1:7891", "is_default": true,
+	})
+	if created.status != http.StatusCreated {
+		t.Fatalf("create proxy status = %d, body = %v", created.status, created.body)
+	}
+
+	response := callManagement(server, http.MethodPost, "/management/upstreams/models", "management-secret", map[string]any{
+		"url": "https://api.example.com", "key": "typed-key",
+	})
+	if response.status != http.StatusOK {
+		t.Fatalf("probe status = %d, body = %v", response.status, response.body)
+	}
+	if prober.request.ProxyURL != "http://127.0.0.1:7891" {
+		t.Errorf("probe proxy = %q, want the default profile", prober.request.ProxyURL)
+	}
+
+	// A proxy typed into the form is the more specific choice and wins.
+	response = callManagement(server, http.MethodPost, "/management/upstreams/models", "management-secret", map[string]any{
+		"url": "https://api.example.com", "key": "typed-key", "proxy_url": "direct",
+	})
+	if response.status != http.StatusOK {
+		t.Fatalf("probe status = %d, body = %v", response.status, response.body)
+	}
+	if prober.request.ProxyURL != "direct" {
+		t.Errorf("probe proxy = %q, want the form's choice", prober.request.ProxyURL)
+	}
+}
+
+// A failed probe answers with what it tried and how it left, so the console can
+// tell an operator which address and which proxy to look at.
+func TestUpstreamModelProbeReportsWhereItWentAndHow(t *testing.T) {
+	server, _ := managementServer(t)
+	server.Prober = &recordingProber{err: upstream.Failure{
+		Reason:  upstream.ReasonUnreachable,
+		Message: "dial tcp: connection refused",
+		Params: map[string]any{
+			"endpoint":     "https://api.example.com/v1/models",
+			"proxy_source": "system",
+		},
+	}}
+
+	response := callManagement(server, http.MethodPost, "/management/upstreams/models", "management-secret", map[string]any{
+		"url": "https://api.example.com", "key": "typed-key",
+	})
+	if response.status != http.StatusBadGateway {
+		t.Fatalf("probe status = %d, want 502; body = %v", response.status, response.body)
+	}
+	params, _ := errorField(response.body, "params").(map[string]any)
+	if params["endpoint"] != "https://api.example.com/v1/models" {
+		t.Errorf("params = %v, want the address that was tried", params)
+	}
+	if params["proxy_source"] != "system" {
+		t.Errorf("params = %v, want how the probe left", params)
+	}
+	if params["detail"] != "dial tcp: connection refused" {
+		t.Errorf("params = %v, want the underlying error", params)
+	}
+}
+
 // Clearing a circuit is how an operator brings a cooled-down or disabled channel
 // back before its cooldown would have expired.
 func TestBreakerResetClearsTheRecordedCircuit(t *testing.T) {

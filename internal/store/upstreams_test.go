@@ -171,6 +171,37 @@ func TestUpstreamCreatesARoutePerModelAndALinePerKey(t *testing.T) {
 	}
 }
 
+// An upstream added from the console serves traffic as soon as it is saved: the
+// status it is created with is the enabled one, so a new upstream is not sitting
+// in the form looking configured while its lines are switched off.
+func TestUpstreamIsCreatedEnabled(t *testing.T) {
+	store := prepareUpstreamStore(t)
+	row := createUpstream(t, store, map[string]any{
+		"name": "Example", "url": "https://api.example.com",
+		"keys": []any{"primary-key"}, "models": []any{"gpt-4.1"},
+	})
+	if row["status"] != "active" {
+		t.Fatalf("status = %v, want active", row["status"])
+	}
+	listed := listUpstreams(t, store)
+	if len(listed) != 1 || listed[0]["status"] != "active" {
+		t.Fatalf("listing status = %v, want the created upstream enabled", listed)
+	}
+
+	// The status is what the loader reads to enable the lines, so the channel it
+	// created has to come back enabled rather than merely stored.
+	configuration, err := store.LoadConfiguration(context.Background())
+	if err != nil {
+		t.Fatalf("LoadConfiguration() error = %v", err)
+	}
+	if len(configuration.Channels) != 1 {
+		t.Fatalf("channels = %d, want the one the upstream created", len(configuration.Channels))
+	}
+	if !configuration.Channels[0].Enabled {
+		t.Error("the line of a newly created upstream is disabled")
+	}
+}
+
 // A site the console created carries the platform the schema requires, and the
 // account the keys live on.
 func TestUpstreamStoresPlatformAndKeysOnOneAccount(t *testing.T) {

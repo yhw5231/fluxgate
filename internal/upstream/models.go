@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/yhw5231/fluxgate/internal/proxy"
 )
 
 // ConfigError reports a probe that did not produce a model list. Every failure
@@ -41,6 +43,9 @@ const (
 	ReasonUnreadable = "unreadable_response"
 	// ReasonUnreachable means the request never reached the upstream.
 	ReasonUnreachable = "unreachable"
+	// ReasonInvalidProxy means the proxy the probe was told to use cannot be
+	// used, so no request was made.
+	ReasonInvalidProxy = "invalid_proxy"
 )
 
 // Failure explains why a probe did not produce a model list.
@@ -50,6 +55,11 @@ type Failure struct {
 	// Status is the upstream's HTTP status when it answered.
 	Status  int
 	Message string
+	// Params carries what the console's message template needs to phrase the
+	// failure: which address was tried, and how the request left the gateway.
+	// They travel as data rather than prose so the console renders them in its
+	// own language.
+	Params map[string]any
 }
 
 func (f Failure) Error() string { return f.Message }
@@ -61,13 +71,44 @@ func failure(reason string, status int, message string) error {
 	return Failure{Reason: reason, Status: status, Message: message}
 }
 
+// describedFailure adds the context every outbound failure has in common: the
+// address that was tried and the proxy, if any, the request left through. Both
+// are what an operator has to check, so both travel with the failure.
+func describedFailure(err error, endpoint string, route outbound) error {
+	var failed Failure
+	if !errors.As(err, &failed) {
+		return err
+	}
+	params := map[string]any{"endpoint": endpoint, "proxy_source": route.Source}
+	if route.URL != "" {
+		params["proxy_url"] = route.URL
+	}
+	for name, value := range failed.Params {
+		params[name] = value
+	}
+	failed.Params = params
+	return failed
+}
+
+// outbound records how a probe leaves the gateway, so a failure can say which
+// proxy carried it instead of leaving the operator to guess.
+type outbound struct {
+	// Source is the proxy decision: "direct", "system", or the configuration
+	// layer that supplied the proxy.
+	Source string
+	// URL is the proxy address when one is in use.
+	URL string
+}
+
 // maxBodyBytes bounds how much of a model listing is read, so a hostile or
 // broken upstream cannot make the gateway buffer an unbounded response.
 const maxBodyBytes = int64(1 << 20)
 
 // Request describes one upstream to ask for its model list.
 type Request struct {
-	// BaseURL is the upstream's root address, the same value a site stores.
+	// BaseURL is the upstream's root address, the same value a site stores. A
+	// trailing slash and a version segment are both optional: the spellings an
+	// operator may type of one address are probed the same way.
 	BaseURL string
 	// APIKey is the credential to present. Both the bearer scheme and the
 	// x-api-key header are sent, because upstreams differ in which one they read
@@ -76,6 +117,11 @@ type Request struct {
 	// Headers are extra request headers, which is how a platform that needs a
 	// vendor-specific header or a different scheme is reached.
 	Headers map[string]string
+	// ProxyURL is the outbound proxy to probe through: a proxy address, or the
+	// keywords "system" and "direct" (also "none"). An empty value follows the
+	// system proxy settings, which is also what the routing engine falls back to
+	// when no proxy is configured for an upstream.
+	ProxyURL string
 }
 
 // Result is what an upstream answered.
@@ -88,6 +134,8 @@ type Result struct {
 
 // Client fetches model listings.
 type Client struct {
+	// HTTP overrides how a probe connects. When set it is used as given, which
+	// is how a test drives the probe without a network.
 	HTTP *http.Client
 	// Timeout bounds one probe. A console request should not hang on an upstream
 	// that never answers.
@@ -113,9 +161,16 @@ func (c *Client) Models(ctx context.Context, request Request) (Result, error) {
 	probeContext, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	client, route, release, err := c.dispatch(request, base)
+	if err != nil {
+		return Result{}, err
+	}
+	defer release()
+
+	endpoints := candidateEndpoints(base)
 	var lastErr error
-	for _, endpoint := range candidateEndpoints(base) {
-		models, err := c.fetch(probeContext, endpoint, request)
+	for _, endpoint := range endpoints {
+		models, err := c.fetch(probeContext, client, endpoint, request)
 		if err == nil {
 			return Result{Models: models, Endpoint: endpoint}, nil
 		}
@@ -123,19 +178,62 @@ func (c *Client) Models(ctx context.Context, request Request) (Result, error) {
 			lastErr = err
 			continue
 		}
-		return Result{}, err
+		return Result{}, describedFailure(err, endpoint, route)
 	}
 	if lastErr != nil {
-		return Result{}, failure(ReasonNoModelEndpoint, http.StatusNotFound,
-			fmt.Sprintf("the upstream answered 404 for %s and %s", base.String()+"/v1/models", base.String()+"/models"))
+		params := map[string]any{"endpoints": endpoints, "proxy_source": route.Source}
+		if route.URL != "" {
+			params["proxy_url"] = route.URL
+		}
+		return Result{}, Failure{
+			Reason:  ReasonNoModelEndpoint,
+			Status:  http.StatusNotFound,
+			Message: fmt.Sprintf("the upstream serves no model listing at %s", strings.Join(endpoints, " or ")),
+			Params:  params,
+		}
 	}
-	return Result{}, failure(ReasonUnreachable, 0, "the upstream did not answer")
+	params := map[string]any{"proxy_source": route.Source}
+	if route.URL != "" {
+		params["proxy_url"] = route.URL
+	}
+	return Result{}, Failure{
+		Reason:  ReasonUnreachable,
+		Status:  0,
+		Message: "the upstream did not answer",
+		Params:  params,
+	}
+}
+
+// dispatch builds the client a probe leaves through. The proxy the form carries
+// wins; with none configured the request follows the system proxy settings,
+// which is what the routing engine does for an upstream without one.
+func (c *Client) dispatch(request Request, target *url.URL) (*http.Client, outbound, func(), error) {
+	if c.HTTP != nil {
+		// An injected client is a test seam; how it connects is not this
+		// package's business.
+		return c.HTTP, outbound{}, func() {}, nil
+	}
+	resolver := &proxy.Resolver{Config: proxy.ProxyConfig{Default: strings.TrimSpace(request.ProxyURL)}}
+	resolved, err := resolver.Resolve(proxy.ProxyRequest{TargetURL: target})
+	if err != nil {
+		return nil, outbound{}, func() {}, failure(ReasonInvalidProxy, 0, err.Error())
+	}
+	route := outbound{Source: string(resolved.Source)}
+	if resolved.URL != nil {
+		route.URL = resolved.URL.String()
+	}
+	pool := proxy.NewTransportPool(nil)
+	transport, err := pool.Transport(resolved)
+	if err != nil {
+		return nil, route, func() {}, failure(ReasonInvalidProxy, 0, err.Error())
+	}
+	return &http.Client{Transport: transport}, route, transport.CloseIdleConnections, nil
 }
 
 // errNotFound marks an endpoint the upstream does not serve.
 var errNotFound = errors.New("endpoint not found")
 
-func (c *Client) fetch(ctx context.Context, endpoint string, request Request) ([]string, error) {
+func (c *Client) fetch(ctx context.Context, client *http.Client, endpoint string, request Request) ([]string, error) {
 	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build model list request: %w", err)
@@ -149,7 +247,6 @@ func (c *Client) fetch(ctx context.Context, endpoint string, request Request) ([
 		httpRequest.Header.Set(name, value)
 	}
 
-	client := c.HTTP
 	if client == nil {
 		client = http.DefaultClient
 	}
@@ -181,14 +278,48 @@ func (c *Client) fetch(ctx context.Context, endpoint string, request Request) ([
 	return models, nil
 }
 
-// candidateEndpoints lists the URLs to try, OpenAI's path first unless the
-// address already carries a version segment.
+// candidateEndpoints lists the model-listing URLs to try, most likely first.
+//
+// The address decides the order. One that names no version is probed at the
+// versioned path and then at the bare one, which is what lets an upstream be
+// written as https://host or https://host/; one that already names a version is
+// probed there first and then at its parent, because a listing also sits
+// directly under the API root — /openai/v1 names the same API as /openai, and an
+// upstream mounted at the root may serve its listing at /models.
 func candidateEndpoints(base *url.URL) []string {
 	root := strings.TrimRight(base.String(), "/")
-	if strings.HasSuffix(base.Path, "/v1") || strings.Contains(base.Path, "/v1/") {
-		return []string{root + "/models", root + "/v1/models"}
+	path := strings.TrimRight(base.Path, "/")
+	version, versioned := versionSegment(path)
+	if !versioned {
+		return []string{root + "/v1/models", root + "/models"}
 	}
-	return []string{root + "/v1/models", root + "/models"}
+	parent := strings.TrimSuffix(root, "/"+version)
+	return []string{root + "/models", parent + "/models"}
+}
+
+// versionSegment reports whether a path's last segment is an API version such as
+// v1 or v1beta1, which is what makes the parent path worth probing.
+func versionSegment(path string) (string, bool) {
+	segment := path[strings.LastIndex(path, "/")+1:]
+	if len(segment) < 2 || (segment[0] != 'v' && segment[0] != 'V') {
+		return "", false
+	}
+	digits := false
+	for index := 1; index < len(segment); index++ {
+		character := segment[index]
+		switch {
+		case character >= '0' && character <= '9':
+			digits = true
+		case character >= 'a' && character <= 'z', character >= 'A' && character <= 'Z',
+			character == '.', character == '-', character == '_':
+		default:
+			return "", false
+		}
+	}
+	if !digits {
+		return "", false
+	}
+	return segment, true
 }
 
 func parseBaseURL(value string) (*url.URL, error) {

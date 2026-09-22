@@ -1008,11 +1008,16 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 .secret-row { display: flex; gap: 8px; align-items: center; }
 .secret-row .field-input { flex: 1; color: var(--accent); }
 
-/* ===== Upstream model picker =====
+/* ===== Upstream model picker and choice lists =====
    The model list and the key list are the two fields the upstream form builds
-   itself, because neither one is a single value. */
+   itself, because neither one is a single value. The exclusion, route and
+   upstream fields of a client key are the same multi-select shape over
+   candidates the console already holds. */
 .field-editor[data-field="models"],
-.field-editor[data-field="keys"] { grid-column: 1 / -1; }
+.field-editor[data-field="keys"],
+.field-editor[data-field="supported_models"],
+.field-editor[data-field="allowed_route_ids"],
+.field-editor[data-field="excluded_site_ids"] { grid-column: 1 / -1; }
 
 .picker-toolbar {
   display: flex;
@@ -1030,7 +1035,8 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   white-space: nowrap;
 }
 
-.model-list {
+.model-list,
+.choice-list {
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -1043,7 +1049,8 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   background: rgba(2, 6, 15, 0.25);
 }
 
-.model-line {
+.model-line,
+.choice-line {
   display: grid;
   grid-template-columns: 18px minmax(0, 1fr) minmax(120px, 42%);
   align-items: center;
@@ -1053,13 +1060,25 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   cursor: pointer;
 }
 
-.model-line:hover { background: rgba(148, 163, 184, 0.07); }
-.model-line input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; }
+.choice-line { grid-template-columns: 18px minmax(0, 1fr) auto; }
 
-.model-name {
+.model-line:hover,
+.choice-line:hover { background: rgba(148, 163, 184, 0.07); }
+
+.model-line input[type="checkbox"],
+.choice-line input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; }
+
+.model-name,
+.choice-name {
   font-size: 12.5px;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.choice-detail {
+  font-size: 11.5px;
+  color: var(--text-faint);
   white-space: nowrap;
 }
 

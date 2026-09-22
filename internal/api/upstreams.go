@@ -20,9 +20,10 @@ import (
 // This endpoint asks the upstream itself and answers with the list, so the
 // operator picks models instead of spelling them.
 //
-// The request carries the address a site holds, one credential, and any custom
-// headers, which is exactly what the console form has at that moment — the
-// upstream does not have to be saved first. When the credential in the form is
+// The request carries the address a site holds, one credential, the proxy and
+// any custom headers, which is exactly what the console form has at that moment
+// — the upstream does not have to be saved first, and the probe goes out the way
+// a real request to that upstream would. When the credential in the form is
 // still the mask of a stored one, the upstream can be named by id instead and
 // the gateway probes with the key it already holds.
 
@@ -44,6 +45,7 @@ type upstreamProbeRequest struct {
 	ID      int64             `json:"id"`
 	URL     string            `json:"url"`
 	Key     string            `json:"key"`
+	Proxy   string            `json:"proxy_url"`
 	Headers map[string]string `json:"headers"`
 }
 
@@ -82,10 +84,16 @@ func (s *Server) handleUpstreamModels(w http.ResponseWriter, r *http.Request) {
 				"the gateway could not complete the probe")
 			return
 		}
-		details := map[string]any{"reason": failed.Reason, "params": map[string]any{}}
+		params := map[string]any{"detail": failed.Error()}
 		if failed.Status != 0 {
-			details["params"] = map[string]any{"status": failed.Status}
+			params["status"] = failed.Status
 		}
+		// The probe describes where it went and how it left, which is what an
+		// operator has to see to fix an address or a proxy.
+		for name, value := range failed.Params {
+			params[name] = value
+		}
+		details := map[string]any{"reason": failed.Reason, "params": params}
 		switch failed.Reason {
 		case upstream.ReasonUnreachable:
 			writeConfigurationError(w, http.StatusBadGateway, "upstream_unreachable", failed.Error(), details)
@@ -121,9 +129,10 @@ func (s *Server) upstreamProbeRequest(w http.ResponseWriter, r *http.Request, bo
 	}
 
 	request := upstream.Request{
-		BaseURL: strings.TrimSpace(payload.URL),
-		APIKey:  strings.TrimSpace(payload.Key),
-		Headers: payload.Headers,
+		BaseURL:  strings.TrimSpace(payload.URL),
+		APIKey:   strings.TrimSpace(payload.Key),
+		Headers:  payload.Headers,
+		ProxyURL: s.probeProxy(r.Context(), payload.Proxy),
 	}
 	if !store.IsMaskedSecret(request.APIKey) {
 		return request, true
@@ -147,4 +156,38 @@ func (s *Server) upstreamProbeRequest(w http.ResponseWriter, r *http.Request, bo
 	}
 	request.APIKey = stored
 	return request, true
+}
+
+// probeProxy decides how the probe leaves the gateway: the proxy the form
+// carries, or — when the form leaves it open — the default proxy profile, which
+// is what the routing engine itself would use for an upstream with no proxy of
+// its own. Without either, the system proxy settings apply.
+func (s *Server) probeProxy(ctx context.Context, submitted string) string {
+	if value := strings.TrimSpace(submitted); value != "" {
+		return value
+	}
+	if s.ConfigStore == nil {
+		return ""
+	}
+	profiles, err := s.ConfigStore.ListResource(ctx, "proxies")
+	if err != nil {
+		// A probe without the profile still has a chance of working, so the
+		// failure to read them is not worth failing the probe over.
+		if s.Logger != nil {
+			s.Logger.Error("upstream_probe_proxy_lookup_failed", "error", err.Error())
+		}
+		return ""
+	}
+	for _, profile := range profiles {
+		if enabled, _ := profile["enabled"].(bool); !enabled {
+			continue
+		}
+		if isDefault, _ := profile["is_default"].(bool); !isDefault {
+			continue
+		}
+		if address, _ := profile["url"].(string); strings.TrimSpace(address) != "" {
+			return address
+		}
+	}
+	return ""
 }

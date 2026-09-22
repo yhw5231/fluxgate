@@ -342,10 +342,13 @@
   var FIELDS = {
     upstreams: {
       name: { label: '名称', placeholder: '例如 OpenAI 官方' },
-      url: { label: 'API 地址', placeholder: 'https://api.example.com', help: '上游服务的根地址，必须包含 http:// 或 https://。' },
+      url: {
+        label: 'API 地址', placeholder: 'https://api.example.com', normalize: normalizeAPIAddress,
+        help: '上游服务的根地址。只填到域名时会自动补上 /v1，结尾多余的 / 会去掉；上游挂在子路径下时请把子路径写上（例如 https://example.com/openai）。'
+      },
       global_weight: { label: '权重', type: 'number', step: 'any', placeholder: '1', help: '权重越大分到的请求越多；同一个模型的多个上游之间按权重分配。' },
       custom_headers: { label: '请求头', type: 'json', placeholder: '{"X-Custom": "value"}', help: 'JSON 对象，会附加到发往这个上游的每个请求上。' },
-      proxy_url: { label: '代理', placeholder: 'http://127.0.0.1:7890', help: '留空表示直连；填 system 表示使用系统代理。' },
+      proxy_url: { label: '代理', placeholder: 'http://127.0.0.1:7890', help: '留空表示直连；填 system 表示使用系统代理。获取模型和转发请求都走这个出口。' },
       status: { label: '状态', type: 'select', options: STATUS_OPTIONS, help: '停用后该上游的线路不再参与选路。' },
       keys: { label: '密钥', help: '一行一个，可以整段粘贴。留空表示保持已保存的密钥不变。' },
       key_mode: { label: '密钥模式', type: 'select', options: KEY_MODE_OPTIONS, help: '可用优先：先用第一个密钥，失败或熔断后再用下一个。轮询：按权重在所有密钥之间分配。' },
@@ -361,9 +364,25 @@
       used_cost: { label: '已用额度', type: 'number', step: 'any', help: '由对账逻辑维护，可在这里重置。' },
       max_requests: { label: '请求数上限', type: 'number', step: '1', help: '留空表示不限制。' },
       used_requests: { label: '已用请求数', type: 'number', step: '1' },
-      supported_models: { label: '排除模型', type: 'json', placeholder: '["gpt-4.1-mini", "re:^o1"]', help: 'JSON 数组，命中的模型会被拒绝并不出现在 /v1/models 中。' },
-      allowed_route_ids: { label: '限定路由', type: 'id_list', resource: 'routes', placeholder: '[1, 2]', help: 'JSON 数组，只允许这些路由；留空表示不限制。' },
-      excluded_site_ids: { label: '排除上游', type: 'id_list', resource: 'sites', placeholder: '[3]', help: 'JSON 数组，这些上游的线路不会被选中。' },
+      supported_models: {
+        label: '排除模型', type: 'choice_list', filterPlaceholder: '筛选模型…',
+        help: '勾选要拒绝的模型：命中的模型会被拒绝，也不会出现在 /v1/models 中。也支持手填一条模式（例如 re:^o1）。',
+        manual: { placeholder: '手动添加模型名或 re: 模式', action: '添加' },
+        candidates: modelCandidates, describe: function (value) { return String(value); },
+        emptyText: '网关还没有可排除的模型：先在上游里勾选模型。'
+      },
+      allowed_route_ids: {
+        label: '限定路由', type: 'choice_list', filterPlaceholder: '筛选路由…',
+        help: '勾选后只允许这些路由；一个都不勾表示不限制。',
+        candidates: routeCandidates, describe: function (value) { return referenceLabel('routes', value); },
+        emptyText: '网关里还没有路由：先在上游里勾选模型，路由会自动建立。'
+      },
+      excluded_site_ids: {
+        label: '排除上游', type: 'choice_list', filterPlaceholder: '筛选上游…',
+        help: '勾选后这些上游的线路不会被选中。',
+        candidates: upstreamCandidates, describe: function (value) { return referenceLabel('sites', value); },
+        emptyText: '还没有上游。'
+      },
       site_weight_multipliers: { label: '上游权重系数', type: 'json', placeholder: '{"3": 2}', help: 'JSON 对象，键是上游 ID，值是大于 0 的倍数。' },
       excluded_credential_refs: {
         label: '排除凭据', type: 'json',
@@ -495,6 +514,57 @@
   function accountName(id) { return id ? referenceLabel('accounts', id) : '—'; }
   function tokenName(id) { return id ? referenceLabel('tokens', id) : '—'; }
 
+  /* 排除模型、限定路由、排除上游这三项都是从一个列表里挑，所以候选来自网关已经
+   * 读到的配置，而不是让 operator 手写 JSON。 */
+
+  function upstreamCandidates() {
+    return resourceRows('upstreams').map(function (row) {
+      var models = parseJSON(row.models);
+      var count = Array.isArray(models) ? models.length : 0;
+      return {
+        value: row.id,
+        label: text(row.name, '#' + row.id),
+        detail: '#' + row.id + ' · ' + count + ' 个模型'
+      };
+    });
+  }
+
+  function routeCandidates() {
+    return resourceRows('routes').map(function (row) {
+      var detail = '#' + row.id;
+      if (row.model_pattern) { detail += ' · ' + row.model_pattern; }
+      return {
+        value: row.id,
+        label: text(row.display_name, text(row.model_pattern, '#' + row.id)),
+        detail: detail
+      };
+    });
+  }
+
+  /* 可排除的模型：网关当前在路由的模型，加上上游里勾选的模型和路由上的匹配模式
+   * （路由模式可能是 re: 形式，按模式整体排除也是合理的用法）。 */
+  function modelCandidates() {
+    var seen = {};
+    var candidates = [];
+    function add(value) {
+      var name = String(value === null || value === undefined ? '' : value).trim();
+      if (name === '' || seen[name]) { return; }
+      seen[name] = true;
+      candidates.push({ value: name, label: name });
+    }
+    var routed = state.configuration && state.configuration.models;
+    if (Array.isArray(routed)) { routed.forEach(add); }
+    resourceRows('routes').forEach(function (row) { add(row.model_pattern); });
+    resourceRows('upstreams').forEach(function (row) {
+      var models = parseJSON(row.models);
+      if (Array.isArray(models)) { models.forEach(add); }
+    });
+    candidates.sort(function (left, right) {
+      return left.value < right.value ? -1 : (left.value > right.value ? 1 : 0);
+    });
+    return candidates;
+  }
+
   function channelCount(routeID) {
     return resourceRows('channels').filter(function (row) {
       return String(row.route_id) === String(routeID);
@@ -569,6 +639,35 @@
     if (typeof value !== 'string') { return value; }
     try {
       return JSON.parse(value);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  /* ===== API address =====
+   *
+   * 一个上游的地址有好几种写法：https://host、https://host/、https://host/v1、
+   * https://host/v1/，还有从文档里整段复制来的 https://host/v1/chat/completions。
+   * 网关探测模型列表时能分辨这些写法，这里再把它们归成一个规范形式存下来，operator
+   * 看到的和探测、转发用的是同一个地址。 */
+
+  var ENDPOINT_SUFFIX = /\/(chat\/completions|completions|responses|messages|models)$/i;
+
+  function normalizeAPIAddress(value) {
+    var raw = String(value === null || value === undefined ? '' : value).trim();
+    if (raw === '') { return ''; }
+    // 粘贴完整接口地址时退回到版本根，例如 /v1/chat/completions 变成 /v1。
+    var trimmed = raw.replace(/\/+$/, '').replace(ENDPOINT_SUFFIX, '').replace(/\/+$/, '');
+    var parsed = parseAddress(trimmed);
+    if (!parsed || parsed.search || parsed.hash) { return trimmed; }
+    // 只填到域名时补上 /v1；写了别的路径就按写的来，上游可能挂在子路径下。
+    if (parsed.pathname === '' || parsed.pathname === '/') { return trimmed + '/v1'; }
+    return trimmed;
+  }
+
+  function parseAddress(value) {
+    try {
+      return new URL(value);
     } catch (error) {
       return null;
     }
@@ -765,12 +864,42 @@
     },
     // 探测上游模型列表时的原因码，用于把失败说清楚。
     invalid_request: function () { return '请先填写 API 地址，并至少填一个密钥。'; },
-    no_model_endpoint: function () { return '该上游没有 /v1/models 接口，请检查 API 地址，或手动添加模型名。'; },
+    invalid_proxy: function (field, params) {
+      return '代理地址不可用：' + text(params.detail, '请检查「代理」这一栏或设置页里的默认代理。');
+    },
+    no_model_endpoint: function (field, params) {
+      var tried = Array.isArray(params.endpoints) && params.endpoints.length
+        ? '（已尝试 ' + params.endpoints.join('、') + '）' : '';
+      return '该上游没有可用的模型列表接口' + tried + '，请检查 API 地址，或手动添加模型名。';
+    },
     credential_rejected: function (field, params) { return '上游拒绝了该密钥（HTTP ' + params.status + '），请检查密钥是否正确。'; },
     upstream_status: function (field, params) { return '上游返回了 HTTP ' + params.status + '。'; },
     unreadable_response: function () { return '上游返回的不是模型列表，请手动添加模型名。'; },
-    unreachable: function () { return '无法连接该上游，请检查地址、代理和网络。'; }
+    unreachable: function (field, params) {
+      var where = [];
+      if (params.endpoint) { where.push('尝试地址 ' + params.endpoint); }
+      var outbound = proxyPhrase(params);
+      if (outbound) { where.push('出口 ' + outbound); }
+      var detail = params.detail ? ' 网关的报错：' + params.detail : '';
+      return '无法连接该上游' + (where.length ? '（' + where.join('，') + '）' : '') +
+        '，请检查地址、代理和网络。' + detail;
+    }
   };
+
+  /* proxyPhrase names the outbound the gateway used, from the stable source code
+   * the probe reports. */
+  function proxyPhrase(params) {
+    switch (params.proxy_source) {
+      case 'system': return '系统代理';
+      case 'direct': return '直连';
+      case 'key':
+      case 'site':
+      case 'default':
+        return params.proxy_url ? '代理 ' + params.proxy_url : '代理';
+      default:
+        return params.proxy_url ? '代理 ' + params.proxy_url : '';
+    }
+  }
 
   /* 配置类型的中文名，用于「仍有 N 条××引用」这类提示。 */
   var RESOURCE_NOUNS = {
@@ -1607,7 +1736,7 @@
     }
 
     function fetchModels(button) {
-      var url = editorFieldValue('url');
+      var url = normalizeAPIAddress(editorFieldValue('url'));
       if (!url) {
         showFeedback(els.editorFeedback, '请先填写 API 地址。', 'error');
         return;
@@ -1624,18 +1753,26 @@
       status.textContent = '正在向上游查询…';
       hideFeedback(els.editorFeedback);
 
+      // 探测带上表单里的代理，走出去的路径和真实请求一致；密钥留空时网关用已保存
+      // 的那个，代理留空时用默认代理。
       post('/management/upstreams/models', {
         id: state.editor ? state.editor.id : 0,
         url: url,
         key: firstKeyLine(),
+        proxy_url: editorFieldValue('proxy_url'),
         headers: headers
       }).then(function (result) {
         setSubmitting(button, false, '获取模型');
         if (result.ok) {
           var models = (result.body && result.body.models) || [];
           models.forEach(function (name) { addModel(name, false, ''); });
-          status.textContent = '上游返回 ' + models.length + ' 个模型';
+          var endpoint = result.body && result.body.endpoint;
+          // 选择计数由 picker 自己维护，探测结果放在反馈区：说清楚是从哪个地址
+          // 拿到的，地址写错时一眼就能看出来。
           paint();
+          showFeedback(els.editorFeedback,
+            '上游返回 ' + models.length + ' 个模型' + (endpoint ? '（来自 ' + endpoint + '）' : '') + '，勾选要使用的模型。',
+            'success');
           return;
         }
         status.textContent = '';
@@ -1765,14 +1902,23 @@
       secretInput.autocomplete = 'new-password';
       secretInput.setAttribute('data-1p-ignore', 'true');
       secretInput.setAttribute('data-lpignore', 'true');
+      secretInput.setAttribute('data-bwignore', 'true');
       secretInput.setAttribute('data-form-type', 'other');
       secretInput.spellcheck = false;
       secretInput.value = '';
       secretInput.placeholder = row && row[field.name] ? '留空保持不变' : text(meta.placeholder, '请输入');
+      // 浏览器和密码管理器会把本站保存的登录密码填进任何一个密码框，而这里填进去
+      // 的会被当成上游/客户端密钥存下来。所以字段先保持只读，聚焦后才可输入，并且
+      // 在没有任何输入的情况下出现的内容一律清掉：提交的就是 operator 亲手填的。
+      keepUnfilled(secretInput);
       return {
         node: secretInput,
         read: function () { return secretInput.value.trim(); }
       };
+    }
+
+    if (meta.type === 'choice_list') {
+      return createChoiceList(field, meta, row);
     }
 
     if (meta.type === 'select' || (field.choices && field.choices.length > 0)) {
@@ -1793,6 +1939,11 @@
         select.appendChild(entry);
       });
       var current = value === null || value === undefined ? '' : String(value);
+      // A create starts on the value the gateway would store for an omitted
+      // field, so the form shows what is about to be saved instead of "not set".
+      if (current === '' && !row && field.default_value !== undefined && field.default_value !== null) {
+        current = String(field.default_value);
+      }
       var known = options.some(function (option) { return String(option.value) === current; });
       if (!known && current !== '') {
         // A value the console does not know is preserved rather than silently
@@ -1816,25 +1967,6 @@
 
     if (meta.type === 'reference') {
       return createReferenceInput(resource, field, meta, inputID, row);
-    }
-
-    if (meta.type === 'id_list') {
-      var listArea = document.createElement('textarea');
-      listArea.id = inputID;
-      listArea.className = 'field-input mono';
-      listArea.rows = 2;
-      listArea.placeholder = text(meta.placeholder, '');
-      listArea.value = value === null || value === undefined ? '' : value;
-      return {
-        node: listArea,
-        read: function () {
-          var raw = listArea.value.trim();
-          if (raw === '') { return null; }
-          var parsed = parseJSON(raw);
-          if (!Array.isArray(parsed)) { throw new FieldError('必须是 JSON 数组，例如 [1, 2]'); }
-          return raw;
-        }
-      };
     }
 
     if (meta.type === 'json' || isJSONKind(field.kind)) {
@@ -1896,11 +2028,20 @@
     input.id = inputID;
     input.className = 'field-input';
     input.type = (field.kind === 'int' || field.kind === 'real') || meta.type === 'number' ? 'number' : 'text';
+    input.autocomplete = 'off';
     if (input.type === 'number') {
       input.step = meta.step || (field.kind === 'int' ? '1' : 'any');
     }
     input.placeholder = text(meta.placeholder, '');
     input.value = value === null || value === undefined ? '' : value;
+    if (meta.normalize) {
+      // The address is shown in the form the gateway stores it in, so the
+      // operator sees what will be saved before saving it.
+      input.addEventListener('blur', function () {
+        var normalized = meta.normalize(input.value);
+        if (normalized !== '' && normalized !== input.value) { input.value = normalized; }
+      });
+    }
     return {
       node: input,
       read: function () {
@@ -1911,7 +2052,176 @@
           if (!isFinite(number)) { throw new FieldError('必须是数字'); }
           return number;
         }
-        return raw;
+        return meta.normalize ? meta.normalize(raw) : raw;
+      }
+    };
+  }
+
+  /* keepUnfilled keeps a credential field empty until the operator types in it.
+   *
+   * A browser or a password manager fills a password input as soon as the dialog
+   * is rendered — with the console's own login password, since that is the
+   * credential saved for this origin — and a value nobody typed would be stored
+   * as an upstream or client key. The field is read-only until it is focused,
+   * which is what makes both leave it alone, and anything that still appears
+   * without a keystroke is cleared. */
+  function keepUnfilled(input) {
+    input.readOnly = true;
+    input.addEventListener('focus', function () { input.readOnly = false; });
+    input.addEventListener('blur', function () {
+      if (input.value === '') { input.readOnly = true; }
+    });
+    window.setTimeout(function () {
+      if (document.activeElement !== input) { input.value = ''; }
+    }, 200);
+  }
+
+  /* createChoiceList is the multi-select field: a restriction is picked from the
+   * candidates the console already holds instead of being typed as JSON. */
+  function createChoiceList(field, meta, row) {
+    var entries = [];
+    var index = {};
+    var filter = '';
+
+    // A candidate keeps the type it arrived with — a route id stays a number,
+    // because the gateway reads these lists as ids — while the string form is
+    // what identifies an entry for selecting and filtering.
+    function add(entry) {
+      var key = entry.value === null || entry.value === undefined ? '' : String(entry.value).trim();
+      if (key === '' || index[key]) { return; }
+      index[key] = true;
+      entries.push({
+        value: entry.value,
+        key: key,
+        label: text(entry.label, key),
+        detail: text(entry.detail, ''),
+        checked: entry.checked === true
+      });
+    }
+
+    var stored = parseJSON(row ? row[field.name] : null);
+    var selected = Array.isArray(stored) ? stored : [];
+    var wanted = {};
+    selected.forEach(function (value) { wanted[String(value)] = true; });
+
+    var candidates = typeof meta.candidates === 'function' ? meta.candidates() : [];
+    candidates.forEach(function (candidate) {
+      add({
+        value: candidate.value,
+        label: candidate.label,
+        detail: candidate.detail,
+        checked: wanted[String(candidate.value)] === true
+      });
+    });
+    // A stored value with no candidate — a route that was deleted, a model that
+    // was renamed — stays selected, so opening the form and saving cannot drop a
+    // restriction the operator never touched.
+    selected.forEach(function (value) {
+      add({
+        value: value,
+        label: meta.describe ? meta.describe(value) : String(value),
+        detail: '不在当前列表中',
+        checked: true
+      });
+    });
+
+    var wrapper = element('div', 'choice-picker');
+    var toolbar = element('div', 'picker-toolbar');
+    var filterInput = document.createElement('input');
+    filterInput.type = 'search';
+    filterInput.className = 'field-input filter-input';
+    filterInput.placeholder = text(meta.filterPlaceholder, '筛选…');
+    filterInput.setAttribute('aria-label', text(meta.filterPlaceholder, '筛选'));
+    filterInput.addEventListener('input', function () {
+      filter = filterInput.value.trim().toLowerCase();
+      paint();
+    });
+    var clearButton = busyButton('btn btn-ghost btn-small', '清空');
+    clearButton.addEventListener('click', function () {
+      entries.forEach(function (entry) { entry.checked = false; });
+      paint();
+    });
+    var status = element('span', 'picker-status', '');
+    toolbar.appendChild(filterInput);
+    toolbar.appendChild(clearButton);
+    toolbar.appendChild(status);
+    wrapper.appendChild(toolbar);
+
+    var list = element('div', 'choice-list');
+    wrapper.appendChild(list);
+
+    if (meta.manual) {
+      var manual = element('div', 'picker-manual');
+      var manualInput = document.createElement('input');
+      manualInput.type = 'text';
+      manualInput.className = 'field-input mono';
+      manualInput.placeholder = text(meta.manual.placeholder, '');
+      var manualButton = busyButton('btn btn-ghost btn-small', text(meta.manual.action, '添加'));
+      manualButton.addEventListener('click', function () {
+        var value = manualInput.value.trim();
+        if (value === '') { return; }
+        add({ value: value, label: value, checked: true });
+        manualInput.value = '';
+        filter = '';
+        filterInput.value = '';
+        paint();
+        list.scrollTop = list.scrollHeight;
+      });
+      manualInput.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter') { event.preventDefault(); manualButton.click(); }
+      });
+      manual.appendChild(manualInput);
+      manual.appendChild(manualButton);
+      wrapper.appendChild(manual);
+    }
+
+    paint();
+
+    function visible() {
+      if (!filter) { return entries; }
+      return entries.filter(function (entry) {
+        return entry.label.toLowerCase().indexOf(filter) !== -1 ||
+          entry.key.toLowerCase().indexOf(filter) !== -1;
+      });
+    }
+
+    function paint() {
+      list.textContent = '';
+      var shown = visible();
+      if (shown.length === 0) {
+        list.appendChild(element('p', 'field-help', entries.length === 0
+          ? text(meta.emptyText, '没有可选的条目。')
+          : '没有符合筛选条件的条目。'));
+      }
+      shown.forEach(function (entry) {
+        var line = element('label', 'choice-line');
+        var box = document.createElement('input');
+        box.type = 'checkbox';
+        box.checked = entry.checked;
+        box.addEventListener('change', function () {
+          entry.checked = box.checked;
+          paintStatus();
+        });
+        line.appendChild(box);
+        line.appendChild(element('span', 'choice-name mono', entry.label));
+        line.appendChild(element('span', 'choice-detail', entry.detail));
+        line.title = entry.key;
+        list.appendChild(line);
+      });
+      paintStatus();
+    }
+
+    function paintStatus() {
+      var count = entries.filter(function (entry) { return entry.checked; }).length;
+      status.textContent = entries.length === 0 ? '' : '已选 ' + count + ' / ' + entries.length + ' 个';
+    }
+
+    return {
+      node: wrapper,
+      read: function () {
+        var values = entries.filter(function (entry) { return entry.checked; })
+          .map(function (entry) { return entry.value; });
+        return values.length === 0 ? null : JSON.stringify(values);
       }
     };
   }

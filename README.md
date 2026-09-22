@@ -299,6 +299,14 @@ administrator account), 运行策略 (the runtime policy), and 代理 (proxy pro
 The upstream form is built around the four things that actually vary between
 upstreams:
 
+- **The address is completed, not corrected later.** A trailing slash is dropped and a
+  bare host is completed to its versioned API root, so `https://api.example.com`,
+  `https://api.example.com/`, `https://api.example.com/v1` and
+  `https://api.example.com/v1/` are stored as one address; a full endpoint pasted from a
+  provider's documentation (`…/v1/chat/completions`) is trimmed back to the version root.
+  A path the operator wrote is kept as written, because an upstream may be mounted under
+  one (`https://example.com/openai`), and the probe tries both the versioned and the bare
+  listing path for whichever address it is given.
 - **Keys are pasted in one go.** One key per line, as many as needed. The stored
   keys are shown masked and are matched by position: an untouched line keeps the
   key it stands for, a changed line replaces it, an added line is stored, and a
@@ -309,10 +317,22 @@ upstreams:
 - **Models are picked, not typed.** 获取模型 asks the upstream itself for its model
   list, so the operator selects from what it really serves; a model can also be
   typed in by hand. Each selected model takes an optional upstream model name —
-  the spelling that upstream knows, when it differs from the name clients use.
+  the spelling that upstream knows, when it differs from the name clients use. The
+  probe goes out the way a real request to that upstream would: through the proxy
+  in the form, or the default proxy profile when the form leaves it open, and the
+  answer names the address that served the listing. A probe that fails says which
+  address it tried, which way the request left the gateway, and what the error was,
+  so a wrong address and a missing proxy can be told apart.
 - **Routing is derived.** Selecting a model creates its route and one line per key;
   deselecting it removes them once no other upstream serves that model. A route the
   operator wrote by hand through the API is never pruned by a console edit.
+
+An upstream added from the console is created enabled, so its lines serve traffic
+as soon as it is saved. Client keys are created enabled too, and their restrictions —
+排除模型 (denied models), 限定路由 (allowed routes), and 排除上游 (excluded upstreams) —
+are picked from the routes, upstreams, and models the gateway already holds rather than
+typed as JSON; a value stored by hand that is no longer in those lists stays selected,
+so editing a key cannot drop a restriction by accident.
 
 Each editable table has an 添加 button, and every row has 编辑 and 删除 actions;
 client keys additionally have 轮换, which mints a new value and invalidates the old
@@ -328,6 +348,10 @@ browser:
   row starts with the mask and leaves the stored value alone unless a new value is
   typed, so a mask can never be saved back over a credential. A client key is shown
   in full exactly once, when it is created or rotated.
+- **Credential fields refuse to be filled in.** A credential input stays read-only
+  until it is focused and anything that appears in it without a keystroke is cleared,
+  because a browser or password manager would otherwise fill it with the console's own
+  saved login and that value would be stored as a key.
 - **References are checked.** A channel must name a route and an account, ids have
   to exist, and a delete is refused while other rows still point at what it would
   remove — the refusal says how many and of which kind. Deleting an upstream does
@@ -455,9 +479,14 @@ does not show, such as a forced endpoint or a per-key proxy.
 /management/breakers/reset` clears one recorded circuit (`scope` of `channel`, `key`, or
 `key_model` with the identifying fields) or every circuit (`scope: "all"`). `POST
 /management/upstreams/models` asks an upstream for its model list: the body carries the
-`url`, one `key`, and any `headers` from the form before it is saved, or an `id` and a
-masked key so the gateway probes with the key it already stores. The key is used for
-that one outbound request and is never part of a response.
+`url`, one `key`, the `proxy_url`, and any `headers` from the form before it is saved, or
+an `id` and a masked key so the gateway probes with the key it already stores. An empty
+`proxy_url` probes through the default proxy profile, which is how the gateway would
+reach that upstream anyway. The key is used for that one outbound request and is never
+part of a response. The answer names the `endpoint` that served the listing; a failure
+answers with a stable `reason` and its `params`, including the `endpoint` that was tried,
+the `proxy_source` (`direct`, `system`, or `default` with `proxy_url`) the request left
+through, and the underlying error.
 
 The write endpoints refuse a request that changes nothing valid: `400` with
 `invalid_configuration` for a bad value (the body names the `field` and a stable

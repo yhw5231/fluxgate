@@ -354,6 +354,11 @@ func describeFields(resource store.Resource) []map[string]any {
 		if column.Kind == store.KindBool {
 			field["default"] = column.Default
 		}
+		// A create that omits the field stores this value, so the form shows it
+		// as the preselected choice rather than leaving the field open.
+		if column.DefaultValue != nil {
+			field["default_value"] = column.DefaultValue
+		}
 		described = append(described, field)
 	}
 	return described

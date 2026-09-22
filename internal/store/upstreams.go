@@ -94,7 +94,9 @@ var upstreamResource = Resource{
 		{Name: "global_weight", Kind: KindReal, Validate: validatePositive},
 		{Name: "custom_headers", Kind: KindJSONObject, MaxLength: 8192, Validate: validateStringMap},
 		{Name: "proxy_url", Kind: KindText, MaxLength: 2048, Validate: validateProxyURL},
-		{Name: "status", Kind: KindText, MaxLength: 32, Choices: []string{"active", "disabled"}},
+		// An upstream added from the console is enabled: a new upstream nobody
+		// can route to would look broken rather than unconfigured.
+		{Name: "status", Kind: KindText, MaxLength: 32, Choices: []string{"active", "disabled"}, DefaultValue: "active"},
 		// The key list is the account's access token followed by its tokens, in
 		// the order the operator sees them. A value that is empty or still
 		// carries the mask keeps the stored key at that position, which is what

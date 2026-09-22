@@ -85,6 +85,203 @@ func TestModelsUsesTheVersionedAddressAsGiven(t *testing.T) {
 	}
 }
 
+// One upstream has several spellings — with or without a trailing slash, with or
+// without the version segment, mounted under a subpath — and all of them have to
+// find its model listing. An operator types whatever the upstream's own
+// documentation shows.
+func TestModelsAdaptsToTheSpellingOfTheAddress(t *testing.T) {
+	versioned := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/v1/models") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":["versioned-model"]}`))
+	}))
+	defer versioned.Close()
+
+	rooted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/v1/models") || !strings.HasSuffix(r.URL.Path, "/models") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":["root-model"]}`))
+	}))
+	defer rooted.Close()
+
+	mounted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/openai/v1/models" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":["mounted-model"]}`))
+	}))
+	defer mounted.Close()
+
+	cases := []struct {
+		name    string
+		base    string
+		want    string
+		model   string
+		missing string
+	}{
+		{name: "bare host", base: versioned.URL, want: versioned.URL + "/v1/models", model: "versioned-model"},
+		{name: "trailing slash", base: versioned.URL + "/", want: versioned.URL + "/v1/models", model: "versioned-model"},
+		{name: "version", base: versioned.URL + "/v1", want: versioned.URL + "/v1/models", model: "versioned-model"},
+		{name: "version with trailing slash", base: versioned.URL + "/v1/", want: versioned.URL + "/v1/models", model: "versioned-model"},
+		// The same address written without the version segment still finds a
+		// listing that sits at /models, because a versioned address is also
+		// probed one level up.
+		{name: "unversioned", base: rooted.URL, want: rooted.URL + "/models", model: "root-model"},
+		{name: "version printed anyway", base: rooted.URL + "/v1", want: rooted.URL + "/models", model: "root-model"},
+		{name: "mounted under a subpath", base: mounted.URL + "/openai/v1", want: mounted.URL + "/openai/v1/models", model: "mounted-model"},
+		{name: "subpath without the version", base: mounted.URL + "/openai", want: mounted.URL + "/openai/v1/models", model: "mounted-model"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			result, err := (&Client{}).Models(context.Background(), Request{BaseURL: testCase.base, APIKey: "secret"})
+			if err != nil {
+				t.Fatalf("Models(%q) error = %v", testCase.base, err)
+			}
+			if len(result.Models) != 1 || result.Models[0] != testCase.model {
+				t.Errorf("models = %v, want %s", result.Models, testCase.model)
+			}
+			if result.Endpoint != testCase.want {
+				t.Errorf("endpoint = %q, want %q", result.Endpoint, testCase.want)
+			}
+		})
+	}
+}
+
+// A probe that finds no listing says which addresses it tried, because that is
+// what tells an operator whether the address or the upstream is wrong.
+func TestModelsReportsEveryPathItTried(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	_, err := (&Client{}).Models(context.Background(), Request{BaseURL: server.URL, APIKey: "secret"})
+	var failed Failure
+	if !errors.As(err, &failed) || failed.Reason != ReasonNoModelEndpoint {
+		t.Fatalf("error = %v, want a %s failure", err, ReasonNoModelEndpoint)
+	}
+	endpoints, ok := failed.Params["endpoints"].([]string)
+	if !ok || len(endpoints) != 2 {
+		t.Fatalf("failure params = %v, want the endpoints that were tried", failed.Params)
+	}
+	if endpoints[0] != server.URL+"/v1/models" || endpoints[1] != server.URL+"/models" {
+		t.Errorf("endpoints = %v, want the versioned path first", endpoints)
+	}
+	if !strings.Contains(failed.Error(), endpoints[0]) {
+		t.Errorf("error = %q, want it to name the address it tried", failed.Error())
+	}
+}
+
+// The proxy the form carries is what the probe goes out through: an upstream
+// that is only reachable through one cannot be listed without it.
+func TestModelsProbesThroughTheConfiguredProxy(t *testing.T) {
+	var proxied int
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":["direct-model"]}`))
+	}))
+	defer upstreamServer.Close()
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxied++
+		_, _ = w.Write([]byte(`{"data":["proxied-model"]}`))
+	}))
+	defer proxyServer.Close()
+
+	result, err := (&Client{}).Models(context.Background(), Request{
+		BaseURL: upstreamServer.URL, APIKey: "secret", ProxyURL: proxyServer.URL,
+	})
+	if err != nil {
+		t.Fatalf("Models() error = %v", err)
+	}
+	if proxied != 1 {
+		t.Fatalf("the proxy saw %d requests, want 1", proxied)
+	}
+	if len(result.Models) != 1 || result.Models[0] != "proxied-model" {
+		t.Errorf("models = %v, want the answer the proxy relayed", result.Models)
+	}
+}
+
+// An upstream that cannot be reached through the proxy it was given fails, and
+// the failure says which proxy carried it: an operator cannot fix a proxy the
+// message does not name.
+func TestModelsReportsTheProxyItUsedWhenItCannotConnect(t *testing.T) {
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":["direct-model"]}`))
+	}))
+	defer upstreamServer.Close()
+
+	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	proxyAddress := closed.URL
+	closed.Close()
+
+	_, err := (&Client{}).Models(context.Background(), Request{
+		BaseURL: upstreamServer.URL, APIKey: "secret", ProxyURL: proxyAddress,
+	})
+	var failed Failure
+	if !errors.As(err, &failed) || failed.Reason != ReasonUnreachable {
+		t.Fatalf("error = %v, want a %s failure", err, ReasonUnreachable)
+	}
+	if failed.Params["proxy_url"] != proxyAddress {
+		t.Errorf("failure params = %v, want the proxy address that was used", failed.Params)
+	}
+	if failed.Params["endpoint"] != upstreamServer.URL+"/v1/models" {
+		t.Errorf("failure params = %v, want the endpoint that was tried", failed.Params)
+	}
+}
+
+// An explicit direct connection means the address is used as given, with no
+// proxy in front of it — which is what makes "direct" a setting rather than a
+// synonym for an empty field.
+func TestModelsHonoursAnExplicitDirectConnection(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":["local-model"]}`))
+	}))
+	defer server.Close()
+
+	if _, err := (&Client{}).Models(context.Background(), Request{
+		BaseURL: server.URL, APIKey: "secret", ProxyURL: "direct",
+	}); err != nil {
+		t.Fatalf("Models(direct) error = %v", err)
+	}
+
+	// The same upstream through a proxy that is not there fails, so the field
+	// really decides the route instead of being ignored.
+	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	proxyAddress := closed.URL
+	closed.Close()
+
+	_, err := (&Client{}).Models(context.Background(), Request{
+		BaseURL: server.URL, APIKey: "secret", ProxyURL: proxyAddress,
+	})
+	var failed Failure
+	if !errors.As(err, &failed) {
+		t.Fatalf("error = %v, want a described failure", err)
+	}
+	if failed.Reason != ReasonUnreachable {
+		t.Errorf("reason = %q, want %s", failed.Reason, ReasonUnreachable)
+	}
+	if failed.Params["proxy_url"] != proxyAddress {
+		t.Errorf("failure params = %v, want the proxy that was used", failed.Params)
+	}
+}
+
+// A proxy that cannot be used is a configuration mistake, not an unreachable
+// upstream, so it is reported as one.
+func TestModelsRejectsAnUnusableProxy(t *testing.T) {
+	_, err := (&Client{}).Models(context.Background(), Request{
+		BaseURL: "https://api.example.com", APIKey: "secret", ProxyURL: "socks4://127.0.0.1:1080",
+	})
+	var failed Failure
+	if !errors.As(err, &failed) || failed.Reason != ReasonInvalidProxy {
+		t.Fatalf("error = %v, want a %s failure", err, ReasonInvalidProxy)
+	}
+}
+
 func TestModelsReportsWhatWentWrong(t *testing.T) {
 	unauthorized := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
