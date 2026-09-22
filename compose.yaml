@@ -16,6 +16,12 @@ services:
     # 本地构建的镜像标签
     image: fluxgate:local
     container_name: fluxgate
+    # 固定使用 Docker 默认 bridge 网络，禁止 Compose 自建项目网络。
+    # 自建 bridge 会另外启一套容器网络（内嵌 DNS + 自己的转发/NAT 规则），其中任何
+    # 一环在该宿主机上不通，容器就没有可用的出网路径：域名解析无响应或连出去的包
+    # 被静默丢弃，网关报「无法连接该上游 ... context deadline exceeded」，而宿主机
+    # curl 同一个地址却秒回。默认 bridge 沿用宿主机既有网络，与宿主机行为一致。
+    network_mode: bridge
     # 容器异常退出后自动重启（手动 docker stop 除外）
     restart: unless-stopped
     ports:

@@ -190,6 +190,19 @@ By default, Compose publishes host port `8081`, mounts `./data` at `/data`, and 
 
 The Compose service runs with a read-only root filesystem, drops all Linux capabilities except `CHOWN`, `SETUID`, and `SETGID` (used only by the startup entrypoint to repair data-directory ownership before dropping to the unprivileged gateway user), enables `no-new-privileges`, uses a temporary `/tmp`, persists the SQLite database through a bind mount, and includes an HTTP health check.
 
+### Container networking
+
+The service is pinned to Docker's default bridge network (`network_mode: bridge`), so Compose does not create a project network for it, and it must stay that way. A self-created bridge brings its own networking with it — an embedded DNS resolver plus its own forwarding and NAT rules — and if any part of that does not work on the host, the container has no working outbound path even though the host does. Name resolution either goes unanswered or the container's packets leave and are silently dropped, and the console then reports every upstream as unreachable — `无法连接该上游 ... context deadline exceeded` — while `curl` on the host answers the same address instantly. The default bridge reuses the host's existing network, so the container behaves the way the host does.
+
+When an upstream is reported as unreachable, compare the two paths before changing any gateway setting:
+
+```bash
+curl -sS -m 20 -o /dev/null -w '%{http_code} %{time_total}\n' https://upstream.example.com/v1/models
+docker exec fluxgate wget -T 20 -O /dev/null https://upstream.example.com/v1/models; echo "exit=$?"
+```
+
+An HTTP status in both cases means the address and the credential are worth checking instead; an exit code of `8` from `wget` is also a successful connection (the server answered an error), whereas a hang is the container's outbound path.
+
 ### Upgrade an existing deployment
 
 Pull the latest code and rebuild the image in place. The SQLite database lives in the bind-mounted data directory, so it survives both steps:
@@ -214,6 +227,7 @@ Run it with a persistent database directory:
 docker run -d \
   --name fluxgate \
   --restart unless-stopped \
+  --network bridge \
   --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=16m \
   --security-opt no-new-privileges \
@@ -226,6 +240,8 @@ docker run -d \
   -e FLUXGATE_ADMIN_PASSWORD="replace-with-a-strong-password" \
   fluxgate:local
 ```
+
+`--network bridge` is explicit on purpose: the container has to resolve upstream names the way the host does. Do not move it onto a network you created yourself — see [Container networking](#container-networking).
 
 ### Validate container configuration
 
