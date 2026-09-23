@@ -2,6 +2,11 @@
 
 FROM golang:1.23-alpine AS builder
 
+# The console reports which revision it is running, and the toolchain reads that
+# from the checkout it builds in with git. The .git directory is kept in the
+# build context for the same reason; without it the binary is stamped "unknown".
+RUN apk add --no-cache git
+
 WORKDIR /src
 
 COPY go.mod go.sum ./
@@ -9,9 +14,12 @@ RUN go mod download
 
 COPY . .
 
+# GIT_COMMIT covers only what the stamp cannot: a build whose context carries no
+# checkout for the toolchain to read.
+ARG GIT_COMMIT=""
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
-    -ldflags="-s -w" \
+    -ldflags="-s -w -X github.com/yhw5231/fluxgate/internal/version.Commit=${GIT_COMMIT}" \
     -o /out/fluxgate \
     ./cmd/fluxgate
 

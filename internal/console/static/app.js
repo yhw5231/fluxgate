@@ -84,6 +84,7 @@
 
     els.status = $('topbar-status');
     els.statusLabel = els.status.querySelector('[data-status-label]');
+    els.version = $('topbar-version');
     els.uptime = $('topbar-uptime');
     els.refresh = $('refresh-button');
     els.signout = $('signout-button');
@@ -1398,6 +1399,11 @@
     setStatus(ready ? 'ok' : 'bad', ready ? '就绪' : '未就绪');
     setStat('service', ready ? '在线' : '降级', status.service ? text(status.service) : '网关服务',
       ready ? 'ok' : 'bad');
+    // Which build is running, next to how long it has been running. The status
+    // carries the abbreviation it wants shown; the full revision goes in the
+    // tooltip for the one matching it against the repository.
+    els.version.textContent = text(status.version, '未知');
+    els.version.title = status.commit ? '仓库版本 ' + status.commit : '仓库版本未知';
     els.uptime.textContent = '已运行 ' + formatDuration(status.uptime_ms);
     els.uptime.title = '进程运行时长';
 

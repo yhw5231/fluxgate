@@ -340,7 +340,10 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 
 .topbar-actions { display: flex; align-items: center; gap: 10px; }
 
-.uptime {
+/* 顶栏这两个标记同一形状：一个是进程已经服务了多久，一个是这个进程是哪次构建。
+ * 版本号是构建出的事实而不是会变的状态，所以不填充底色，比旁边的运行时长轻一档。 */
+.uptime,
+.version {
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--text-muted);
@@ -350,6 +353,8 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   background: rgba(148, 163, 184, 0.05);
   white-space: nowrap;
 }
+
+.version { background: none; }
 
 .status-pill {
   display: inline-flex;
@@ -1301,7 +1306,8 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   [data-settings-panel],
   #policy-panels { gap: 18px; }
   .brand-sub { display: none; }
-  .uptime { display: none; }
+  .uptime,
+  .version { display: none; }
   .panel-header { padding: 14px 16px; }
   .panel-note { display: none; }
   .data-table thead th,

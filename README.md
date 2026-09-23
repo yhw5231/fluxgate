@@ -292,9 +292,9 @@ Management console:
 The management console is a self-contained, embedded web UI served directly by the
 gateway binary. It requires no separate build step, static file directory, or Node
 runtime. Open it in a browser, sign in with the administrator account, and the
-dashboard shows gateway readiness and uptime, circuit-breaker state, upstream
-lines, routable models, and the record of the requests it served, refreshing itself
-every ten seconds. The interface is
+dashboard shows gateway readiness, uptime, the revision the binary was built
+from, circuit-breaker state, upstream lines, routable models, and the record of
+the requests it served, refreshing itself every ten seconds. The interface is
 in Simplified Chinese; the endpoints it calls are unchanged, and the gateway's own
 error codes stay stable for automation while the console renders them in Chinese.
 

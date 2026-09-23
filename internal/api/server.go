@@ -23,6 +23,7 @@ import (
 	"github.com/yhw5231/fluxgate/internal/proxy"
 	"github.com/yhw5231/fluxgate/internal/router"
 	"github.com/yhw5231/fluxgate/internal/store"
+	"github.com/yhw5231/fluxgate/internal/version"
 )
 
 // Authenticator validates a downstream credential without exposing it.
@@ -355,7 +356,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		started = time.Now()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"service":     "fluxgate",
+		"service": "fluxgate",
+		// Version is what the console shows next to the uptime; Commit is the same
+		// revision unabbreviated, for the operator comparing the running build
+		// against the repository.
+		"version":     version.Short(),
+		"commit":      version.Revision(),
 		"ready":       s.Engine != nil && s.Ready.Load(),
 		"model_count": len(s.currentModels()),
 		"uptime_ms":   time.Since(started).Milliseconds(),

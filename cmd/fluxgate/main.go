@@ -22,6 +22,7 @@ import (
 	"github.com/yhw5231/fluxgate/internal/proxy"
 	"github.com/yhw5231/fluxgate/internal/router"
 	"github.com/yhw5231/fluxgate/internal/store"
+	"github.com/yhw5231/fluxgate/internal/version"
 )
 
 func main() {
@@ -190,6 +191,7 @@ func run(parent context.Context, logger *slog.Logger) error {
 	serveErrors := make(chan error, 1)
 	go func() {
 		logger.Info("gateway_started",
+			"version", version.Short(),
 			"address", cfg.Address,
 			"model_count", len(configuration.Models),
 			"channel_count", len(configuration.Channels),

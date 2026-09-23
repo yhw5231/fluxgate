@@ -1,4 +1,6 @@
-.git
+# .git is deliberately not ignored: the builder reads it to stamp the binary with
+# the revision it was built from, which is what the console shows next to the
+# uptime. Ignored, that binary can only report "unknown".
 .gitignore
 .github
 
