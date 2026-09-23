@@ -312,7 +312,7 @@
             <span class="panel-note">每 10 秒自动刷新 &middot; <span data-next-refresh>&mdash;</span></span>
           </div>
         </header>
-        <p class="panel-help">网关服务过的每个请求都记在这里：结果、走的哪条线路、上游返回的原文，以及每一次尝试的耗时。客户端只拿到状态码和错误码，<strong>上游到底说了什么只在这里</strong>，所以排查报错从这里开始。点开一行能看到每次尝试的明细。</p>
+        <p class="panel-help">网关服务过的每个请求都记在这里：结果、走的哪条线路、上游返回的原文，以及每一次尝试的耗时。线路只记真正发过请求的线路，被熔断（冷却）跳过的线路不在其中。客户端只拿到状态码和错误码，<strong>上游到底说了什么只在这里</strong>，所以排查报错从这里开始。点开一行能看到每次尝试的明细。</p>
         <div class="panel-toolbar">
           <button id="requests-failed" class="btn btn-ghost btn-small" type="button" aria-pressed="false">只看失败</button>
           <input id="requests-model" class="filter-input" type="search" placeholder="按模型筛选…" aria-label="按模型筛选">

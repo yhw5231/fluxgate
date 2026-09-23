@@ -234,6 +234,15 @@ func ScopeForMode(mode string, fallback Mode, channelID, keyID, model string) Sc
 	return scopeForMode(modeOrDefault(mode, fallback), channelID, keyID, model)
 }
 
+// EffectiveMode returns the mode one channel runs in: the mode it carries itself,
+// or the given process-wide default when it carries none. It is the question a
+// view has to answer before it can report which circuit holds a line out of
+// rotation, because only the scope that mode names is consulted when a request
+// asks whether the line may answer.
+func EffectiveMode(configured string, fallback Mode) Mode {
+	return modeOrDefault(configured, fallback)
+}
+
 func (b *Breaker) policyForMode(mode Mode) Policy {
 	policy := b.currentPolicy()
 	policy.Mode = mode

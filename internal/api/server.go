@@ -550,23 +550,32 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 // for one upstream model. Only the gateway holds the credential, so the answer is
 // resolved here and reported per line rather than by credential to the console.
 //
-// The circuit the line runs in is asked for first, but a circuit filed under
-// another scope still holds it out of rotation — a mode that changed, or a
-// per-model circuit for a name a pattern route also matches — so every circuit
-// that can block the line is a candidate and the most restrictive one wins.
+// Only the scope the line's own mode names is consulted when a request asks
+// whether the line may answer, so only that scope is reported: a circuit filed
+// under another one — a mode the upstream has since changed, or a line's circuit
+// for a model this route does not serve — does not hold this line out, and saying
+// it does would have an operator read a line as skipped while requests are still
+// going to it. A per-model circuit is the one exception, because a pattern route
+// is asked for many model names and every recorded one of them reaches the same
+// line; the most restrictive circuit among those wins.
 func lineCircuit(circuits map[breaker.Scope]breaker.State, channel domain.Channel, route domain.Route, fallback breaker.Mode, now time.Time) (breaker.State, breaker.Scope, bool) {
 	if len(circuits) == 0 {
 		return breaker.State{}, breaker.Scope{}, false
 	}
 	candidates := []breaker.Scope{
 		breaker.ScopeForMode(channel.BreakerMode, fallback, channel.ID, channel.APIKey, router.ActualModel(routedModelName(route), route, channel)),
-		{ChannelID: channel.ID},
 	}
-	if channel.APIKey != "" {
-		candidates = append(candidates, breaker.Scope{KeyID: channel.APIKey})
-		for scope := range circuits {
-			if scope.KeyID == channel.APIKey && scope.Model != "" {
-				candidates = append(candidates, scope)
+	switch breaker.EffectiveMode(channel.BreakerMode, fallback) {
+	case breaker.ModeKeyCooldown:
+		if channel.APIKey != "" {
+			candidates = append(candidates, breaker.Scope{KeyID: channel.APIKey})
+		}
+	case breaker.ModeKeyModelCooldown:
+		if channel.APIKey != "" {
+			for scope := range circuits {
+				if scope.KeyID == channel.APIKey && scope.Model != "" {
+					candidates = append(candidates, scope)
+				}
 			}
 		}
 	}

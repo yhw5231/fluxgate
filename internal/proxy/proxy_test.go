@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yhw5231/fluxgate/internal/breaker"
 	"github.com/yhw5231/fluxgate/internal/domain"
 	"github.com/yhw5231/fluxgate/internal/router"
 )
@@ -457,5 +459,202 @@ func TestEnginePolicyCanBeReplacedAtRuntime(t *testing.T) {
 	}
 	if calls != 4 {
 		t.Errorf("calls = %d, want three more attempts under the installed policy", calls)
+	}
+}
+
+// A line that keeps failing is held out of rotation, and the circuit that holds
+// it out is the one its failures were filed under.
+//
+// The line is asked for a model of its own, so its circuit is filed under that
+// name while the client asks for the mapped one. Selection therefore has to ask
+// the breaker about the name the line is asked for: asked about the requested
+// one it looks up a circuit that is never written, and a line that answers 503
+// to everything is walked on every request forever while its recorded cooldown
+// keeps escalating unseen.
+func TestEngineHoldsOutAMappedLineThatKeepsFailing(t *testing.T) {
+	var deadCalls, liveCalls int
+	dead := channelServer(t, http.StatusServiceUnavailable, &deadCalls)
+	live := channelServer(t, http.StatusOK, &liveCalls)
+
+	circuit := &breaker.Breaker{
+		Policy: breaker.Policy{
+			Mode:         breaker.ModeKeyModelCooldown,
+			Threshold:    2,
+			BaseCooldown: time.Minute,
+			MaxCooldown:  time.Minute,
+			Multiplier:   1,
+		},
+		Store: breaker.NewMemoryStore(),
+	}
+	engine := &Engine{
+		Selector: router.NewMemorySelectorWithFilter(routeFor(
+			domain.ModelMapping{{Pattern: "gpt-*", Target: "mapped-model"}},
+			// The failing line belongs to the preferred upstream, so every request
+			// starts on it until its circuit holds it out.
+			domain.Channel{
+				ID: "dead", Name: "workbuddy", BaseURL: dead.URL, APIKey: "dead-key",
+				Enabled: true, Weight: 1, SiteID: 1, SitePriority: 20,
+				RoutingStrategy: "round_robin", BreakerMode: "key_model_cooldown",
+			},
+			domain.Channel{
+				ID: "live", Name: "unigate", BaseURL: live.URL, APIKey: "live-key",
+				Enabled: true, Weight: 1, SiteID: 2, SitePriority: 10,
+				RoutingStrategy: "round_robin", BreakerMode: "key_model_cooldown",
+			},
+		), circuit),
+		Observer: circuit,
+		Client:   &http.Client{},
+		Policy: domain.RetryPolicy{
+			MaxAttempts:           4,
+			MaxAttemptsPerChannel: 1,
+			RetryStatuses:         map[int]struct{}{http.StatusServiceUnavailable: {}},
+		},
+		Sleep: noSleep,
+	}
+
+	forward := func(requestID string) Result {
+		t.Helper()
+		result, err := engine.Forward(context.Background(), domain.Request{
+			Method:    http.MethodPost,
+			Path:      "/v1/chat/completions",
+			Body:      []byte(`{"model":"gpt-4.1","messages":[]}`),
+			Model:     "gpt-4.1",
+			RequestID: requestID,
+		})
+		if err != nil {
+			t.Fatalf("Forward(%s) error = %v", requestID, err)
+		}
+		result.Response.Body.Close()
+		return result
+	}
+
+	// Two requests that fail on the line are what its threshold counts, and both
+	// of them fall through to the healthy upstream.
+	for request := 1; request <= 2; request++ {
+		result := forward(fmt.Sprintf("req-%d", request))
+		if len(result.Trace.Attempts) != 2 {
+			t.Fatalf("request %d attempts = %d, want the failing line and then the healthy one", request, len(result.Trace.Attempts))
+		}
+		if result.Attempt.ChannelID != "live" {
+			t.Fatalf("request %d was served by %q, want the healthy upstream", request, result.Attempt.ChannelID)
+		}
+	}
+
+	// The third request never reaches the failed line: it is cooling down.
+	result := forward("req-3")
+	if len(result.Trace.Attempts) != 1 {
+		t.Fatalf("attempts after the circuit tripped = %d, want only the healthy upstream", len(result.Trace.Attempts))
+	}
+	if result.Attempt.ChannelID != "live" {
+		t.Fatalf("channel after the circuit tripped = %q, want live", result.Attempt.ChannelID)
+	}
+	if deadCalls != 2 {
+		t.Errorf("the failed upstream was called %d times, want no call once its line is cooling", deadCalls)
+	}
+	if liveCalls != 3 {
+		t.Errorf("the healthy upstream was called %d times, want once per request", liveCalls)
+	}
+
+	// The circuit is filed under the model the line was asked for, not the one the
+	// client asked for.
+	if _, known := circuit.Store.Load(breaker.Scope{KeyID: "dead-key", Model: "mapped-model"}); !known {
+		t.Error("the failing line's circuit is not filed under the model it was asked for")
+	}
+	if !circuit.IsBlocked(domain.Channel{ID: "dead", APIKey: "dead-key", BreakerMode: "key_model_cooldown"}, "mapped-model") {
+		t.Error("the failing line is not held out of rotation")
+	}
+}
+
+// The trace of a request is the path it really walked: only the lines that were
+// dispatched to leave an entry, so a line the router skips — held out of rotation
+// as a whole, or for the model it would be asked for — is not part of the path and
+// not counted among the attempts. A cooling line's own name carrying the failure
+// that put it there is what an operator reads the path for, and a line that was
+// never asked cannot explain anything.
+func TestEngineTracesOnlyTheLinesItAsked(t *testing.T) {
+	cooling := []struct {
+		name  string
+		mode  string
+		scope breaker.Scope
+	}{
+		{"whole line cooling", "key_cooldown", breaker.Scope{KeyID: "dead-key"}},
+		{"line cooling for the model it is asked for", "key_model_cooldown", breaker.Scope{KeyID: "dead-key", Model: "mapped-model"}},
+	}
+
+	for _, scenario := range cooling {
+		t.Run(scenario.name, func(t *testing.T) {
+			var deadCalls, liveCalls int
+			dead := channelServer(t, http.StatusServiceUnavailable, &deadCalls)
+			live := channelServer(t, http.StatusOK, &liveCalls)
+
+			store := breaker.NewMemoryStore()
+			store.Update(scenario.scope, func(breaker.State) breaker.State {
+				return breaker.State{ConsecutiveFailures: 3, CooldownLevel: 1, BlockedUntil: time.Now().Add(time.Minute)}
+			})
+			circuit := &breaker.Breaker{
+				Policy: breaker.Policy{
+					Mode:         breaker.Mode(scenario.mode),
+					Threshold:    3,
+					BaseCooldown: time.Minute,
+					MaxCooldown:  time.Minute,
+					Multiplier:   1,
+				},
+				Store: store,
+			}
+			engine := &Engine{
+				Selector: router.NewMemorySelectorWithFilter(routeFor(
+					domain.ModelMapping{{Pattern: "gpt-*", Target: "mapped-model"}},
+					domain.Channel{
+						ID: "dead", Name: "workbuddy", BaseURL: dead.URL, APIKey: "dead-key",
+						Enabled: true, Weight: 1, SiteID: 1, SitePriority: 20,
+						RoutingStrategy: "round_robin", BreakerMode: scenario.mode,
+					},
+					domain.Channel{
+						ID: "live", Name: "unigate", BaseURL: live.URL, APIKey: "live-key",
+						Enabled: true, Weight: 1, SiteID: 2, SitePriority: 10,
+						RoutingStrategy: "round_robin", BreakerMode: scenario.mode,
+					},
+				), circuit),
+				Observer: circuit,
+				Client:   &http.Client{},
+				Policy: domain.RetryPolicy{
+					MaxAttempts:           4,
+					MaxAttemptsPerChannel: 1,
+					RetryStatuses:         map[int]struct{}{http.StatusServiceUnavailable: {}},
+				},
+				Sleep: noSleep,
+			}
+
+			result, err := engine.Forward(context.Background(), domain.Request{
+				Method:    http.MethodPost,
+				Path:      "/v1/chat/completions",
+				Body:      []byte(`{"model":"gpt-4.1","messages":[]}`),
+				Model:     "gpt-4.1",
+				RequestID: "req-1",
+			})
+			if err != nil {
+				t.Fatalf("Forward() error = %v", err)
+			}
+			defer result.Response.Body.Close()
+
+			if len(result.Trace.Attempts) != 1 {
+				t.Fatalf("traced attempts = %d, want only the line that answered: %#v", len(result.Trace.Attempts), result.Trace.Attempts)
+			}
+			attempt := result.Trace.Attempts[0]
+			if attempt.ChannelID != "live" || attempt.ChannelName != "unigate" {
+				t.Errorf("traced line = %s/%s, want the line that answered", attempt.ChannelID, attempt.ChannelName)
+			}
+			// Attempts are numbered by what was dispatched, so the first line a
+			// request walks is always attempt 1 — a skipped line takes no number.
+			if attempt.Number != 1 {
+				t.Errorf("traced attempt number = %d, want 1", attempt.Number)
+			}
+			if deadCalls != 0 {
+				t.Errorf("the cooling upstream was called %d times, want none", deadCalls)
+			}
+			if liveCalls != 1 {
+				t.Errorf("the answering upstream was called %d times, want once", liveCalls)
+			}
+		})
 	}
 }

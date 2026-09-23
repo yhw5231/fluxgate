@@ -152,23 +152,23 @@ func TestSnapshotReportsALineItsConfigurationDisables(t *testing.T) {
 	}
 }
 
-// A line can be held by two circuits at once — its own and the one its credential
-// shares — and the view reports the one that releases last.
+// A line can be held by more than one circuit at once, and the view reports the
+// one that releases last. A key-and-model line is the case: a pattern route is
+// asked for many model names, and each of them reaches the same line.
 func TestSnapshotReportsTheCircuitThatHoldsALineLongest(t *testing.T) {
 	server, _ := managementServer(t)
-	addUpstream(t, server, "alpha", "gpt-4o", "sk-alpha-key")
+	siteID := addUpstream(t, server, "alpha", "gpt-4o", "sk-alpha-key")
+	setCooldownMode(t, server, siteID, "key_model_cooldown")
 
-	line := snapshotChannelByName(t, server, "alpha")
-	channelID, _ := line["id"].(string)
 	sooner := time.Now().Add(time.Minute).UTC()
 	later := time.Now().Add(time.Hour).UTC()
 	server.BreakerSnapshotter = staticCircuits{
-		{ChannelID: channelID}:  {BlockedUntil: sooner},
-		{KeyID: "sk-alpha-key"}: {BlockedUntil: later, CooldownLevel: 3},
+		{KeyID: "sk-alpha-key", Model: "gpt-4o"}:      {BlockedUntil: sooner},
+		{KeyID: "sk-alpha-key", Model: "gpt-4o-mini"}: {BlockedUntil: later, CooldownLevel: 3},
 	}
 
 	state := channelState(t, snapshotChannelByName(t, server, "alpha"))
-	if state["scope"] != "key" {
+	if state["scope"] != "key_model" {
 		t.Errorf("scope = %v, want the circuit that releases last", state["scope"])
 	}
 	if state["cooldown_level"] != float64(3) {
@@ -176,6 +176,54 @@ func TestSnapshotReportsTheCircuitThatHoldsALineLongest(t *testing.T) {
 	}
 	if deadline, _ := state["blocked_until"].(string); deadline != later.Format(time.RFC3339Nano) {
 		t.Errorf("blocked_until = %q, want %v", deadline, later.Format(time.RFC3339Nano))
+	}
+}
+
+// setCooldownMode switches how an upstream cools a failing key down.
+func setCooldownMode(t *testing.T, server *Server, siteID int64, mode string) {
+	t.Helper()
+	response := callManagement(server, http.MethodPut, "/management/configuration/upstreams/"+itoa(siteID), "management-secret", map[string]any{
+		"key_cd_mode": mode,
+	})
+	if response.status != http.StatusOK {
+		t.Fatalf("set cooldown mode %s: status = %d, body = %v", mode, response.status, response.body)
+	}
+}
+
+// Only the circuit the line's own mode names holds it out of rotation, because
+// that is the only one a request consults. An upstream whose mode changed keeps
+// the circuit its old mode filed, and reporting that one would have an operator
+// read a line as skipped — no request reaches it — while requests are still being
+// served by it.
+func TestSnapshotIgnoresACircuitTheLinesModeDoesNotName(t *testing.T) {
+	server, _ := managementServer(t)
+	siteID := addUpstream(t, server, "alpha", "gpt-4o", "sk-alpha-key")
+	setCooldownMode(t, server, siteID, "key_model_cooldown")
+
+	// A circuit filed under the credential alone is what the mode it ran in
+	// before recorded; the mode it runs in now files one per model.
+	server.BreakerSnapshotter = staticCircuits{
+		{KeyID: "sk-alpha-key"}: {BlockedUntil: time.Now().Add(time.Hour)},
+	}
+	state := channelState(t, snapshotChannelByName(t, server, "alpha"))
+	if state["status"] != "ready" {
+		t.Errorf("status = %v, want ready: this line's mode files no circuit under the credential alone", state["status"])
+	}
+
+	// The circuit the mode does name is the one that holds the line out.
+	blockedUntil := time.Now().Add(time.Hour).UTC()
+	server.BreakerSnapshotter = staticCircuits{
+		{KeyID: "sk-alpha-key", Model: "gpt-4o"}: {CooldownLevel: 1, BlockedUntil: blockedUntil},
+	}
+	state = channelState(t, snapshotChannelByName(t, server, "alpha"))
+	if state["status"] != "cooling" {
+		t.Errorf("status = %v, want cooling", state["status"])
+	}
+	if state["scope"] != "key_model" {
+		t.Errorf("scope = %v, want the circuit the line's mode files under", state["scope"])
+	}
+	if state["model"] != "gpt-4o" {
+		t.Errorf("model = %v, want the model the circuit was filed for", state["model"])
 	}
 }
 

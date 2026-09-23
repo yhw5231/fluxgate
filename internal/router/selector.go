@@ -37,6 +37,10 @@ var (
 
 // ChannelFilter can remove temporarily or permanently blocked channels at selection time.
 type ChannelFilter interface {
+	// IsBlocked reports whether a channel is held out of rotation for one model.
+	// The model is the one the channel would be asked for — its own name for the
+	// requested one, as ActualModel resolves it — because that is the name a
+	// per-model circuit is filed under when the channel fails.
 	IsBlocked(channel domain.Channel, model string) bool
 }
 
@@ -337,7 +341,12 @@ func (s *MemorySelector) eligible(route domain.Route, request domain.SelectionRe
 		if request.Policy.ExcludesCredential(channel) {
 			continue
 		}
-		if s.filter != nil && s.filter.IsBlocked(channel, request.Model) {
+		// A circuit is filed under the model the line was actually asked for, so
+		// the question has to be asked about that same name: asking about the
+		// requested one would look up a circuit that is never written when the
+		// route maps the model, and the line would stay in rotation while its
+		// recorded failures kept escalating.
+		if s.filter != nil && s.filter.IsBlocked(channel, ActualModel(request.Model, route, channel)) {
 			continue
 		}
 		eligible = append(eligible, channel)

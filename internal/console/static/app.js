@@ -2255,6 +2255,12 @@
     setEmptyText(els.requestsEmpty, 'requests', emptyRequestsText());
 
     var columns = ['时间', '结果', '模型', '线路', '尝试', '耗时', '说明', ''];
+    // 线路和尝试是排查故障时一起读的两列，各自的表头说明它记的是什么：路径只记
+    // 真正发过请求的线路，尝试是发到上游的次数。
+    var columnTitles = {
+      '线路': '这条请求实际走过的线路：只有真正发过请求的线路在这里，被熔断跳过的不计入。',
+      '尝试': '发到上游的次数：同一条线路重试几次就算几次，所以可能多于线路一栏里的名字个数。'
+    };
     var head = els.requestsTable.querySelector('thead');
     if (head) { head.textContent = ''; } else {
       head = document.createElement('thead');
@@ -2266,6 +2272,7 @@
       th.textContent = label;
       if (label === '尝试' || label === '耗时') { th.className = 'num'; }
       if (label === '') { th.className = 'actions'; }
+      if (columnTitles[label]) { th.title = columnTitles[label]; }
       headerRow.appendChild(th);
     });
     head.appendChild(headerRow);
@@ -2382,7 +2389,11 @@
   /* requestLineSummary is the failover path of a request, in the order it was
    * walked: the upstream it was first sent to, then every upstream it was retried
    * on after that. Keys are deliberately not part of it — which key carried an
-   * attempt is what the expanded record below is for. */
+   * attempt is what the expanded record below is for.
+   *
+   * It is built from the attempts, so it is the path the request really walked: a
+   * line the router skipped — cooling down, held out of rotation, or excluded for
+   * this request — was never asked and is not part of it. */
   function requestLineSummary(attempts) {
     var path = [];
     (attempts || []).forEach(function (attempt) {
@@ -2398,7 +2409,7 @@
       if (index > 0) { node.appendChild(element('span', 'line-arrow', '→')); }
       node.appendChild(element('span', 'cell-strong', name));
     });
-    node.title = '按这个顺序尝试的上游：' + path.join(' → ');
+    node.title = '实际请求过的上游，按先后顺序：' + path.join(' → ');
     return node;
   }
 
@@ -3833,7 +3844,7 @@
     },
     breaker: {
       title: '故障冷却与恢复',
-      help: '连续失败达到阈值后，这条线路被暂时移出选路（熔断），冷却时间每次按倍数增长，到期自动恢复；作用域选「通道禁用」的线路不会自动恢复，需要在概览页手动恢复。'
+      help: '连续失败达到阈值后，这条线路被暂时移出选路（熔断），冷却时间每次按倍数增长，到期自动恢复；作用域选「通道禁用」的线路不会自动恢复，需要在概览页手动恢复。这里的作用域是上游自己没有指定时的默认值：上游配置里「Key 冷却模式」给出的作用域优先于它，线路页会显示每条线路实际生效的作用域。'
     },
     request_log: {
       title: '请求记录',
@@ -3849,7 +3860,7 @@
     'gateway.retry.base_backoff_ms': { label: '首次重试等待', unit: 'ms' },
     'gateway.retry.max_backoff_ms': { label: '重试等待上限', unit: 'ms' },
     'gateway.retry.statuses': { label: '重试的状态码', help: '用逗号分隔，例如 408,429,500,502,503,504。' },
-    'gateway.breaker.mode': { label: '熔断作用域', help: '决定一次熔断影响多大范围：整条线路、一个密钥、或一个密钥加一个模型。' },
+    'gateway.breaker.mode': { label: '熔断作用域', help: '决定一次熔断影响多大范围：整条线路、一个密钥、或一个密钥加一个模型。上游自己配置了 Key 冷却模式时，以它给出的作用域为准。' },
     'gateway.breaker.threshold': { label: '连续失败多少次熔断', unit: 'count' },
     'gateway.breaker.base_cooldown_seconds': { label: '首次冷却时间', unit: 's' },
     'gateway.breaker.max_cooldown_seconds': { label: '冷却时间上限', unit: 's' },
