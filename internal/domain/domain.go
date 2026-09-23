@@ -127,6 +127,10 @@ type RoutingPolicy struct {
 	// exclusion list: a matching model is rejected rather than permitted.
 	DeniedModelPatterns []string
 	AllowedRouteIDs     []int64
+	// AllowedSiteIDs comes from the allowed_site_ids column and is an allow
+	// list: an empty value permits every upstream, a non-empty one permits only
+	// the upstreams it names.
+	AllowedSiteIDs      []int64
 	ExcludedSiteIDs     []int64
 	SiteMultipliers     map[int64]float64
 	ExcludedCredentials []ExcludedCredential
@@ -139,6 +143,21 @@ type RoutingPolicy struct {
 func (p RoutingPolicy) DeniesModel(model string) bool {
 	for _, candidate := range p.DeniedModelPatterns {
 		if pattern.MatchName(model, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+// AllowsSite reports whether the site is permitted for this policy. An empty
+// allow list permits every site, so a key that never selected an upstream keeps
+// the whole gateway reachable.
+func (p RoutingPolicy) AllowsSite(siteID int64) bool {
+	if len(p.AllowedSiteIDs) == 0 {
+		return true
+	}
+	for _, allowed := range p.AllowedSiteIDs {
+		if allowed == siteID {
 			return true
 		}
 	}

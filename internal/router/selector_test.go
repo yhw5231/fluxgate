@@ -267,6 +267,37 @@ func TestMemorySelectorAppliesDownstreamPolicyRestrictions(t *testing.T) {
 		}
 	})
 
+	t.Run("allowed site ids keep only the listed upstreams", func(t *testing.T) {
+		policy := domain.RoutingPolicy{AllowedSiteIDs: []int64{8}}
+		if got := selectChannel(t, newSelector(), "model", policy).Channel.ID; got != "site-8" {
+			t.Fatalf("selected channel = %q, want site-8", got)
+		}
+		if !newSelector().HasCandidate("model", policy) {
+			t.Fatal("HasCandidate() = false for a model one allowed upstream serves")
+		}
+
+		// A key restricted to an upstream that serves nothing has no candidate, so
+		// the request fails instead of falling through to an upstream it may not use.
+		absent := domain.RoutingPolicy{AllowedSiteIDs: []int64{9}}
+		if newSelector().HasCandidate("model", absent) {
+			t.Fatal("HasCandidate() = true for a site the allow list does not name")
+		}
+		if _, err := newSelector().Select(domain.SelectionRequest{Model: "model", Policy: absent}); err != ErrNoChannel {
+			t.Fatalf("Select() error = %v, want ErrNoChannel", err)
+		}
+	})
+
+	t.Run("an exclusion applies on top of the allow list", func(t *testing.T) {
+		policy := domain.RoutingPolicy{AllowedSiteIDs: []int64{7, 8}, ExcludedSiteIDs: []int64{7}}
+		if got := selectChannel(t, newSelector(), "model", policy).Channel.ID; got != "site-8" {
+			t.Fatalf("selected channel = %q, want site-8", got)
+		}
+		excludedBoth := domain.RoutingPolicy{AllowedSiteIDs: []int64{7}, ExcludedSiteIDs: []int64{7}}
+		if newSelector().HasCandidate("model", excludedBoth) {
+			t.Fatal("a site that is both allowed and excluded stayed selectable")
+		}
+	})
+
 	t.Run("excluded credential requires every identifier to match", func(t *testing.T) {
 		policy := domain.RoutingPolicy{ExcludedCredentials: []domain.ExcludedCredential{
 			{Kind: "account_token", SiteID: 7, AccountID: 1, TokenID: 42},

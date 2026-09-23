@@ -56,6 +56,7 @@ type DownstreamAPIKey struct {
 	UsedRequests        int64
 	SupportedModels     []string
 	AllowedRouteIDs     []int64
+	AllowedSiteIDs      []int64
 	ExcludedSiteIDs     []int64
 	SiteMultipliers     map[int64]float64
 	ExcludedCredentials []domain.ExcludedCredential
@@ -68,6 +69,7 @@ func (k DownstreamAPIKey) Policy() domain.RoutingPolicy {
 	return domain.RoutingPolicy{
 		DeniedModelPatterns: k.SupportedModels,
 		AllowedRouteIDs:     k.AllowedRouteIDs,
+		AllowedSiteIDs:      k.AllowedSiteIDs,
 		ExcludedSiteIDs:     k.ExcludedSiteIDs,
 		SiteMultipliers:     k.SiteMultipliers,
 		ExcludedCredentials: k.ExcludedCredentials,

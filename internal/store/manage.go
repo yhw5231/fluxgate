@@ -370,6 +370,7 @@ var resources = []Resource{
 			{Name: "used_requests", Kind: KindInt},
 			{Name: "supported_models", Kind: KindJSONArray, MaxLength: 8192, Validate: validateStringList},
 			{Name: "allowed_route_ids", Kind: KindJSONArray, MaxLength: 8192, Validate: validateIDList},
+			{Name: "allowed_site_ids", Kind: KindJSONArray, MaxLength: 8192, Validate: validateIDList},
 			{Name: "excluded_site_ids", Kind: KindJSONArray, MaxLength: 8192, Validate: validateIDList},
 			{Name: "site_weight_multipliers", Kind: KindJSONObject, MaxLength: 8192, Validate: validateWeightMultipliers},
 			{Name: "excluded_credential_refs", Kind: KindJSONArray, MaxLength: 16384, Validate: validateExcludedCredentials},

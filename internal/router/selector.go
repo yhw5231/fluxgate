@@ -335,6 +335,12 @@ func (s *MemorySelector) eligible(route domain.Route, request domain.SelectionRe
 		if !bypassSourceModel && !channelAdmitsModel(route, channel, request.Model) {
 			continue
 		}
+		// The allow list is asked first: a key restricted to some upstreams must not
+		// reach a line outside them, and an exclusion then subtracts from what the
+		// allow list already left.
+		if !request.Policy.AllowsSite(channel.SiteID) {
+			continue
+		}
 		if request.Policy.ExcludesSite(channel.SiteID) {
 			continue
 		}

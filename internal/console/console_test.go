@@ -690,13 +690,13 @@ func TestCredentialFieldsRefuseToBeAutofilled(t *testing.T) {
 	}
 }
 
-// 排除模型、限定路由、排除上游 are chosen from a list the console already holds:
-// a restriction typed as JSON by hand is how a policy ends up naming a route or
-// a model that does not exist.
+// 排除模型、限定路由、限定上游、排除上游 are chosen from a list the console already
+// holds: a restriction typed as JSON by hand is how a policy ends up naming a route
+// or a model that does not exist.
 func TestKeyRestrictionsArePickedFromFetchedLists(t *testing.T) {
 	script := consoleScript(t)
 
-	for _, field := range []string{"supported_models", "allowed_route_ids", "excluded_site_ids"} {
+	for _, field := range []string{"supported_models", "allowed_route_ids", "allowed_site_ids", "excluded_site_ids"} {
 		if !strings.Contains(script, field+": {") {
 			t.Errorf("the console declares no field metadata for %s", field)
 		}

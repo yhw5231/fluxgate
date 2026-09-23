@@ -90,7 +90,7 @@ mkdir -p data
 cp ../data/hub.db data/hub.db
 ```
 
-If no database file exists yet, the gateway creates it together with the full configuration schema and starts healthy with an empty configuration, so a first deployment comes up before any upstream data is placed; copying the management server's `hub.db` brings the real sites, routes, and downstream keys. A database that contains only part of the schema is treated as a wrong or truncated file and refuses to start with the tables it has and the ones it lacks.
+If no database file exists yet, the gateway creates it together with the full configuration schema and starts healthy with an empty configuration, so a first deployment comes up before any upstream data is placed; copying the management server's `hub.db` brings the real sites, routes, and downstream keys. A database that contains only part of the schema is treated as a wrong or truncated file and refuses to start with the tables it has and the ones it lacks. A database that carries every table but predates a column the console writes — `downstream_api_keys.allowed_site_ids` on a copy taken before 限定上游 existed — is brought up to the current shape in place instead: the column is added as a nullable one, so rows written by the older application keep meaning exactly what they did.
 
 The image fixes the data-directory ownership automatically: the container starts briefly as root with only the `CHOWN`, `SETUID`, and `SETGID` capabilities, the entrypoint hands the mounted directory (and everything inside it) to the runtime user and group ID `10001`, and the gateway then runs unprivileged. No manual `chown` is required, even when Docker created a missing host directory as root. New database files are created with mode `0600` (`umask 077`).
 
@@ -374,10 +374,13 @@ upstreams:
 
 An upstream added from the console is created enabled, so its lines serve traffic
 as soon as it is saved. Client keys are created enabled too, and their restrictions —
-排除模型 (denied models), 限定路由 (allowed routes), and 排除上游 (excluded upstreams) —
-are picked from the routes, upstreams, and models the gateway already holds rather than
-typed as JSON; a value stored by hand that is no longer in those lists stays selected,
-so editing a key cannot drop a restriction by accident.
+排除模型 (denied models), 限定路由 (allowed routes), 限定上游 (allowed upstreams), and
+排除上游 (excluded upstreams) — are picked from the routes, upstreams, and models the
+gateway already holds rather than typed as JSON; a value stored by hand that is no
+longer in those lists stays selected, so editing a key cannot drop a restriction by
+accident. 限定上游 and 排除上游 are the two halves of one question: the allow list
+narrows a key to the upstreams it names, and the exclusion list then removes from
+what the allow list left, so a key with nothing in 限定上游 reaches every upstream.
 
 Each editable table has an 添加 button, and every row has 编辑 and 删除 actions;
 client keys additionally have 轮换, which mints a new value and invalidates the old
@@ -850,9 +853,10 @@ operator say "use this upstream first" and "spread what is left":
    therefore not a share of traffic — a lower tier is reached only when every
    line above it is unusable — while weight divides the traffic of one tier.
 
-A line that is disabled, blocked by a circuit, excluded by the downstream key, or
-already tried by the retry loop is filtered out before the tiers are computed, so
-a request falls to the next tier instead of failing while a preferred line cools
+A line that is disabled, blocked by a circuit, outside the downstream key's scope
+— a site its `allowed_site_ids` does not name, or one its `excluded_site_ids` does
+— or already tried by the retry loop is filtered out before the tiers are computed,
+so a request falls to the next tier instead of failing while a preferred line cools
 down. An upstream that has never been given a priority has `0`, which is what
 every upstream had before priorities existed.
 
@@ -864,7 +868,13 @@ every upstream had before priorities existed.
 - `allowed_route_ids` limits the key to the listed routes, which are addressed
   by their public name (`display_name` when set, otherwise `model_pattern`). A
   route with an exact `model_pattern` stays visible regardless of this list.
-- `excluded_site_ids` removes every channel on those sites.
+- `allowed_site_ids` limits the key to the listed upstreams: a channel on any
+  other site is not a candidate, and a model that only those sites serve is
+  hidden from `GET /v1/models` and answers `503 no_available_channel`. An empty
+  or absent value allows every upstream, so a key that never selected one keeps
+  the whole gateway reachable.
+- `excluded_site_ids` removes every channel on those sites. It is applied on top
+  of `allowed_site_ids`, so a site named by both is still out of reach.
 - `excluded_credential_refs` removes the channel identified by an
   `{"kind":"account_token","siteId":…,"accountId":…,"tokenId":…}` entry; all
   three identifiers must match, and a channel without a token is never matched.

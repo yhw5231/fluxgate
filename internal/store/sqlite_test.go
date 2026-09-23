@@ -45,6 +45,7 @@ func createDownstreamKeysTable(t *testing.T, store *SQLiteStore) {
 		used_requests INTEGER DEFAULT 0,
 		supported_models TEXT,
 		allowed_route_ids TEXT,
+		allowed_site_ids TEXT,
 		site_weight_multipliers TEXT,
 		excluded_site_ids TEXT,
 		excluded_credential_refs TEXT
@@ -61,14 +62,15 @@ func TestAuthenticateDownstreamKeyAcceptsValidCredentialAndDecodesRestrictions(t
 	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
 	_, err := store.db.Exec(`INSERT INTO downstream_api_keys (
 		name, key, enabled, expires_at, max_cost, used_cost, max_requests,
-		used_requests, supported_models, allowed_route_ids,
+		used_requests, supported_models, allowed_route_ids, allowed_site_ids,
 		site_weight_multipliers, excluded_site_ids, excluded_credential_refs
-	) VALUES (?, ?, 1, ?, 10, 2, 100, 5, ?, ?, ?, ?, ?)`,
+	) VALUES (?, ?, 1, ?, 10, 2, 100, 5, ?, ?, ?, ?, ?, ?)`,
 		"test-client",
 		"downstream-secret",
 		expiresAt,
 		`["gpt-4.1","claude-sonnet"]`,
 		`[1,2]`,
+		`[7,8]`,
 		`{"7":1.5}`,
 		`[9]`,
 		`[{"kind":"account_token","siteId":1,"accountId":11,"tokenId":22}]`,
@@ -96,6 +98,9 @@ func TestAuthenticateDownstreamKeyAcceptsValidCredentialAndDecodesRestrictions(t
 	if len(key.ExcludedSiteIDs) != 1 || key.ExcludedSiteIDs[0] != 9 {
 		t.Fatalf("ExcludedSiteIDs = %#v", key.ExcludedSiteIDs)
 	}
+	if len(key.AllowedSiteIDs) != 2 || key.AllowedSiteIDs[0] != 7 || key.AllowedSiteIDs[1] != 8 {
+		t.Fatalf("AllowedSiteIDs = %#v", key.AllowedSiteIDs)
+	}
 	if len(key.ExcludedCredentials) != 1 {
 		t.Fatalf("ExcludedCredentials = %#v", key.ExcludedCredentials)
 	}
@@ -116,6 +121,14 @@ func TestAuthenticateDownstreamKeyAcceptsValidCredentialAndDecodesRestrictions(t
 	}
 	if policy.ExcludesCredential(domain.Channel{SiteID: 1, AccountID: 11}) {
 		t.Fatal("a channel without a token matched a token-scoped exclusion")
+	}
+	// allowed_site_ids is an allow list, so the sites it names are the only ones
+	// the key can reach.
+	if !policy.AllowsSite(7) || !policy.AllowsSite(8) {
+		t.Fatalf("allowed site ids = %#v, want both configured sites allowed", policy.AllowedSiteIDs)
+	}
+	if policy.AllowsSite(9) {
+		t.Fatal("policy allowed a site that is not on the allow list")
 	}
 }
 
@@ -140,9 +153,9 @@ func TestAuthenticateDownstreamKeyRejectsInvalidExpiredAndExhaustedCredentials(t
 	for _, row := range rows {
 		_, err := store.db.Exec(`INSERT INTO downstream_api_keys (
 			name, key, enabled, expires_at, max_cost, used_cost, max_requests,
-			used_requests, supported_models, allowed_route_ids,
+			used_requests, supported_models, allowed_route_ids, allowed_site_ids,
 			site_weight_multipliers, excluded_site_ids, excluded_credential_refs
-		) VALUES (?, ?, 1, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL)`,
+		) VALUES (?, ?, 1, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL)`,
 			row.name, row.credential, row.expiresAt, row.maxCost, row.usedCost, row.maxRequests, row.usedRequests)
 		if err != nil {
 			t.Fatalf("insert %s key: %v", row.name, err)
@@ -183,6 +196,7 @@ func TestLoadConfigurationModelsChannelPolicyAndProxyPrecedence(t *testing.T) {
 			used_requests INTEGER DEFAULT 0,
 			supported_models TEXT,
 			allowed_route_ids TEXT,
+			allowed_site_ids TEXT,
 			site_weight_multipliers TEXT,
 			excluded_site_ids TEXT,
 			excluded_credential_refs TEXT
@@ -592,6 +606,54 @@ func TestOpenSQLiteRejectsDirectoryAsDatabasePath(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "is a directory") {
 		t.Fatalf("error = %v, want the is-a-directory diagnosis", err)
+	}
+}
+
+// A database created before allowed_site_ids existed still carries every table, so
+// it is brought up to the current shape rather than rejected: the console writes
+// that column, and refusing to start would leave no way to add it.
+func TestEnsureUpstreamSchemaAddsTheAllowedSiteColumnToAnOlderDatabase(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	createUpstreamTables(t, store)
+	if _, err := store.db.Exec(`INSERT INTO downstream_api_keys (name, key, enabled, excluded_site_ids) VALUES ('legacy', 'legacy-secret', 1, '[9]')`); err != nil {
+		t.Fatalf("insert the key written before the column existed: %v", err)
+	}
+	if _, err := store.db.Exec(`ALTER TABLE downstream_api_keys DROP COLUMN allowed_site_ids`); err != nil {
+		t.Fatalf("drop allowed_site_ids to model an older database: %v", err)
+	}
+
+	// Running twice is what a restart does, and the second run must find the column
+	// already there instead of failing on a duplicate one.
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := store.EnsureUpstreamSchema(ctx); err != nil {
+			t.Fatalf("EnsureUpstreamSchema() attempt %d error = %v", attempt+1, err)
+		}
+	}
+
+	// The row written before the column existed keeps every restriction it had, and
+	// the allow list it never carried reads as an unrestricted key.
+	key, err := store.AuthenticateDownstreamKey(ctx, "legacy-secret", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("AuthenticateDownstreamKey() error = %v", err)
+	}
+	if len(key.ExcludedSiteIDs) != 1 || key.ExcludedSiteIDs[0] != 9 {
+		t.Fatalf("ExcludedSiteIDs = %#v, want the stored exclusion kept", key.ExcludedSiteIDs)
+	}
+	if len(key.AllowedSiteIDs) != 0 {
+		t.Fatalf("AllowedSiteIDs = %#v, want none", key.AllowedSiteIDs)
+	}
+	if !key.Policy().AllowsSite(1234) {
+		t.Fatal("a key with no allow list was restricted to a site it never named")
+	}
+
+	// The console reads rows through the same schema, so a listing has to work too.
+	rows, err := store.ListResource(ctx, "keys")
+	if err != nil {
+		t.Fatalf("ListResource(keys) error = %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListResource(keys) returned %d rows, want the legacy key", len(rows))
 	}
 }
 

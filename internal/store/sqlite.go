@@ -206,7 +206,8 @@ var upstreamSchemaDDL = []string{
 		id INTEGER PRIMARY KEY, name TEXT NOT NULL, key TEXT NOT NULL, enabled INTEGER DEFAULT 1,
 		expires_at TEXT, max_cost REAL, used_cost REAL DEFAULT 0, max_requests INTEGER,
 		used_requests INTEGER DEFAULT 0, supported_models TEXT, allowed_route_ids TEXT,
-		site_weight_multipliers TEXT, excluded_site_ids TEXT, excluded_credential_refs TEXT
+		allowed_site_ids TEXT, site_weight_multipliers TEXT, excluded_site_ids TEXT,
+		excluded_credential_refs TEXT
 	)`,
 	`CREATE TABLE IF NOT EXISTS sites (
 		id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, platform TEXT NOT NULL,
@@ -240,6 +241,11 @@ var upstreamSchemaDDL = []string{
 // that carries part of the schema is treated as a wrong or truncated file and
 // rejected with the tables it has and the ones it is missing, so half-migrated
 // data cannot serve subtly wrong routing.
+//
+// A database carrying every table but predating a column is brought up to the
+// current shape instead of being rejected: the console edits these tables, so a
+// column it can write has to exist for the gateway to start against a database
+// created before that column did.
 func (s *SQLiteStore) EnsureUpstreamSchema(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table'`)
 	if err != nil {
@@ -264,24 +270,57 @@ func (s *SQLiteStore) EnsureUpstreamSchema(ctx context.Context) error {
 			missing = append(missing, table)
 		}
 	}
-	if len(missing) == 0 {
-		return nil
-	}
-	if len(missing) < len(requiredUpstreamTables) {
-		present := make([]string, 0, len(found))
-		for name := range found {
-			present = append(present, name)
+	if len(missing) > 0 {
+		if len(missing) < len(requiredUpstreamTables) {
+			present := make([]string, 0, len(found))
+			for name := range found {
+				present = append(present, name)
+			}
+			sort.Strings(present)
+			return fmt.Errorf(
+				"the configuration database is missing the upstream tables %s but contains %s; place the management server's SQLite database (hub.db) at the configured FLUXGATE_DATABASE_PATH",
+				strings.Join(missing, ", "), strings.Join(present, ", "))
 		}
-		sort.Strings(present)
-		return fmt.Errorf(
-			"the configuration database is missing the upstream tables %s but contains %s; place the management server's SQLite database (hub.db) at the configured FLUXGATE_DATABASE_PATH",
-			strings.Join(missing, ", "), strings.Join(present, ", "))
+
+		for _, statement := range upstreamSchemaDDL {
+			if _, err := s.db.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("create upstream table: %w", err)
+			}
+		}
 	}
 
-	for _, statement := range upstreamSchemaDDL {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
-			return fmt.Errorf("create upstream table: %w", err)
+	// A column the console writes that an older database predates is added here.
+	// It is nullable and reads as an absent restriction, so a row written by an
+	// application that does not know the column keeps meaning what it always did.
+	if err := s.addColumnIfMissing(ctx, "downstream_api_keys", "allowed_site_ids", "TEXT"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// addColumnIfMissing adds a column to a table when an older database predates
+// it. SQLite has no IF NOT EXISTS for a column, so the current shape is compared
+// first.
+func (s *SQLiteStore) addColumnIfMissing(ctx context.Context, table, column, definition string) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return fmt.Errorf("scan %s column: %w", table, err)
 		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate %s columns: %w", table, err)
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+column+` `+definition); err != nil {
+		return fmt.Errorf("add %s.%s: %w", table, column, err)
 	}
 	return nil
 }
@@ -406,12 +445,17 @@ func (s *SQLiteStore) CleanupBreakerStates(ctx context.Context, before time.Time
 	return result.RowsAffected()
 }
 
+// downstreamKeyColumns is the projection every downstream key read shares, in the
+// order scanDownstreamKey expects. Keeping it in one place is what stops the two
+// queries from drifting apart from the scan as columns are added.
+const downstreamKeyColumns = `id, name, key, enabled, expires_at, max_cost, used_cost, max_requests, used_requests, supported_models, allowed_route_ids, allowed_site_ids, site_weight_multipliers, excluded_site_ids, excluded_credential_refs`
+
 func (s *SQLiteStore) AuthenticateDownstreamKey(ctx context.Context, candidate string, now time.Time) (DownstreamAPIKey, error) {
 	candidate = strings.TrimSpace(candidate)
 	if candidate == "" {
 		return DownstreamAPIKey{}, ErrUnauthorized
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, key, enabled, expires_at, max_cost, used_cost, max_requests, used_requests, supported_models, allowed_route_ids, site_weight_multipliers, excluded_site_ids, excluded_credential_refs FROM downstream_api_keys WHERE enabled = 1`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+downstreamKeyColumns+` FROM downstream_api_keys WHERE enabled = 1`)
 	if err != nil {
 		return DownstreamAPIKey{}, fmt.Errorf("query downstream API keys: %w", err)
 	}
@@ -494,7 +538,7 @@ func (s *SQLiteStore) loadProxyProfiles(ctx context.Context, configuration *Conf
 }
 
 func (s *SQLiteStore) loadDownstreamKeys(ctx context.Context, configuration *Configuration) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, key, enabled, expires_at, max_cost, used_cost, max_requests, used_requests, supported_models, allowed_route_ids, site_weight_multipliers, excluded_site_ids, excluded_credential_refs FROM downstream_api_keys`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+downstreamKeyColumns+` FROM downstream_api_keys`)
 	if err != nil {
 		return fmt.Errorf("load downstream API keys: %w", err)
 	}
@@ -517,8 +561,8 @@ func scanDownstreamKey(scanner interface{ Scan(...any) error }) (DownstreamAPIKe
 	var usedCost sql.NullFloat64
 	var maxRequests sql.NullInt64
 	var usedRequests sql.NullInt64
-	var supportedModels, allowedRoutes, multipliers, excludedSites, excludedCredentials sql.NullString
-	if err := scanner.Scan(&key.ID, &key.Name, &key.Key, &enabled, &expires, &maxCost, &usedCost, &maxRequests, &usedRequests, &supportedModels, &allowedRoutes, &multipliers, &excludedSites, &excludedCredentials); err != nil {
+	var supportedModels, allowedRoutes, allowedSites, multipliers, excludedSites, excludedCredentials sql.NullString
+	if err := scanner.Scan(&key.ID, &key.Name, &key.Key, &enabled, &expires, &maxCost, &usedCost, &maxRequests, &usedRequests, &supportedModels, &allowedRoutes, &allowedSites, &multipliers, &excludedSites, &excludedCredentials); err != nil {
 		return key, fmt.Errorf("scan downstream API key: %w", err)
 	}
 	key.Enabled = enabled != 0
@@ -543,6 +587,9 @@ func scanDownstreamKey(scanner interface{ Scan(...any) error }) (DownstreamAPIKe
 	}
 	if err := decodeJSON(allowedRoutes.String, &key.AllowedRouteIDs); err != nil {
 		return key, fmt.Errorf("parse allowed_route_ids: %w", err)
+	}
+	if err := decodeJSON(allowedSites.String, &key.AllowedSiteIDs); err != nil {
+		return key, fmt.Errorf("parse allowed_site_ids: %w", err)
 	}
 	if err := decodeJSON(excludedSites.String, &key.ExcludedSiteIDs); err != nil {
 		return key, fmt.Errorf("parse excluded_site_ids: %w", err)

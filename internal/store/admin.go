@@ -54,36 +54,10 @@ func (s *SQLiteStore) EnsureAdminSchema(ctx context.Context) error {
 			return fmt.Errorf("create admin table: %w", err)
 		}
 	}
-	if err := s.addAdminColumnIfMissing(ctx, "change_required", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+	// The default is chosen so an account created before the column existed is
+	// not forced through a password change it does not need.
+	if err := s.addColumnIfMissing(ctx, "gateway_admin_users", "change_required", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
-	}
-	return nil
-}
-
-// addAdminColumnIfMissing adds a column to gateway_admin_users when an older
-// database predates it. SQLite has no IF NOT EXISTS for a column, so the current
-// shape is compared first. The default is chosen so an account created before
-// the column existed is not forced through a password change it does not need.
-func (s *SQLiteStore) addAdminColumnIfMissing(ctx context.Context, column, definition string) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT name FROM pragma_table_info('gateway_admin_users')`)
-	if err != nil {
-		return fmt.Errorf("inspect gateway_admin_users: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return fmt.Errorf("scan gateway_admin_users column: %w", err)
-		}
-		if name == column {
-			return nil
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate gateway_admin_users columns: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, `ALTER TABLE gateway_admin_users ADD COLUMN `+column+` `+definition); err != nil {
-		return fmt.Errorf("add gateway_admin_users.%s: %w", column, err)
 	}
 	return nil
 }

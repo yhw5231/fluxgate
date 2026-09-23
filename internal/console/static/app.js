@@ -421,9 +421,15 @@
         candidates: routeCandidates, describe: function (value) { return referenceLabel('routes', value); },
         emptyText: '网关里还没有路由：先在上游里勾选模型，路由会自动建立。'
       },
+      allowed_site_ids: {
+        label: '限定上游', type: 'choice_list', filterPlaceholder: '筛选上游…',
+        help: '勾选后只允许这些上游的线路；一个都不勾表示不限制。这里允许的上游仍然会被「排除上游」去掉。',
+        candidates: upstreamCandidates, describe: function (value) { return referenceLabel('sites', value); },
+        emptyText: '还没有上游。'
+      },
       excluded_site_ids: {
         label: '排除上游', type: 'choice_list', filterPlaceholder: '筛选上游…',
-        help: '勾选后这些上游的线路不会被选中。',
+        help: '勾选后这些上游的线路不会被选中；同一个上游既被限定又被排除时，按排除处理。',
         candidates: upstreamCandidates, describe: function (value) { return referenceLabel('sites', value); },
         emptyText: '还没有上游。'
       },
@@ -715,8 +721,8 @@
   function accountName(id) { return id ? referenceLabel('accounts', id) : '—'; }
   function tokenName(id) { return id ? referenceLabel('tokens', id) : '—'; }
 
-  /* 排除模型、限定路由、排除上游这三项都是从一个列表里挑，所以候选来自网关已经
-   * 读到的配置，而不是让 operator 手写 JSON。 */
+  /* 排除模型、限定路由、限定上游、排除上游这四项都是从一个列表里挑，所以候选来自
+   * 网关已经读到的配置，而不是让 operator 手写 JSON。 */
 
   function upstreamCandidates() {
     return resourceRows('upstreams').map(function (row) {

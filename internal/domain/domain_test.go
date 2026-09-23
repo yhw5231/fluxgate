@@ -88,6 +88,31 @@ func TestAllowsModelDoesNotEnforceRouteAvailability(t *testing.T) {
 	}
 }
 
+// allowed_site_ids is an allow list that reads like an absent one when it is
+// empty, so a key that never selected an upstream keeps reaching all of them
+// while a key that did select reaches only those.
+func TestAllowsSiteTreatsAnEmptyListAsUnrestricted(t *testing.T) {
+	unrestricted := RoutingPolicy{}
+	if !unrestricted.AllowsSite(1) || !unrestricted.AllowsSite(99) {
+		t.Fatal("an empty allow list restricted the key")
+	}
+
+	restricted := RoutingPolicy{AllowedSiteIDs: []int64{3, 5}}
+	if !restricted.AllowsSite(3) || !restricted.AllowsSite(5) {
+		t.Fatal("a site on the allow list was rejected")
+	}
+	if restricted.AllowsSite(4) {
+		t.Fatal("a site outside the allow list was permitted")
+	}
+
+	// A site that is both allowed and excluded stays out of reach: the allow list
+	// answers for itself and the exclusion is applied on top of it.
+	both := RoutingPolicy{AllowedSiteIDs: []int64{3}, ExcludedSiteIDs: []int64{3}}
+	if !both.AllowsSite(3) || !both.ExcludesSite(3) {
+		t.Fatal("the allow list and the exclusion did not both answer for the site")
+	}
+}
+
 func TestExposedModelsHidesRoutesCoveredByAGroup(t *testing.T) {
 	routes := []Route{
 		{ID: 1, ModelPattern: "gpt-*", Mode: RouteModePattern, Enabled: true},

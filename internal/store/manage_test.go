@@ -82,6 +82,7 @@ func TestCreateResourceStoresEveryWritableField(t *testing.T) {
 		"expires_at":        "2027-01-31T09:00:00Z",
 		"max_requests":      100,
 		"supported_models":  `["gpt-4.1-mini"]`,
+		"allowed_site_ids":  "[" + strconv.FormatInt(fixture.siteID, 10) + "]",
 		"excluded_site_ids": "[9]",
 	})
 	proxyID := createManagedRow(t, store, "proxies", map[string]any{
@@ -130,6 +131,9 @@ func TestCreateResourceStoresEveryWritableField(t *testing.T) {
 	}
 	if keys[0]["supported_models"] != `["gpt-4.1-mini"]` {
 		t.Errorf("supported_models = %v", keys[0]["supported_models"])
+	}
+	if want := "[" + strconv.FormatInt(fixture.siteID, 10) + "]"; keys[0]["allowed_site_ids"] != want {
+		t.Errorf("allowed_site_ids = %v, want %v", keys[0]["allowed_site_ids"], want)
 	}
 	if keys[0]["id"] != keyID {
 		t.Errorf("key id = %v, want %d", keys[0]["id"], keyID)

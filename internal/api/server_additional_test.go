@@ -151,6 +151,60 @@ func TestModelsOmitModelsWithoutAnyChannel(t *testing.T) {
 	}
 }
 
+// A key restricted to some upstreams is offered only what those upstreams serve,
+// and a model that only another upstream serves fails as unavailable instead of
+// being routed to an upstream the key may not use.
+func TestUpstreamScopeOfAKeyShapesWhatItCanReach(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("an upstream outside the key's scope was contacted")
+	}))
+	defer upstream.Close()
+
+	engine := &proxy.Engine{
+		Selector: router.NewMemorySelector([]domain.Route{
+			{
+				ID: 1, ModelPattern: "allowed-model", Mode: domain.RouteModePattern, Enabled: true,
+				Channels: []domain.Channel{{ID: "allowed", BaseURL: upstream.URL, SiteID: 1, Enabled: true, Weight: 1}},
+			},
+			{
+				ID: 2, ModelPattern: "other-model", Mode: domain.RouteModePattern, Enabled: true,
+				Channels: []domain.Channel{{ID: "other", BaseURL: upstream.URL, SiteID: 2, Enabled: true, Weight: 1}},
+			},
+		}),
+		Policy: domain.RetryPolicy{MaxAttempts: 1, MaxAttemptsPerChannel: 1},
+	}
+	authenticator := &fakeAuthenticator{
+		wantCredential: "secret",
+		key:            store.DownstreamAPIKey{AllowedSiteIDs: []int64{1}},
+	}
+	server := &Server{
+		Engine:        engine,
+		Authenticator: authenticator,
+		Models:        []string{"allowed-model", "other-model"},
+	}
+
+	listing := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	listing.Header.Set("Authorization", "Bearer secret")
+	listed := httptest.NewRecorder()
+	server.Handler().ServeHTTP(listed, listing)
+	if body := listed.Body.String(); !strings.Contains(body, "allowed-model") {
+		t.Fatalf("body = %s, want the model the key's upstream serves", body)
+	} else if strings.Contains(body, "other-model") {
+		t.Fatalf("body = %s, listed a model only an upstream outside the key's scope serves", body)
+	}
+
+	proxied := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"other-model"}`))
+	proxied.Header.Set("Authorization", "Bearer secret")
+	served := httptest.NewRecorder()
+	server.Handler().ServeHTTP(served, proxied)
+	if served.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body = %s", served.Code, served.Body.String())
+	}
+	if !strings.Contains(served.Body.String(), `"code":"no_available_channel"`) {
+		t.Fatalf("body = %s, want no_available_channel", served.Body.String())
+	}
+}
+
 // A model with no usable route or channel never reaches an upstream, so it is
 // an availability failure rather than a bad gateway.
 func TestProxyReturnsServiceUnavailableWhenNothingCanServeTheModel(t *testing.T) {
