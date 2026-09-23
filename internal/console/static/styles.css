@@ -1,19 +1,36 @@
 /* ============================================================
-   Fluxgate Console — dark technical theme
+   Fluxgate Console — 日间/夜间两套配色
    Self-contained: no external fonts or assets (CSP: self only)
+
+   颜色只在下面两个 :root 里给出，其余规则一律用变量，所以换主题不需要第二份
+   样式表。带 -rgb 后缀的那几个是留给需要透明度的场合的：写成
+   rgba(var(--accent-rgb), α) 之后，同一个 α 在深底和浅底上都是合适的浓度。
    ============================================================ */
 
+/* 夜间（默认）。html 上没有 data-theme 时也是这一套。 */
 :root {
+  color-scheme: dark;
+
   --bg-base: #05070d;
-  --bg-deep: #070b14;
   --bg-panel: rgba(17, 24, 39, 0.62);
   --bg-panel-solid: #0d1420;
-  --bg-elevated: rgba(30, 41, 59, 0.5);
   --bg-input: rgba(2, 6, 15, 0.7);
+  /* 比面板更暗的一层：表头、展开的明细、候选列表。 */
+  --bg-sunken: rgba(2, 6, 15, 0.32);
+  /* 顶栏压在滚动内容上，所以要盖得住；遮罩是模态框背后那一层。 */
+  --topbar-bg: rgba(7, 11, 20, 0.78);
+  --scrim: rgba(2, 6, 15, 0.72);
 
-  --border-soft: rgba(148, 163, 184, 0.14);
-  --border-strong: rgba(148, 163, 184, 0.26);
-  --border-accent: rgba(56, 189, 248, 0.45);
+  --tint-rgb: 148, 163, 184;
+  --accent-rgb: 56, 189, 248;
+  --violet-rgb: 129, 140, 248;
+  --success-rgb: 52, 211, 153;
+  --warning-rgb: 251, 191, 36;
+  --danger-rgb: 248, 113, 113;
+
+  --border-soft: rgba(var(--tint-rgb), 0.14);
+  --border-strong: rgba(var(--tint-rgb), 0.26);
+  --border-accent: rgba(var(--accent-rgb), 0.45);
 
   --text-primary: #e8eefb;
   --text-secondary: #94a3b8;
@@ -21,16 +38,19 @@
   --text-faint: #475569;
 
   --accent: #38bdf8;
-  --accent-soft: rgba(56, 189, 248, 0.14);
-  --accent-glow: rgba(56, 189, 248, 0.35);
+  --accent-soft: rgba(var(--accent-rgb), 0.14);
+  --accent-glow: rgba(var(--accent-rgb), 0.35);
   --violet: #818cf8;
-  --violet-soft: rgba(129, 140, 248, 0.14);
+  --violet-soft: rgba(var(--violet-rgb), 0.14);
   --success: #34d399;
-  --success-soft: rgba(52, 211, 153, 0.14);
+  --success-soft: rgba(var(--success-rgb), 0.14);
   --warning: #fbbf24;
-  --warning-soft: rgba(251, 191, 36, 0.14);
+  --warning-soft: rgba(var(--warning-rgb), 0.14);
   --danger: #f87171;
-  --danger-soft: rgba(248, 113, 113, 0.14);
+  --danger-soft: rgba(var(--danger-rgb), 0.14);
+  /* 填在状态底色上的文字色：深色底上要亮，浅色底上要暗，所以各自给一份。 */
+  --success-text: #a7f3d0;
+  --danger-text: #fecaca;
 
   --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', Roboto, sans-serif;
   --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', Consolas, 'Liberation Mono', Menlo, monospace;
@@ -39,8 +59,11 @@
   --radius-md: 12px;
   --radius-lg: 16px;
 
+  --glow-opacity: 0.5;
   --shadow-panel: 0 24px 60px -30px rgba(0, 0, 0, 0.9);
-  --shadow-glow: 0 0 0 1px rgba(56, 189, 248, 0.12), 0 18px 50px -28px rgba(56, 189, 248, 0.5);
+  --shadow-glow: 0 0 0 1px rgba(var(--accent-rgb), 0.12), 0 18px 50px -28px rgba(var(--accent-rgb), 0.5);
+  --shadow-primary: 0 10px 30px -14px rgba(var(--accent-rgb), 0.85);
+  --shadow-primary-hover: 0 16px 36px -14px rgba(var(--accent-rgb), 0.95);
 
   --topbar-height: 64px;
 
@@ -49,6 +72,49 @@
    * 所以这段留白写成变量，表头和输入框共用一份。 */
   --inline-field-action: 48px;
   --inline-field-gap: 6px;
+}
+
+/* 日间：浅底、白面板，强调色压深一档才在白底上读得清。data-theme 由 theme.js
+   写在 html 上，而它在样式表之前执行，所以第一帧就是对的那一套。 */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg-base: #eef2f8;
+  --bg-panel: rgba(255, 255, 255, 0.78);
+  --bg-panel-solid: #ffffff;
+  --bg-input: rgba(15, 23, 42, 0.04);
+  --bg-sunken: rgba(15, 23, 42, 0.045);
+  --topbar-bg: rgba(255, 255, 255, 0.82);
+  --scrim: rgba(15, 23, 42, 0.42);
+
+  --tint-rgb: 71, 85, 105;
+  --accent-rgb: 2, 132, 199;
+  --violet-rgb: 99, 102, 241;
+  --success-rgb: 5, 150, 105;
+  --warning-rgb: 180, 83, 9;
+  --danger-rgb: 220, 38, 38;
+
+  --border-soft: rgba(var(--tint-rgb), 0.18);
+  --border-strong: rgba(var(--tint-rgb), 0.34);
+
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #64748b;
+  --text-faint: #8494a7;
+
+  --accent: #0284c7;
+  --violet: #6366f1;
+  --success: #059669;
+  --warning: #b45309;
+  --danger: #dc2626;
+  --success-text: #065f46;
+  --danger-text: #991b1b;
+
+  --glow-opacity: 0.32;
+  --shadow-panel: 0 20px 44px -30px rgba(15, 23, 42, 0.45);
+  --shadow-glow: 0 0 0 1px rgba(var(--accent-rgb), 0.1), 0 18px 44px -30px rgba(var(--accent-rgb), 0.45);
+  --shadow-primary: 0 10px 26px -16px rgba(var(--accent-rgb), 0.5);
+  --shadow-primary-hover: 0 14px 32px -16px rgba(var(--accent-rgb), 0.6);
 }
 
 * { box-sizing: border-box; }
@@ -91,7 +157,7 @@ code {
   position: absolute;
   border-radius: 50%;
   filter: blur(140px);
-  opacity: 0.5;
+  opacity: var(--glow-opacity);
 }
 
 .glow-a {
@@ -99,7 +165,7 @@ code {
   left: -10%;
   width: 46rem;
   height: 46rem;
-  background: radial-gradient(circle, rgba(56, 189, 248, 0.32), transparent 65%);
+  background: radial-gradient(circle, rgba(var(--accent-rgb), 0.32), transparent 65%);
 }
 
 .glow-b {
@@ -107,15 +173,15 @@ code {
   right: -12%;
   width: 52rem;
   height: 52rem;
-  background: radial-gradient(circle, rgba(129, 140, 248, 0.28), transparent 65%);
+  background: radial-gradient(circle, rgba(var(--violet-rgb), 0.28), transparent 65%);
 }
 
 .grid-overlay {
   position: absolute;
   inset: 0;
   background-image:
-    linear-gradient(rgba(148, 163, 184, 0.06) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(148, 163, 184, 0.06) 1px, transparent 1px);
+    linear-gradient(rgba(var(--tint-rgb), 0.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(var(--tint-rgb), 0.06) 1px, transparent 1px);
   background-size: 56px 56px;
   mask-image: radial-gradient(ellipse 90% 70% at 50% 0%, #000 20%, transparent 80%);
   -webkit-mask-image: radial-gradient(ellipse 90% 70% at 50% 0%, #000 20%, transparent 80%);
@@ -131,11 +197,16 @@ code {
 
 .logo-mark { width: 34px; height: 34px; flex: none; }
 .logo-hex {
-  fill: rgba(56, 189, 248, 0.08);
+  fill: rgba(var(--accent-rgb), 0.08);
   stroke: url(#logo-gradient);
   stroke-width: 1.5;
 }
 .logo-bolt { fill: var(--accent); }
+
+/* 图标渐变用的是页面里那份 defs，这里把它接到强调色上：日间压深一档，白底上
+   才和夜间一样有轮廓。 */
+#logo-gradient stop:first-child { stop-color: var(--accent); }
+#logo-gradient stop:last-child { stop-color: var(--violet); }
 
 /* ===== Buttons ===== */
 .btn {
@@ -163,21 +234,21 @@ code {
 .btn-primary {
   background: linear-gradient(135deg, #0ea5e9, #6366f1);
   color: #f8fbff;
-  box-shadow: 0 10px 30px -14px rgba(56, 189, 248, 0.85);
+  box-shadow: var(--shadow-primary);
 }
 
-.btn-primary:hover { transform: translateY(-1px); box-shadow: 0 16px 36px -14px rgba(56, 189, 248, 0.95); }
+.btn-primary:hover { transform: translateY(-1px); box-shadow: var(--shadow-primary-hover); }
 .btn-primary:active { transform: translateY(0); }
 .btn-primary:disabled { opacity: 0.6; cursor: progress; transform: none; }
 
 .btn-ghost {
-  background: rgba(148, 163, 184, 0.06);
+  background: rgba(var(--tint-rgb), 0.06);
   border-color: var(--border-soft);
   color: var(--text-secondary);
 }
 
 .btn-ghost:hover {
-  background: rgba(148, 163, 184, 0.12);
+  background: rgba(var(--tint-rgb), 0.12);
   border-color: var(--border-strong);
   color: var(--text-primary);
 }
@@ -282,9 +353,9 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   margin-top: 14px;
   padding: 10px 12px;
   background: var(--danger-soft);
-  border: 1px solid rgba(248, 113, 113, 0.32);
+  border: 1px solid rgba(var(--danger-rgb), 0.32);
   border-radius: var(--radius-sm);
-  color: #fecaca;
+  color: var(--danger-text);
   font-size: 12.5px;
   text-align: left;
 }
@@ -303,7 +374,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   position: sticky;
   top: 0;
   z-index: 20;
-  background: rgba(7, 11, 20, 0.78);
+  background: var(--topbar-bg);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
   border-bottom: 1px solid var(--border-soft);
@@ -350,11 +421,16 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   padding: 5px 10px;
   border: 1px solid var(--border-soft);
   border-radius: 999px;
-  background: rgba(148, 163, 184, 0.05);
+  background: rgba(var(--tint-rgb), 0.05);
   white-space: nowrap;
 }
 
 .version { background: none; }
+
+/* 日间/夜间切换。按钮上画的是「按下去会变成什么」，所以夜间这一枚是太阳。 */
+#theme-button .theme-icon-moon { display: none; }
+:root[data-theme="light"] #theme-button .theme-icon-sun { display: none; }
+:root[data-theme="light"] #theme-button .theme-icon-moon { display: block; }
 
 .status-pill {
   display: inline-flex;
@@ -377,10 +453,10 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   box-shadow: 0 0 10px currentColor;
 }
 
-.status-ok { color: var(--success); background: var(--success-soft); border-color: rgba(52, 211, 153, 0.3); }
-.status-warn { color: var(--warning); background: var(--warning-soft); border-color: rgba(251, 191, 36, 0.3); }
-.status-bad { color: var(--danger); background: var(--danger-soft); border-color: rgba(248, 113, 113, 0.3); }
-.status-unknown { color: var(--text-muted); background: rgba(148, 163, 184, 0.08); }
+.status-ok { color: var(--success); background: var(--success-soft); border-color: rgba(var(--success-rgb), 0.3); }
+.status-warn { color: var(--warning); background: var(--warning-soft); border-color: rgba(var(--warning-rgb), 0.3); }
+.status-bad { color: var(--danger); background: var(--danger-soft); border-color: rgba(var(--danger-rgb), 0.3); }
+.status-unknown { color: var(--text-muted); background: rgba(var(--tint-rgb), 0.08); }
 
 /* ===== Layout ===== */
 .container {
@@ -399,13 +475,13 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   gap: 12px;
   padding: 14px 16px;
   border-radius: var(--radius-md);
-  border: 1px solid rgba(248, 113, 113, 0.3);
-  background: linear-gradient(180deg, rgba(248, 113, 113, 0.12), rgba(248, 113, 113, 0.05));
+  border: 1px solid rgba(var(--danger-rgb), 0.3);
+  background: linear-gradient(180deg, rgba(var(--danger-rgb), 0.12), rgba(var(--danger-rgb), 0.05));
 }
 
 .banner svg { width: 20px; height: 20px; flex: none; color: var(--danger); }
 .banner-body { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
-.banner-body strong { font-size: 13px; color: #fecaca; }
+.banner-body strong { font-size: 13px; color: var(--danger-text); }
 .banner-body span { font-size: 12px; color: var(--text-secondary); word-break: break-word; }
 
 /* ===== Stat cards ===== */
@@ -436,7 +512,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   position: absolute;
   inset: 0 0 auto 0;
   height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(56, 189, 248, 0.5), transparent);
+  background: linear-gradient(90deg, transparent, rgba(var(--accent-rgb), 0.5), transparent);
   opacity: 0;
   transition: opacity 0.2s ease;
 }
@@ -444,7 +520,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 .stat-card:hover {
   transform: translateY(-2px);
   border-color: var(--border-strong);
-  box-shadow: var(--shadow-panel), 0 0 0 1px rgba(56, 189, 248, 0.1);
+  box-shadow: var(--shadow-panel), 0 0 0 1px rgba(var(--accent-rgb), 0.1);
 }
 
 .stat-card:hover::before { opacity: 1; }
@@ -457,7 +533,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   flex: none;
   border-radius: 10px;
   background: var(--accent-soft);
-  border: 1px solid rgba(56, 189, 248, 0.22);
+  border: 1px solid rgba(var(--accent-rgb), 0.22);
   color: var(--accent);
 }
 
@@ -514,7 +590,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   flex-wrap: wrap;
   padding: 16px 20px;
   border-bottom: 1px solid var(--border-soft);
-  background: rgba(2, 6, 15, 0.35);
+  background: var(--bg-sunken);
 }
 
 .panel-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
@@ -541,7 +617,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   color: var(--text-faint);
   padding: 2px 8px;
   border-radius: 999px;
-  background: rgba(148, 163, 184, 0.08);
+  background: rgba(var(--tint-rgb), 0.08);
   white-space: nowrap;
 }
 
@@ -568,20 +644,20 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   letter-spacing: 0.07em;
   text-transform: uppercase;
   color: var(--text-faint);
-  background: rgba(2, 6, 15, 0.3);
+  background: var(--bg-sunken);
   border-bottom: 1px solid var(--border-soft);
   white-space: nowrap;
 }
 
 .data-table tbody td {
   padding: 12px 16px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.07);
+  border-bottom: 1px solid rgba(var(--tint-rgb), 0.07);
   color: var(--text-secondary);
   vertical-align: middle;
 }
 
 .data-table tbody tr { transition: background 0.15s ease; }
-.data-table tbody tr:hover { background: rgba(56, 189, 248, 0.045); }
+.data-table tbody tr:hover { background: rgba(var(--accent-rgb), 0.045); }
 .data-table tbody tr:last-child td { border-bottom: none; }
 .data-table .num { text-align: right; font-family: var(--font-mono); }
 
@@ -616,12 +692,12 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   background: currentColor;
 }
 
-.badge-success { color: var(--success); background: var(--success-soft); border-color: rgba(52, 211, 153, 0.28); }
-.badge-danger { color: var(--danger); background: var(--danger-soft); border-color: rgba(248, 113, 113, 0.28); }
-.badge-warning { color: var(--warning); background: var(--warning-soft); border-color: rgba(251, 191, 36, 0.28); }
-.badge-info { color: var(--accent); background: var(--accent-soft); border-color: rgba(56, 189, 248, 0.28); }
-.badge-violet { color: var(--violet); background: var(--violet-soft); border-color: rgba(129, 140, 248, 0.28); }
-.badge-muted { color: var(--text-muted); background: rgba(148, 163, 184, 0.09); border-color: var(--border-soft); }
+.badge-success { color: var(--success); background: var(--success-soft); border-color: rgba(var(--success-rgb), 0.28); }
+.badge-danger { color: var(--danger); background: var(--danger-soft); border-color: rgba(var(--danger-rgb), 0.28); }
+.badge-warning { color: var(--warning); background: var(--warning-soft); border-color: rgba(var(--warning-rgb), 0.28); }
+.badge-info { color: var(--accent); background: var(--accent-soft); border-color: rgba(var(--accent-rgb), 0.28); }
+.badge-violet { color: var(--violet); background: var(--violet-soft); border-color: rgba(var(--violet-rgb), 0.28); }
+.badge-muted { color: var(--text-muted); background: rgba(var(--tint-rgb), 0.09); border-color: var(--border-soft); }
 
 .tag {
   display: inline-flex;
@@ -631,7 +707,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-secondary);
-  background: rgba(148, 163, 184, 0.09);
+  background: rgba(var(--tint-rgb), 0.09);
   border: 1px solid var(--border-soft);
   white-space: nowrap;
 }
@@ -652,7 +728,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--text-secondary);
-  background: rgba(148, 163, 184, 0.07);
+  background: rgba(var(--tint-rgb), 0.07);
   border: 1px solid var(--border-soft);
   transition: color 0.16s ease, border-color 0.16s ease, background 0.16s ease, transform 0.16s ease;
 }
@@ -670,7 +746,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 
 .key-revealed {
   color: var(--text-primary);
-  background: rgba(56, 189, 248, 0.12);
+  background: rgba(var(--accent-rgb), 0.12);
   border: 1px solid var(--border-accent);
   border-radius: 4px;
   padding: 1px 6px;
@@ -780,7 +856,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   display: inline-block;
   height: 12px;
   border-radius: 4px;
-  background: linear-gradient(90deg, rgba(148, 163, 184, 0.1), rgba(148, 163, 184, 0.2), rgba(148, 163, 184, 0.1));
+  background: linear-gradient(90deg, rgba(var(--tint-rgb), 0.1), rgba(var(--tint-rgb), 0.2), rgba(var(--tint-rgb), 0.1));
   background-size: 200% 100%;
   animation: shimmer 1.4s ease-in-out infinite;
 }
@@ -805,16 +881,16 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 .footer-brand { margin-left: auto; letter-spacing: 0.04em; }
 
 /* ===== Scrollbars ===== */
-* { scrollbar-width: thin; scrollbar-color: rgba(148, 163, 184, 0.28) transparent; }
+* { scrollbar-width: thin; scrollbar-color: rgba(var(--tint-rgb), 0.28) transparent; }
 *::-webkit-scrollbar { width: 9px; height: 9px; }
 *::-webkit-scrollbar-track { background: transparent; }
 *::-webkit-scrollbar-thumb {
-  background: rgba(148, 163, 184, 0.24);
+  background: rgba(var(--tint-rgb), 0.24);
   border-radius: 999px;
   border: 2px solid transparent;
   background-clip: content-box;
 }
-*::-webkit-scrollbar-thumb:hover { background: rgba(148, 163, 184, 0.4); background-clip: content-box; }
+*::-webkit-scrollbar-thumb:hover { background: rgba(var(--tint-rgb), 0.4); background-clip: content-box; }
 
 /* ===== Settings view =====
    The settings view is grouped by function, and this bar switches between the
@@ -859,11 +935,11 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   white-space: nowrap;
   transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease;
 }
-.settings-tab:hover { color: var(--text-primary); background: rgba(148, 163, 184, 0.08); }
+.settings-tab:hover { color: var(--text-primary); background: rgba(var(--tint-rgb), 0.08); }
 .settings-tab.is-active {
   color: var(--accent);
   background: var(--accent-soft);
-  border-color: rgba(56, 189, 248, 0.32);
+  border-color: rgba(var(--accent-rgb), 0.32);
 }
 
 .settings-body { padding: 20px 22px 24px; }
@@ -889,14 +965,14 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 
 .settings-feedback.is-error {
   background: var(--danger-soft);
-  border: 1px solid rgba(248, 113, 113, 0.32);
-  color: #fecaca;
+  border: 1px solid rgba(var(--danger-rgb), 0.32);
+  color: var(--danger-text);
 }
 
 .settings-feedback.is-success {
   background: var(--success-soft);
-  border: 1px solid rgba(52, 211, 153, 0.32);
-  color: #a7f3d0;
+  border: 1px solid rgba(var(--success-rgb), 0.32);
+  color: var(--success-text);
 }
 
 .settings-actions {
@@ -938,18 +1014,18 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   background: var(--bg-panel);
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-lg);
-  box-shadow: 0 18px 48px rgba(2, 6, 23, 0.65);
+  box-shadow: var(--shadow-panel);
 }
 
 .settings-card-body { padding: 22px; }
 
 /* ===== Success notice ===== */
 .banner-success {
-  border-color: rgba(52, 211, 153, 0.3);
-  background: linear-gradient(180deg, rgba(52, 211, 153, 0.12), rgba(52, 211, 153, 0.05));
+  border-color: rgba(var(--success-rgb), 0.3);
+  background: linear-gradient(180deg, rgba(var(--success-rgb), 0.12), rgba(var(--success-rgb), 0.05));
 }
 .banner-success svg { color: var(--success); }
-.banner-success .banner-body span { color: #bbf7d0; font-size: 13px; }
+.banner-success .banner-body span { color: var(--success-text); font-size: 13px; }
 
 /* ===== Management navigation =====
    The console is one page with several views; the bar switches between them and
@@ -981,11 +1057,11 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   white-space: nowrap;
   transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease;
 }
-.nav-item:hover { color: var(--text-primary); background: rgba(148, 163, 184, 0.08); }
+.nav-item:hover { color: var(--text-primary); background: rgba(var(--tint-rgb), 0.08); }
 .nav-item.is-active {
   color: var(--accent);
   background: var(--accent-soft);
-  border-color: rgba(56, 189, 248, 0.32);
+  border-color: rgba(var(--accent-rgb), 0.32);
 }
 
 /* 通知容器在两个横幅都隐藏时整块收起，不留下空白。 */
@@ -1004,7 +1080,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   font-size: 11.5px;
   padding: 1px 5px;
   border-radius: 4px;
-  background: rgba(148, 163, 184, 0.1);
+  background: rgba(var(--tint-rgb), 0.1);
   color: var(--text-secondary);
 }
 
@@ -1022,8 +1098,8 @@ input[type="password"].field-input { font-family: var(--font-mono); }
  * 折叠时是结论（模型、几个上游、几条线路、当前状态），点开后是线路本身。
  * 展开的行在自动刷新重画后保持展开，因为展开状态存在脚本里而不是 DOM 上。 */
 .data-table tbody tr.row-expandable { cursor: pointer; }
-.data-table tbody tr.row-expandable.is-expanded { background: rgba(56, 189, 248, 0.06); }
-.data-table tbody tr.row-expandable.is-expanded:hover { background: rgba(56, 189, 248, 0.09); }
+.data-table tbody tr.row-expandable.is-expanded { background: rgba(var(--accent-rgb), 0.06); }
+.data-table tbody tr.row-expandable.is-expanded:hover { background: rgba(var(--accent-rgb), 0.09); }
 .data-table th.toggle-cell,
 .data-table td.toggle-cell { width: 1%; white-space: nowrap; padding-right: 0; }
 
@@ -1038,8 +1114,8 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 
 /* 展开出来的线路表：不再重复外层表格的边框和表头样式，读起来像是这个模型的一
  * 部分，而不是另一张表。 */
-.data-table tbody tr.detail-row > td { padding: 0; background: rgba(2, 6, 15, 0.35); }
-.data-table tbody tr.detail-row:hover > td { background: rgba(2, 6, 15, 0.35); }
+.data-table tbody tr.detail-row > td { padding: 0; background: var(--bg-sunken); }
+.data-table tbody tr.detail-row:hover > td { background: var(--bg-sunken); }
 .detail-body { padding: 12px 16px 14px; }
 .detail-note { margin: 0 0 8px; font-size: 11.5px; line-height: 1.6; color: var(--text-faint); }
 .detail-table { width: 100%; border-collapse: collapse; }
@@ -1060,7 +1136,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   padding: 8px 12px;
   font-size: 12.5px;
   color: var(--text-secondary);
-  border-bottom: 1px solid rgba(148, 163, 184, 0.06);
+  border-bottom: 1px solid rgba(var(--tint-rgb), 0.06);
   vertical-align: middle;
 }
 .detail-table tbody tr:last-child td { border-bottom: none; }
@@ -1103,8 +1179,8 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   text-align: right;
 }
 .weight-field.is-invalid .weight-input {
-  border-color: rgba(248, 113, 113, 0.55);
-  box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.12);
+  border-color: rgba(var(--danger-rgb), 0.55);
+  box-shadow: 0 0 0 3px rgba(var(--danger-rgb), 0.12);
 }
 /* 保存按钮的宽度固定成表头让出的那个宽度，显形时不再推动输入框。 */
 .weight-field .weight-save {
@@ -1117,8 +1193,8 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 .weight-field:focus-within .weight-save { visibility: visible; }
 
 .btn-small { padding: 5px 10px; font-size: 12px; }
-.btn-danger { background: rgba(248, 113, 113, 0.16); border-color: rgba(248, 113, 113, 0.4); color: #fecaca; }
-.btn-danger:hover:not(:disabled) { background: rgba(248, 113, 113, 0.24); }
+.btn-danger { background: rgba(var(--danger-rgb), 0.16); border-color: rgba(var(--danger-rgb), 0.4); color: var(--danger-text); }
+.btn-danger:hover:not(:disabled) { background: rgba(var(--danger-rgb), 0.24); }
 .btn-danger-text { color: var(--danger); }
 .btn-danger-text:hover:not(:disabled) { background: var(--danger-soft); }
 .btn:disabled { opacity: 0.55; cursor: not-allowed; }
@@ -1133,7 +1209,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   justify-content: center;
   padding: 48px 16px;
   overflow-y: auto;
-  background: rgba(2, 6, 15, 0.72);
+  background: var(--scrim);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
 }
@@ -1165,7 +1241,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   gap: 10px;
   padding: 14px 20px;
   border-top: 1px solid var(--border-soft);
-  background: rgba(2, 6, 15, 0.35);
+  background: var(--bg-sunken);
 }
 
 /* ===== Editor form ===== */
@@ -1177,7 +1253,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 .field-editor { min-width: 0; }
 .field-editor:has(textarea) { grid-column: 1 / -1; }
 .field-help { margin: 6px 0 0; font-size: 11.5px; line-height: 1.6; color: var(--text-faint); }
-.field-editor.is-invalid .field-input { border-color: rgba(248, 113, 113, 0.55); box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.12); }
+.field-editor.is-invalid .field-input { border-color: rgba(var(--danger-rgb), 0.55); box-shadow: 0 0 0 3px rgba(var(--danger-rgb), 0.12); }
 .field-editor textarea.field-input { resize: vertical; line-height: 1.55; }
 
 .checkline {
@@ -1232,7 +1308,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   overflow-y: auto;
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-sm);
-  background: rgba(2, 6, 15, 0.25);
+  background: var(--bg-sunken);
 }
 
 .model-line,
@@ -1249,7 +1325,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 .choice-line { grid-template-columns: 18px minmax(0, 1fr) auto; }
 
 .model-line:hover,
-.choice-line:hover { background: rgba(148, 163, 184, 0.07); }
+.choice-line:hover { background: rgba(var(--tint-rgb), 0.07); }
 
 .model-line input[type="checkbox"],
 .choice-line input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; }

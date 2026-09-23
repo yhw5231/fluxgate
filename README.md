@@ -294,7 +294,10 @@ gateway binary. It requires no separate build step, static file directory, or No
 runtime. Open it in a browser, sign in with the administrator account, and the
 dashboard shows gateway readiness, uptime, the revision the binary was built
 from, circuit-breaker state, upstream lines, routable models, and the record of
-the requests it served, refreshing itself every ten seconds. The interface is
+the requests it served, refreshing itself every ten seconds. It opens in the
+scheme the browser prefers, light or dark, and the sun/moon button in the top bar
+switches between the two at any time; that choice is remembered for the next
+visit. The interface is
 in Simplified Chinese; the endpoints it calls are unchanged, and the gateway's own
 error codes stay stable for automation while the console renders them in Chinese.
 
@@ -662,7 +665,8 @@ location /gateway/ {
 ```
 
 `https://host/gateway/` redirects to `/gateway/console/`, which then loads
-`/gateway/console/styles.css`, `/gateway/console/app.js`, and `/gateway/management/*`.
+`/gateway/console/styles.css`, `/gateway/console/theme.js`, `/gateway/console/app.js`,
+and `/gateway/management/*`.
 Because the redirect is resolved by the browser against the public URL, no
 `proxy_redirect` rewriting is needed, and the `/v1/...` and `/management/...` routes stay
 reachable as long as the proxy forwards them to the gateway.

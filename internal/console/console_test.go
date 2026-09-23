@@ -22,6 +22,7 @@ func TestHandlerServesIndexAndAssets(t *testing.T) {
 		{name: "index", path: "/console/", wantType: "text/html", wantSnippet: `id="auth-overlay"`},
 		{name: "stylesheet", path: "/console/styles.css", wantType: "text/css", wantSnippet: "--bg-base"},
 		{name: "script", path: "/console/app.js", wantType: "text/javascript", wantSnippet: "management/snapshot"},
+		{name: "theme script", path: "/console/theme.js", wantType: "text/javascript", wantSnippet: "data-theme"},
 	}
 
 	for _, testCase := range cases {
@@ -313,7 +314,8 @@ func hasAncestorIn(page, marker, ancestor string) bool {
 }
 
 // A credential must not be persisted by the console itself: the session is an
-// HTTP-only cookie, so no token may be written to web storage.
+// HTTP-only cookie, so no token may be written to web storage. The one thing the
+// console does keep there is the day/night choice, and that lives in theme.js.
 func TestConsoleDoesNotPersistCredentialsInWebStorage(t *testing.T) {
 	script := consoleScript(t)
 
@@ -604,14 +606,64 @@ func TestConsolePostsPasswordChange(t *testing.T) {
 // under test lives.
 func consoleScript(t *testing.T) string {
 	t.Helper()
-	request := httptest.NewRequest(http.MethodGet, "/console/app.js", nil)
+	return consoleAsset(t, "/console/app.js")
+}
+
+// consoleAsset reads one of the files the console serves.
+func consoleAsset(t *testing.T, path string) string {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodGet, path, nil)
 	response := httptest.NewRecorder()
 	Handler().ServeHTTP(response, request)
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
-		t.Fatalf("read body: %v", err)
+		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(body)
+}
+
+// The console carries two colour schemes, and which one it opens with has to be
+// decided before the first paint: a script that ran with the app would draw the
+// other scheme first and then flip. That is why the theme script is a file of
+// its own, loaded from the head, and why the switch it binds lives in the top
+// bar. The light palette is a second set of values for the same variables, so
+// no rule needs a second body.
+func TestConsoleSwitchesBetweenDayAndNight(t *testing.T) {
+	page := consoleAsset(t, "/console/")
+
+	themeTag := strings.Index(page, `src="theme.js"`)
+	if themeTag == -1 {
+		t.Fatal("the console page does not load the theme script")
+	}
+	if headEnd := strings.Index(page, "</head>"); headEnd == -1 || themeTag > headEnd {
+		t.Error("the theme script is not loaded from the head, so the first paint is unthemed")
+	}
+	if !strings.Contains(page, `id="theme-button"`) {
+		t.Error("the top bar carries no day/night switch")
+	}
+
+	script := consoleAsset(t, "/console/theme.js")
+	for _, wanted := range []string{
+		"getElementById('theme-button')",
+		"'fluxgate.theme'",
+		"prefers-color-scheme",
+		"data-theme",
+		"localStorage",
+	} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("the theme script is missing %q", wanted)
+		}
+	}
+
+	stylesheet := consoleAsset(t, "/console/styles.css")
+	for _, wanted := range []string{
+		`:root[data-theme="light"]`,
+		"color-scheme: light",
+	} {
+		if !strings.Contains(stylesheet, wanted) {
+			t.Errorf("the stylesheet is missing %q", wanted)
+		}
+	}
 }
 
 // A credential field is not a place a browser may fill in. The console's own
