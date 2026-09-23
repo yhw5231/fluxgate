@@ -34,10 +34,40 @@ func IsExact(pat string) bool {
 	return !strings.ContainsAny(trimmed, "*?")
 }
 
+// variantTags are the colon-separated suffixes that are naming rather than a
+// different model, which is how a router that resells one model under several
+// arrangements spells them: ":free", ":nitro". The set is closed on purpose,
+// because a colon also writes the channel group a platform serves a model from
+// — "cn:deepseek-v4.1-flash" — and a rule that read every suffix as a variant
+// would reduce such a name to its group and give every model of that platform
+// one identity. A suffix that is not listed here stays part of the name, so
+// nothing is ever dropped on a guess.
+var variantTags = map[string]struct{}{
+	"free":           {},
+	"nitro":          {},
+	"thinking":       {},
+	"online":         {},
+	"extended":       {},
+	"floor":          {},
+	"beta":           {},
+	"self-moderated": {},
+}
+
+// isDecoration reports whether what follows a colon is a channel's arrangement
+// of the model rather than part of its name: a known variant tag, or nothing at
+// all, which is a value that carries no model name past its separator.
+func isDecoration(suffix string) bool {
+	if suffix == "" {
+		return true
+	}
+	_, known := variantTags[suffix]
+	return known
+}
+
 // Canonical reduces a model name to the identity that every spelling of it
 // shares. One model is routinely written several ways: a listing may call it
 // "cline-free/deepseek-v4.1-flash:free" while a client asks for
-// "DeepSeek-V4.1-Flash". The channel path before the last "/", the variant
+// "DeepSeek-V4.1-Flash". The channel path before the last "/", a known variant
 // suffix after the last ":" and a trailing "-free" name a channel's own
 // arrangement of the model rather than a different model, so dropping them makes
 // the spellings compare equal.
@@ -49,7 +79,7 @@ func Canonical(value string) string {
 	if index := strings.LastIndex(name, "/"); index >= 0 {
 		name = name[index+1:]
 	}
-	if index := strings.LastIndex(name, ":"); index >= 0 {
+	if index := strings.LastIndex(name, ":"); index >= 0 && isDecoration(name[index+1:]) {
 		name = name[:index]
 	}
 	return strings.TrimSuffix(name, "-free")

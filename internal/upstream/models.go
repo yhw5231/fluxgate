@@ -365,6 +365,21 @@ func parseModels(body []byte) ([]string, error) {
 // collectModels walks a decoded listing for model names. It descends into the
 // containers a listing is known to use instead of walking the whole document,
 // so an unrelated "id" field cannot be mistaken for a model.
+//
+// One entry names one model: the first of the identifier keys that carries a
+// value is the name, and the others are not further models. An entry that
+// carries a display label beside its identifier is a common shape — a platform
+// that serves a model from a channel group may list
+// {"id":"cn:deepseek-v4.1-flash","name":"Deepseek-V4.1-Flash"} — and that label
+// is a name the upstream would not accept, and the same model under another
+// spelling to everything downstream. Reading it as a model in its own right is
+// what offers an operator a choice that cannot be routed and lets the label
+// answer for the model: the two reduce to one identity, so the lowercase model
+// ends up named by the label.
+//
+// The identifier keys are tried in the order the shapes put them in, so a
+// listing of plain strings, of "id"-keyed entries, and of "name"-keyed entries
+// all still read.
 func collectModels(value any, names map[string]struct{}) {
 	switch typed := value.(type) {
 	case []any:
@@ -377,12 +392,17 @@ func collectModels(value any, names map[string]struct{}) {
 				collectModels(nested, names)
 			}
 		}
-		for _, key := range []string{"id", "name", "model"} {
-			if name, ok := typed[key].(string); ok {
-				if trimmed := strings.TrimSpace(name); trimmed != "" {
-					names[trimmed] = struct{}{}
-				}
+		for _, key := range []string{"id", "model", "name"} {
+			name, ok := typed[key].(string)
+			if !ok {
+				continue
 			}
+			trimmed := strings.TrimSpace(name)
+			if trimmed == "" {
+				continue
+			}
+			names[trimmed] = struct{}{}
+			break
 		}
 	case string:
 		if trimmed := strings.TrimSpace(typed); trimmed != "" {

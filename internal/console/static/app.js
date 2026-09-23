@@ -2995,16 +2995,33 @@
     };
   }
 
+  /* MODEL_VARIANTS are the colon suffixes that are a channel's own arrangement of
+   * a model rather than a different model, mirroring the gateway's own list. The
+   * set is closed on purpose: a colon also writes the channel group a model is
+   * served from, in the shape "cn:deepseek-v4.1-flash", and there the name after
+   * it is the model. */
+  var MODEL_VARIANTS = {
+    free: true, nitro: true, thinking: true, online: true,
+    extended: true, floor: true, beta: true, 'self-moderated': true
+  };
+
+  /* isModelDecoration reports whether what follows a colon is a channel's own
+   * arrangement of the model rather than part of its name, mirroring the
+   * gateway: a known variant tag, or nothing at all. */
+  function isModelDecoration(suffix) {
+    return suffix === '' || Object.prototype.hasOwnProperty.call(MODEL_VARIANTS, suffix);
+  }
+
   /* canonicalModelName is the name a model is exposed by, mirroring the
-   * gateway's own rule: case, the channel path before the last "/", the variant
-   * suffix after the last ":", and a trailing "-free" are a channel's own
-   * arrangement of the model rather than a different model. */
+   * gateway's own rule: case, the channel path before the last "/", a known
+   * variant suffix after the last ":", and a trailing "-free" are a channel's
+   * own arrangement of the model rather than a different model. */
   function canonicalModelName(value) {
     var name = String(value === null || value === undefined ? '' : value).trim().toLowerCase();
     var slash = name.lastIndexOf('/');
     if (slash >= 0) { name = name.slice(slash + 1); }
     var colon = name.lastIndexOf(':');
-    if (colon >= 0) { name = name.slice(0, colon); }
+    if (colon >= 0 && isModelDecoration(name.slice(colon + 1))) { name = name.slice(0, colon); }
     if (name.slice(-5) === '-free') { name = name.slice(0, -5); }
     return name;
   }
@@ -3017,10 +3034,11 @@
     var heading = element('span', 'field-label', (FIELDS.upstreams.models || {}).label || '模型');
     wrapper.appendChild(heading);
     wrapper.appendChild(element('p', 'field-help',
-      '勾选这个上游提供的模型；保存后网关会自动为它们建立路由。模型名会去掉大小写、' +
-      '渠道路径（/ 前面）和后缀（: 后面）的差别：cline-free/deepseek-v4.1-flash:free ' +
-      '和 DeepSeek-V4.1-Flash 都是同一个模型。「上游模型名」填上游认识的写法，' +
-      '留空表示与模型名相同。'));
+      '勾选这个上游提供的模型；保存后网关会自动为它们建立路由。模型名会去掉大小写和' +
+      '渠道路径（/ 前面）的差别，:free、:nitro 这类已知变体后缀也算同一个模型：' +
+      'cline-free/deepseek-v4.1-flash:free 和 DeepSeek-V4.1-Flash 是同一个模型。' +
+      '「上游模型名」填上游认识的写法，留空表示与模型名相同。注意 cn:deepseek-v4.1-flash ' +
+      '这类带渠道分组的名字：冒号后面才是模型本身，不会当成后缀去掉。'));
 
     var rows = [];
     var known = {};

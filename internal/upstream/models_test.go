@@ -41,6 +41,38 @@ func TestModelsReadsAnOpenAIListing(t *testing.T) {
 	}
 }
 
+// A listing entry names one model. A platform that serves models from channel
+// groups labels them beside the id — {"id":"cn:deepseek-v4.1-flash",
+// "name":"Deepseek-V4.1-Flash"} — and that label is what its own console shows,
+// not a name it would accept. Offering it as a model is what let an operator's
+// lowercase model be answered by the label.
+func TestModelsReadsTheIdentifierAndNotTheDisplayLabel(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"object":"list","data":[` +
+			`{"id":"cn:deepseek-v4.1-flash","object":"model","name":"Deepseek-V4.1-Flash"},` +
+			`{"id":"global:deepseek-v4.1-flash","object":"model","name":"Deepseek-V4.1-Flash"},` +
+			// An entry whose identifier is blank still contributes the name it
+			// does carry, so a shape that is only ever named keeps working.
+			`{"id":"","name":"bare-name"}]}`))
+	}))
+	defer server.Close()
+
+	result, err := (&Client{}).Models(context.Background(), Request{BaseURL: server.URL, APIKey: "secret"})
+	if err != nil {
+		t.Fatalf("Models() error = %v", err)
+	}
+	want := []string{"bare-name", "cn:deepseek-v4.1-flash", "global:deepseek-v4.1-flash"}
+	if len(result.Models) != len(want) {
+		t.Fatalf("models = %v, want %v", result.Models, want)
+	}
+	for index, name := range want {
+		if result.Models[index] != name {
+			t.Errorf("models = %v, want %v", result.Models, want)
+			break
+		}
+	}
+}
+
 // Upstreams that mount their API at the root, or answer with a different shape,
 // still work: the probe tries the other path and reads the names it finds.
 func TestModelsFallsBackToTheRootPathAndOtherShapes(t *testing.T) {

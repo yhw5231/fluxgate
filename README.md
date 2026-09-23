@@ -353,8 +353,12 @@ upstreams:
   (weighted random) spreads requests across every key in proportion to its weight.
 - **Models are picked, not typed.** 获取模型 asks the upstream itself for its model
   list, so the operator selects from what it really serves; a model can also be
-  typed in by hand. A picked name is filed under the model's canonical name — the
-  part after any `channel/` path, without a `:variant` suffix, lowercased — so
+  typed in by hand. A listing entry names one model: the name is read from the
+  entry's identifier (`id`, or `model`/`name` when that is all an entry carries), and
+  a display label a platform writes beside the identifier is not offered as a second
+  model — it is what that platform's own console shows, not a name it would accept.
+  A picked name is filed under the model's canonical name — the
+  part after any `channel/` path, without a known `:variant` suffix, lowercased — so
   `cline-free/deepseek-v4.1-flash:free` and `DeepSeek-V4.1-Flash` are one model
   exposed once, and the spelling the upstream listed is carried as the name to send
   it. Each selected model takes an optional upstream model name, prefilled with that
@@ -538,7 +542,7 @@ Writing `keys` or `models` creates the account, the token
 rows, the routes, and the channels behind them; the route ids the console created are
 recorded in the settings table under `gateway.managed_routes`, so an edit prunes only
 what it owns. A selected model is exposed under its canonical name — the part after any
-`channel/` path, without a `:variant` suffix, lowercased — while the spelling it was
+`channel/` path, without a known `:variant` suffix, lowercased — while the spelling it was
 picked by becomes the name that upstream receives, so two upstreams that call one model
 different things meet on one route. `priority` is stored in the settings table under
 `gateway.upstream_priorities` as a JSON object of upstream id to whole number, because
@@ -773,8 +777,10 @@ the form, not the forced endpoint, so a probe before saving answers for what was
 ### Model names
 
 One model is routinely spelled several ways, so a request is matched by model
-identity rather than as a string. Case, the channel path before the last `/`, the
-variant suffix after the last `:`, and a trailing `-free` are naming rather than a
+identity rather than as a string. Case, the channel path before the last `/`, a
+known variant suffix after the last `:` (`:free`, `:nitro`, `:thinking`, `:online`,
+`:extended`, `:floor`, `:beta`, `:self-moderated`), and a trailing `-free` are naming
+rather than a
 different model, so `DeepSeek-V4.1-Flash`, `cline-free/deepseek-v4.1-flash`, and
 `cline-free/deepseek-v4.1-flash:free` all reach the route that exposes
 `deepseek-v4.1-flash`, and that name is what the gateway exposes and lists. Route
@@ -784,6 +790,15 @@ the plain name covers every decorated spelling of it. A `re:` pattern is the
 exception: it is matched against the name as sent, because it is written against
 what the client spells out.
 
+Only those variant tags are read as naming, because a colon also writes the channel
+group a platform serves a model from — `cn:deepseek-v4.1-flash` — and there the name
+after the colon is the model itself. Such a name is kept whole: it keeps its own
+identity instead of collapsing into its channel group, and every model that group
+serves stays a model of its own. A suffix the gateway does not know is kept for the
+same reason, so a name is never reduced to something no upstream ever wrote. To
+expose a friendlier name for one, map it (`model_mapping`) or give the route a
+display name.
+
 The upstream still receives the spelling it knows: a channel's `source_model` (or
 the name the console stored when the model was picked) is written into the request
 body, so one exposed model can reach several upstreams that each call it something
@@ -792,8 +807,8 @@ different.
 Candidate channels are then filtered by:
 
 - `route_channels.source_model`: when set, the channel only serves models that
-  equal it, are the same model under another spelling (case, channel path, variant
-  suffix, `-free`), or match it as a pattern. A channel on an exact-pattern route
+  equal it, are the same model under another spelling (case, channel path, known
+  variant suffix, `-free`), or match it as a pattern. A channel on an exact-pattern route
   inherits that pattern as its source model when the column is empty. A channel
   that names its own model on an exact-pattern route is a candidate for that
   route regardless, which is what lets one exposed model reach several upstreams

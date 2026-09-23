@@ -669,3 +669,29 @@ func TestUpstreamExposesTheCanonicalModelName(t *testing.T) {
 		t.Fatalf("line source models = %v, want each upstream's own spelling", sources)
 	}
 }
+
+// A platform that writes the channel group before the colon serves several
+// models as "cn:<model>". Reading that colon as a variant suffix would leave
+// "cn" as the name of every one of them, so they would all land on one route
+// named after the group and the model the operator picked would be gone.
+func TestUpstreamKeepsAChannelGroupInTheModelName(t *testing.T) {
+	store := prepareUpstreamStore(t)
+	created := createUpstream(t, store, map[string]any{
+		"name": "Grouped", "url": "https://api.example.com",
+		"keys": []any{"key"}, "models": []any{"cn:deepseek-v4.1-flash", "cn:auto"},
+	})
+
+	models := stringsOf(t, created["models"])
+	if len(models) != 2 || models[0] != "cn:auto" || models[1] != "cn:deepseek-v4.1-flash" {
+		t.Fatalf("models = %v, want both names kept whole", models)
+	}
+	if routes := rowsOf(t, store, "routes"); len(routes) != 2 {
+		t.Fatalf("routes = %v, want one route per model", routes)
+	}
+	for _, channel := range rowsOf(t, store, "channels") {
+		source := channel["source_model"].(string)
+		if source != "cn:auto" && source != "cn:deepseek-v4.1-flash" {
+			t.Errorf("source model = %q, want the name the upstream serves", source)
+		}
+	}
+}
