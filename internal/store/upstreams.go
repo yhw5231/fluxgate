@@ -31,10 +31,12 @@ import (
 //     the model automatically" means here. A route the console created is
 //     remembered in the settings table, so a route the operator wrote by hand is
 //     never pruned by a later edit.
-//   - A key is a channel. The per-key selection mode is expressed with the two
-//     mechanisms the selector already has: an upstream that prefers the first
-//     available key gives its keys descending priorities, and an upstream that
-//     rotates gives every key the same priority and the same weight.
+//   - A key is a channel. The per-key selection mode rides on the route as its
+//     routing strategy, which is what the router reads to pick a key out of the
+//     upstream it has already chosen: stable_first takes the first key of the
+//     list, round_robin spreads the request across the keys. The order of the
+//     rows is therefore the order of the keys, and the console writes them in
+//     the order the operator sees them.
 
 const (
 	// managedRoutesSetting names the settings row that records which routes the
@@ -55,9 +57,23 @@ const (
 	upstreamKeyModeAvailableFirst = "available_first"
 	upstreamKeyModeRoundRobin     = "round_robin"
 
-	// upstreamChannelWeight is the weight a generated channel carries. It only
-	// orders keys inside one route; an upstream's own weight is the site's
-	// global_weight, which the selector multiplies into every channel weight.
+	// upstreamCDModeSetting names the settings row that records how each upstream
+	// cools its keys down. It is not a sites column either, and it is deliberately
+	// separate from the key mode: which key answers a request and how long a key
+	// stays out of rotation after failing are two different questions.
+	upstreamCDModeSetting = "gateway.upstream_cd_modes"
+
+	// The two ways an upstream holds a failing key out of rotation.
+	// upstreamCDModeKey takes the whole key out, whichever model it failed on;
+	// upstreamCDModeKeyAndModel takes it out for that one model only, which keeps
+	// a key that is broken for one model serving the rest.
+	upstreamCDModeKey         = "key_cooldown"
+	upstreamCDModeKeyAndModel = "key_model_cooldown"
+
+	// upstreamChannelWeight is the weight a generated channel carries, which is
+	// the share of the upstream's requests that key takes when the upstream
+	// rotates across its keys. The upstream's own weight is the site's
+	// global_weight, which decides between upstreams of one priority.
 	upstreamChannelWeight = 10
 
 	// defaultPlatform is stored for an upstream created from the console. The
@@ -119,6 +135,10 @@ var upstreamResource = Resource{
 		// makes an untouched form safe to submit.
 		{Name: "keys", Kind: KindJSONArray, Synthetic: true, MaxLength: 65536, Validate: validateStringList},
 		{Name: "key_mode", Kind: KindText, Synthetic: true, MaxLength: 32, Choices: []string{upstreamKeyModeAvailableFirst, upstreamKeyModeRoundRobin}},
+		// How a failing key is held out of rotation. Per key is the default: a key
+		// that just failed is not worth trying on the upstream's other models
+		// either, which is what key+model would do.
+		{Name: "key_cd_mode", Kind: KindText, Synthetic: true, MaxLength: 32, Choices: []string{upstreamCDModeKey, upstreamCDModeKeyAndModel}, DefaultValue: upstreamCDModeKey},
 		{Name: "models", Kind: KindJSONArray, Synthetic: true, MaxLength: 65536, Validate: validateStringList},
 		{Name: "model_mapping", Kind: KindJSONObject, Synthetic: true, MaxLength: 32768, Validate: validateModelMapping},
 	},
@@ -200,6 +220,13 @@ func applyUpstream(ctx context.Context, tx *sql.Tx, siteID int64, values map[str
 			return err
 		}
 	}
+	if raw, present := values["key_cd_mode"]; present {
+		if err := applyUpstreamCDMode(ctx, tx, siteID, raw); err != nil {
+			return err
+		}
+	} else if err := ensureUpstreamCDMode(ctx, tx, siteID); err != nil {
+		return err
+	}
 	accountID, err := ensureUpstreamAccount(ctx, tx, siteID)
 	if err != nil {
 		return err
@@ -227,8 +254,8 @@ func applyUpstream(ctx context.Context, tx *sql.Tx, siteID int64, values map[str
 }
 
 // refreshUpstreamChannels rewrites the lines of the models an upstream already
-// serves. The model selection is untouched: only the credentials behind it and
-// the priority each of them gets.
+// serves. The model selection is untouched: only the credentials behind it, the
+// order they are tried in, and the key mode the routes carry.
 func refreshUpstreamChannels(ctx context.Context, tx *sql.Tx, accountID int64, rawMode any) error {
 	credentials, err := upstreamChannelCredentials(ctx, tx, accountID)
 	if err != nil {
@@ -242,8 +269,22 @@ func refreshUpstreamChannels(ctx context.Context, tx *sql.Tx, accountID int64, r
 	if mode == "" {
 		mode = upstreamKeyModeOfRoutes(served)
 	}
+	// A key mode that arrives without the model selection is still a change the
+	// operator asked for, so the managed routes are brought in line with it: the
+	// router reads the key mode off the route, and leaving the old one there would
+	// silently ignore the request.
+	strategy := upstreamRoutingStrategy(mode)
+	managed, err := managedRoutes(ctx, tx)
+	if err != nil {
+		return err
+	}
 	for routeID, route := range served {
-		if err := writeUpstreamChannels(ctx, tx, routeID, accountID, credentials, strings.TrimSpace(route.SourceModel), mode); err != nil {
+		if _, owned := managed[routeID]; owned {
+			if _, err := tx.ExecContext(ctx, `UPDATE token_routes SET routing_strategy = ? WHERE id = ?`, strategy, routeID); err != nil {
+				return fmt.Errorf("set route strategy: %w", err)
+			}
+		}
+		if err := writeUpstreamChannels(ctx, tx, routeID, accountID, credentials, strings.TrimSpace(route.SourceModel)); err != nil {
 			return err
 		}
 	}
@@ -389,7 +430,7 @@ func replaceUpstreamModels(ctx context.Context, tx *sql.Tx, accountID int64, raw
 			}
 		}
 		target := upstreamModelTarget(model, mapping)
-		if err := writeUpstreamChannels(ctx, tx, routeID, accountID, credentials, target, mode); err != nil {
+		if err := writeUpstreamChannels(ctx, tx, routeID, accountID, credentials, target); err != nil {
 			return err
 		}
 	}
@@ -422,19 +463,22 @@ func replaceUpstreamModels(ctx context.Context, tx *sql.Tx, accountID int64, raw
 // writeUpstreamChannels replaces this account's channels on one route. The
 // channel of a key carries the model name the upstream expects, which is the
 // mapping target when there is one.
-func writeUpstreamChannels(ctx context.Context, tx *sql.Tx, routeID, accountID int64, credentials []upstreamCredential, target, mode string) error {
+//
+// The rows are inserted in the order of the credential list, which is what makes
+// "the upstream's first key" mean the first key the operator sees: selection
+// walks an upstream's keys in that order for a key mode that prefers the first
+// available one. The line's own priority column is left at its default, because
+// nothing reads it — a line is never chosen over another upstream's line, and
+// inside one upstream the key mode decides.
+func writeUpstreamChannels(ctx context.Context, tx *sql.Tx, routeID, accountID int64, credentials []upstreamCredential, target string) error {
 	if err := dropUpstreamChannels(ctx, tx, routeID, accountID); err != nil {
 		return err
 	}
-	for index, credential := range credentials {
-		priority := 0
-		if mode == upstreamKeyModeAvailableFirst {
-			priority = len(credentials) - 1 - index
-		}
+	for _, credential := range credentials {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO route_channels (
 			route_id, account_id, token_id, source_model, priority, weight, enabled
-		) VALUES (?, ?, ?, ?, ?, ?, 1)`,
-			routeID, accountID, credential.TokenID, target, priority, upstreamChannelWeight); err != nil {
+		) VALUES (?, ?, ?, ?, 0, ?, 1)`,
+			routeID, accountID, credential.TokenID, target, upstreamChannelWeight); err != nil {
 			return fmt.Errorf("create upstream channel: %w", err)
 		}
 	}
@@ -764,6 +808,153 @@ func forgetUpstreamPriority(ctx context.Context, tx *sql.Tx, siteID int64) error
 	return saveUpstreamPriorities(ctx, tx, priorities)
 }
 
+/* ===== Per-upstream key cooldown mode ===== */
+
+// upstreamCDModes reads the cooldown mode stored for each upstream.
+func upstreamCDModes(ctx context.Context, db queryer) (map[int64]string, error) {
+	var value string
+	err := db.QueryRowContext(ctx, `SELECT COALESCE(value, '') FROM settings WHERE key = ?`, upstreamCDModeSetting).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return map[int64]string{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read upstream cooldown modes: %w", err)
+	}
+	return parseUpstreamCDModes(value)
+}
+
+// upstreamCDModesFrom reads the modes out of an already-loaded settings map,
+// which is how the configuration loader reaches them: it has every settings row
+// in hand before it builds the routing table.
+func upstreamCDModesFrom(settings map[string]string) (map[int64]string, error) {
+	return parseUpstreamCDModes(settings[upstreamCDModeSetting])
+}
+
+// parseUpstreamCDModes decodes the stored object. An entry naming an unknown mode
+// or no site is skipped rather than failing the load: a cooldown mode is a policy
+// hint, and one unreadable entry must not cost the gateway its whole
+// configuration.
+func parseUpstreamCDModes(value string) (map[int64]string, error) {
+	modes := map[int64]string{}
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || trimmed == "null" {
+		return modes, nil
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &decoded); err != nil {
+		return nil, fmt.Errorf("parse upstream cooldown modes: %w", err)
+	}
+	for key, entry := range decoded {
+		siteID, err := strconv.ParseInt(strings.TrimSpace(key), 10, 64)
+		if err != nil || siteID <= 0 {
+			continue
+		}
+		text, ok := entry.(string)
+		if !ok {
+			continue
+		}
+		if mode := upstreamCDModeFrom(text); mode != "" {
+			modes[siteID] = mode
+		}
+	}
+	return modes, nil
+}
+
+func saveUpstreamCDModes(ctx context.Context, tx *sql.Tx, modes map[int64]string) error {
+	if len(modes) == 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, upstreamCDModeSetting); err != nil {
+			return fmt.Errorf("clear upstream cooldown modes: %w", err)
+		}
+		return nil
+	}
+	encoded, err := json.Marshal(modes)
+	if err != nil {
+		return fmt.Errorf("encode upstream cooldown modes: %w", err)
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO settings (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, upstreamCDModeSetting, string(encoded))
+	if err != nil {
+		return fmt.Errorf("store upstream cooldown modes: %w", err)
+	}
+	return nil
+}
+
+// upstreamCDModeFrom normalizes a submitted cooldown mode, answering "" for a
+// value it does not recognize.
+func upstreamCDModeFrom(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case upstreamCDModeKey:
+		return upstreamCDModeKey
+	case upstreamCDModeKeyAndModel:
+		return upstreamCDModeKeyAndModel
+	default:
+		return ""
+	}
+}
+
+// upstreamCDModeOrDefault is the cooldown mode of an upstream that has none
+// stored: the one its key mode has always implied. Preferring the first key takes
+// that key out when it fails, rotating across keys takes a key out for the model
+// it failed on. An upstream with no line yet falls back to the default, which is
+// the whole key.
+func upstreamCDModeOrDefault(keyMode string) string {
+	if keyMode == upstreamKeyModeRoundRobin {
+		return upstreamCDModeKeyAndModel
+	}
+	return upstreamCDModeKey
+}
+
+// applyUpstreamCDMode stores one upstream's cooldown mode. The default is written
+// out rather than skipped: an upstream the console manages should say which of
+// the two modes it runs in, instead of leaving the loader to infer one from a key
+// mode that answers a different question.
+func applyUpstreamCDMode(ctx context.Context, tx *sql.Tx, siteID int64, raw any) error {
+	mode := upstreamCDModeKey
+	if text, ok := raw.(string); ok {
+		if normalized := upstreamCDModeFrom(text); normalized != "" {
+			mode = normalized
+		}
+	}
+	modes, err := upstreamCDModes(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if modes[siteID] == mode {
+		return nil
+	}
+	modes[siteID] = mode
+	return saveUpstreamCDModes(ctx, tx, modes)
+}
+
+// ensureUpstreamCDMode gives an upstream the default cooldown mode when it has
+// none yet, so an upstream the console writes runs in a mode that is written down
+// rather than one inferred from its key mode. An upstream that already has one
+// keeps it: an edit that does not mention the mode is not a request to change it.
+func ensureUpstreamCDMode(ctx context.Context, tx *sql.Tx, siteID int64) error {
+	modes, err := upstreamCDModes(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if _, present := modes[siteID]; present {
+		return nil
+	}
+	return applyUpstreamCDMode(ctx, tx, siteID, nil)
+}
+
+// forgetUpstreamCDMode drops a deleted upstream's cooldown mode, so a site id the
+// database later reuses does not inherit it.
+func forgetUpstreamCDMode(ctx context.Context, tx *sql.Tx, siteID int64) error {
+	modes, err := upstreamCDModes(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if _, present := modes[siteID]; !present {
+		return nil
+	}
+	delete(modes, siteID)
+	return saveUpstreamCDModes(ctx, tx, modes)
+}
+
 /* ===== Read path ===== */
 
 // UpstreamKey returns the first key of a stored upstream.
@@ -805,6 +996,10 @@ func decorateUpstreams(ctx context.Context, db queryer, rows []map[string]any) e
 	if err != nil {
 		return err
 	}
+	cdModes, err := upstreamCDModes(ctx, db)
+	if err != nil {
+		return err
+	}
 	for _, row := range rows {
 		siteID, ok := row["id"].(int64)
 		if !ok {
@@ -820,6 +1015,7 @@ func decorateUpstreams(ctx context.Context, db queryer, rows []map[string]any) e
 			row["models"] = []any{}
 			row["model_mapping"] = map[string]any{}
 			row["key_mode"] = upstreamKeyModeRoundRobin
+			row["key_cd_mode"] = upstreamCDModeFor(cdModes, siteID, upstreamKeyModeRoundRobin)
 			continue
 		}
 		keys, err := upstreamKeys(ctx, db, accountID)
@@ -847,9 +1043,22 @@ func decorateUpstreams(ctx context.Context, db queryer, rows []map[string]any) e
 		sort.Strings(models)
 		row["models"] = models
 		row["model_mapping"] = mapping
-		row["key_mode"] = upstreamKeyModeOfRoutes(served)
+		keyMode := upstreamKeyModeOfRoutes(served)
+		row["key_mode"] = keyMode
+		row["key_cd_mode"] = upstreamCDModeFor(cdModes, siteID, keyMode)
 	}
 	return nil
+}
+
+// upstreamCDModeFor reports the cooldown mode an upstream runs in: the one stored
+// for it, or the one its key mode implies while it has none of its own. The
+// second case is what an upstream created before the setting existed, or one
+// written straight into the database, still behaves as.
+func upstreamCDModeFor(modes map[int64]string, siteID int64, keyMode string) string {
+	if mode, ok := modes[siteID]; ok {
+		return mode
+	}
+	return upstreamCDModeOrDefault(keyMode)
 }
 
 func upstreamAccountID(ctx context.Context, db queryer, siteID int64) (int64, error) {
@@ -969,6 +1178,9 @@ func upstreamServedRoutes(ctx context.Context, db queryer, accountID int64) (map
 func cascadeDeleteUpstream(ctx context.Context, tx *sql.Tx, siteID int64) (map[string]int64, error) {
 	removed := map[string]int64{}
 	if err := forgetUpstreamPriority(ctx, tx, siteID); err != nil {
+		return nil, err
+	}
+	if err := forgetUpstreamCDMode(ctx, tx, siteID); err != nil {
 		return nil, err
 	}
 	accounts, err := siteAccountIDs(ctx, tx, siteID)

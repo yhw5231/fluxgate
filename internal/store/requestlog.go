@@ -109,6 +109,11 @@ type RequestLogFilter struct {
 	// Limit bounds how many records are returned, newest first. Zero means the
 	// store's own default.
 	Limit int
+	// Offset skips that many matching records, which is how a view reads a page
+	// beyond the first one. It is counted over the records the rest of the filter
+	// matches, so page two of a filtered view is the next page of what the
+	// operator is looking at.
+	Offset int
 	// FailedOnly keeps the requests that were not served, which is what an
 	// operator hunting a failure wants.
 	FailedOnly bool
@@ -120,8 +125,8 @@ type RequestLogFilter struct {
 }
 
 // defaultRequestLogLimit is how many records a read returns when the caller does
-// not say. The console shows a page of them and a wider window only on request.
-const defaultRequestLogLimit = 200
+// not say: one page of the console's request view.
+const defaultRequestLogLimit = 20
 
 // maxRequestLogLimit bounds a single read, so a request for "everything" cannot
 // put an unbounded result in memory.
@@ -137,30 +142,16 @@ func (s *SQLiteStore) ListRequestRecords(ctx context.Context, filter RequestLogF
 	if limit > maxRequestLogLimit {
 		limit = maxRequestLogLimit
 	}
-
-	clauses := make([]string, 0, 3)
-	args := make([]any, 0, 4)
-	if filter.SinceID > 0 {
-		clauses = append(clauses, "id > ?")
-		args = append(args, filter.SinceID)
-	}
-	if filter.FailedOnly {
-		// A request that never reached an upstream carries no status at all and is
-		// a failure the operator needs to see just as much as a 502.
-		clauses = append(clauses, "(status = 0 OR status >= 400)")
-	}
-	if model := strings.TrimSpace(filter.Model); model != "" {
-		clauses = append(clauses, "model = ? COLLATE NOCASE")
-		args = append(args, model)
+	offset := filter.Offset
+	if offset < 0 {
+		offset = 0
 	}
 
+	where, args := requestLogWhere(filter)
 	query := `SELECT id, request_id, created_at, method, path, client_ip, key_id, key_name, model,
-		stream, status, error_code, error_message, duration_ms, detail FROM gateway_request_log`
-	if len(clauses) > 0 {
-		query += " WHERE " + strings.Join(clauses, " AND ")
-	}
-	query += " ORDER BY id DESC LIMIT ?"
-	args = append(args, limit)
+		stream, status, error_code, error_message, duration_ms, detail FROM gateway_request_log` +
+		where + " ORDER BY id DESC LIMIT ? OFFSET ?"
+	args = append(args, limit, offset)
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -177,6 +168,43 @@ func (s *SQLiteStore) ListRequestRecords(ctx context.Context, filter RequestLogF
 		records = append(records, record)
 	}
 	return records, rows.Err()
+}
+
+// CountRequestRecords reports how many records match a filter. The page window is
+// not part of it: this is the number a view needs to know how many pages there
+// are, so it is counted over exactly the records the filter selects.
+func (s *SQLiteStore) CountRequestRecords(ctx context.Context, filter RequestLogFilter) (int, error) {
+	where, args := requestLogWhere(filter)
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM gateway_request_log`+where, args...).Scan(&total); err != nil {
+		return 0, fmt.Errorf("count request records: %w", err)
+	}
+	return total, nil
+}
+
+// requestLogWhere builds the WHERE clause a filter asks for. A page read and its
+// count share it, so a page and the total it is measured against never describe
+// different sets of records.
+func requestLogWhere(filter RequestLogFilter) (string, []any) {
+	clauses := make([]string, 0, 3)
+	args := make([]any, 0, 4)
+	if filter.SinceID > 0 {
+		clauses = append(clauses, "id > ?")
+		args = append(args, filter.SinceID)
+	}
+	if filter.FailedOnly {
+		// A request that never reached an upstream carries no status at all and is
+		// a failure the operator needs to see just as much as a 502.
+		clauses = append(clauses, "(status = 0 OR status >= 400)")
+	}
+	if model := strings.TrimSpace(filter.Model); model != "" {
+		clauses = append(clauses, "model = ? COLLATE NOCASE")
+		args = append(args, model)
+	}
+	if len(clauses) == 0 {
+		return "", args
+	}
+	return " WHERE " + strings.Join(clauses, " AND "), args
 }
 
 // ClearRequestRecords empties the log and reports how many records it dropped.

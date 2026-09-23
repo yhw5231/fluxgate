@@ -38,10 +38,17 @@ type Scope struct {
 
 // State is the persisted state for one circuit.
 type State struct {
+	// ConsecutiveFailures counts the failures since the line last succeeded. It
+	// is what the threshold is compared against, and it is kept across a trip:
+	// a line that fails again after its cooldown expired opens the circuit with
+	// the very next failure, because the failures it already accumulated still
+	// stand. A success, or an operator clearing the circuit, is what resets it.
 	ConsecutiveFailures int
-	CooldownLevel       int
-	BlockedUntil        time.Time
-	Disabled            bool
+	// CooldownLevel counts the trips, which is what makes a circuit that keeps
+	// failing wait longer each time.
+	CooldownLevel int
+	BlockedUntil  time.Time
+	Disabled      bool
 }
 
 // Store separates breaker behavior from state persistence.
@@ -158,7 +165,12 @@ func (b *Breaker) RecordFailure(failure domain.Failure) {
 		if state.ConsecutiveFailures < policy.Threshold {
 			return state
 		}
-		state.ConsecutiveFailures = 0
+		// The count deliberately survives the trip. A line that is still broken
+		// when its cooldown expires must answer for the failures it already
+		// accumulated, so its next failure opens the circuit again and the
+		// cooldown steps up, instead of every cooldown expiry handing it a fresh
+		// budget of attempts at the base duration. Only a success, or an operator
+		// clearing the circuit, starts the count over.
 		if policy.Mode == ModeDisable {
 			state.Disabled = true
 			return state

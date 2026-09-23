@@ -85,20 +85,24 @@ func TestEngineRetriesSameChannelThenFailsOver(t *testing.T) {
 
 	selector := router.NewMemorySelector(routeFor(
 		domain.ModelMapping{{Pattern: "gpt-*", Target: "mapped-model"}},
+		// The failing line belongs to the preferred upstream, so the request
+		// starts on it rather than on whichever of the two was drawn.
 		domain.Channel{
-			ID:       "first",
-			BaseURL:  first.URL,
-			Enabled:  true,
-			Priority: 20,
-			Weight:   1,
+			ID:           "first",
+			BaseURL:      first.URL,
+			Enabled:      true,
+			SiteID:       1,
+			SitePriority: 20,
+			Weight:       1,
 		},
 		domain.Channel{
-			ID:       "second",
-			BaseURL:  second.URL,
-			APIKey:   "second-key",
-			Enabled:  true,
-			Priority: 10,
-			Weight:   1,
+			ID:           "second",
+			BaseURL:      second.URL,
+			APIKey:       "second-key",
+			Enabled:      true,
+			SiteID:       2,
+			SitePriority: 10,
+			Weight:       1,
 		},
 	))
 	observer := &recordingObserver{}
@@ -153,6 +157,56 @@ func TestEngineRetriesSameChannelThenFailsOver(t *testing.T) {
 	}
 }
 
+// A failing key is left for the next key of the upstream the request is already
+// on, before any other upstream is considered: the upstream is chosen first, and
+// which of its keys answers is the upstream's own business.
+func TestEngineFailoverWalksTheKeysOfTheChosenUpstream(t *testing.T) {
+	var firstKeyCalls, secondKeyCalls, otherUpstreamCalls int
+	firstKey := channelServer(t, http.StatusServiceUnavailable, &firstKeyCalls)
+	secondKey := channelServer(t, http.StatusOK, &secondKeyCalls)
+	otherUpstream := channelServer(t, http.StatusOK, &otherUpstreamCalls)
+
+	engine := &Engine{
+		Selector: router.NewMemorySelector(routeFor(nil,
+			// One upstream with two keys, and a second upstream of lower priority
+			// that the request should never need.
+			domain.Channel{ID: "key-1", Enabled: true, Weight: 10, SiteID: 1, SitePriority: 10, RoutingStrategy: "stable_first", BaseURL: firstKey.URL, APIKey: "key-1"},
+			domain.Channel{ID: "key-2", Enabled: true, Weight: 10, SiteID: 1, SitePriority: 10, RoutingStrategy: "stable_first", BaseURL: secondKey.URL, APIKey: "key-2"},
+			domain.Channel{ID: "other", Enabled: true, Weight: 10, SiteID: 2, BaseURL: otherUpstream.URL, APIKey: "other"},
+		)),
+		Policy: domain.RetryPolicy{
+			MaxAttempts:           4,
+			MaxAttemptsPerChannel: 1,
+			RetryStatuses:         map[int]struct{}{http.StatusServiceUnavailable: {}},
+		},
+		Sleep: noSleep,
+	}
+
+	result, err := engine.Forward(context.Background(), domain.Request{
+		Method: http.MethodPost,
+		Path:   "/v1/chat/completions",
+		Body:   []byte(`{"model":"m"}`),
+		Model:  "m",
+	})
+	if err != nil {
+		t.Fatalf("Forward() error = %v", err)
+	}
+	defer result.Response.Body.Close()
+
+	if result.Attempt.ChannelID != "key-2" {
+		t.Fatalf("successful channel = %q, want the upstream's second key", result.Attempt.ChannelID)
+	}
+	if len(result.Trace.Attempts) != 2 || result.Trace.Attempts[0].ChannelID != "key-1" {
+		t.Fatalf("attempts = %#v, want key-1 then key-2", result.Trace.Attempts)
+	}
+	if firstKeyCalls != 1 || secondKeyCalls != 1 {
+		t.Fatalf("key calls = %d and %d, want one each", firstKeyCalls, secondKeyCalls)
+	}
+	if otherUpstreamCalls != 0 {
+		t.Fatalf("the lower-priority upstream was called %d times, want none", otherUpstreamCalls)
+	}
+}
+
 func TestEngineReturnsNonRetryableResponseWithoutFailover(t *testing.T) {
 	var firstCalls int
 	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -171,8 +225,10 @@ func TestEngineReturnsNonRetryableResponseWithoutFailover(t *testing.T) {
 
 	engine := Engine{
 		Selector: router.NewMemorySelector(routeFor(nil,
-			domain.Channel{ID: "first", BaseURL: first.URL, Enabled: true, Priority: 20, Weight: 1},
-			domain.Channel{ID: "second", BaseURL: second.URL, Enabled: true, Priority: 10, Weight: 1},
+			// Two upstreams, the first one preferred: the request has to reach it
+			// for the test to say anything about a non-retryable answer.
+			domain.Channel{ID: "first", BaseURL: first.URL, Enabled: true, SiteID: 1, SitePriority: 20, Weight: 1},
+			domain.Channel{ID: "second", BaseURL: second.URL, Enabled: true, SiteID: 2, SitePriority: 10, Weight: 1},
 		)),
 		Policy: domain.RetryPolicy{
 			MaxAttempts:           4,
@@ -298,11 +354,11 @@ func TestEngineWithoutFailoverRetriesTheSameChannel(t *testing.T) {
 
 	engine := &Engine{
 		Selector: router.NewMemorySelector(routeFor(nil,
-			// The failing line is the preferred one, so which line the request
-			// starts on is decided by priority rather than by the draw between
-			// lines of one priority.
-			domain.Channel{ID: "first", Enabled: true, Weight: 10, Priority: 20, BaseURL: first.URL, APIKey: "first-key"},
-			domain.Channel{ID: "second", Enabled: true, Weight: 10, Priority: 10, BaseURL: second.URL, APIKey: "second-key"},
+			// The failing line belongs to the preferred upstream, so which line the
+			// request starts on is decided by upstream priority rather than by the
+			// draw between two upstreams of one priority.
+			domain.Channel{ID: "first", Enabled: true, Weight: 10, SiteID: 1, SitePriority: 20, BaseURL: first.URL, APIKey: "first-key"},
+			domain.Channel{ID: "second", Enabled: true, Weight: 10, SiteID: 2, SitePriority: 10, BaseURL: second.URL, APIKey: "second-key"},
 		)),
 		Policy: domain.RetryPolicy{
 			MaxAttempts:           4,

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math/rand"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,18 @@ import (
 )
 
 const defaultChannelWeight = 10
+
+// The two per-key selection modes an upstream can be configured with. The console
+// stores the upstream's key mode as the routing strategy of the routes it manages,
+// so the loader hands it to the router on every channel of that upstream.
+const (
+	// keyModeFirstAvailable prefers the upstream's first key, moving to the next
+	// one only when the first is unusable.
+	keyModeFirstAvailable = "stable_first"
+	// keyModeRotate spreads a request across the upstream's keys by key weight;
+	// equal weights make it a plain rotation.
+	keyModeRotate = "round_robin"
+)
 
 var (
 	// ErrNoChannel reports that a route matched but no channel could serve the
@@ -30,14 +43,16 @@ type ChannelFilter interface {
 // MemorySelector resolves the route that owns the requested model and picks one
 // of its channels.
 //
-// Selection is by priority first and by weight second, the way an operator
-// reasons about a pool of upstreams:
+// Selection asks two questions in order, the way an operator reasons about a pool
+// of upstreams:
 //
-//  1. The highest upstream priority with an eligible channel wins. The channel's
-//     own priority is compared inside that: a key mode that orders one
-//     upstream's keys orders them within their upstream, never across upstreams.
-//  2. Among the channels that tie on both, one is drawn at random, each
-//     channel's chance proportional to its effective weight.
+//  1. Which upstream? The highest upstream priority with an eligible channel
+//     wins; upstreams that tie on it are drawn by upstream weight.
+//  2. Which key of that upstream? The upstream's own key mode answers that — the
+//     first available key, or a rotation across its keys — and nothing outside the
+//     upstream influences it. A key can never lift its upstream above a preferred
+//     one, which is what makes priority mean "use this upstream first" rather than
+//     "give it more traffic".
 type MemorySelector struct {
 	mu     sync.Mutex
 	routes []domain.Route
@@ -89,36 +104,119 @@ func (s *MemorySelector) Select(request domain.SelectionRequest) (domain.Selecti
 		return domain.Selection{}, ErrNoChannel
 	}
 
-	selected := s.pickWeighted(highestPriorityTier(eligible), request.Policy)
+	selected := s.pickKey(s.pickUpstream(eligible, request.Policy), request.Policy)
 	return domain.Selection{
 		Channel: selected,
 		Model:   ActualModel(request.Model, route, selected),
 	}, nil
 }
 
-// highestPriorityTier keeps the channels a request should be tried on first: the
-// highest upstream priority present, and within it the highest channel priority.
-// A channel of a lower tier is only reached when every channel of the higher one
-// is unusable, which is what makes priority mean "try these first" rather than
-// "give these more traffic".
-func highestPriorityTier(eligible []domain.Channel) []domain.Channel {
-	bestSite, bestLine := eligible[0].SitePriority, eligible[0].Priority
+// pickUpstream keeps the channels of the upstream a request should be tried on:
+// the highest upstream priority present, and among the upstreams that tie on it
+// the one the draw gives, each upstream's chance proportional to its own weight
+// (its global weight scaled by the downstream key's site multiplier). A channel
+// of a lower-priority upstream is reached only when every channel of the higher
+// one is unusable, which is what makes priority mean "try these first" rather
+// than "give these more traffic".
+//
+// The return value is the chosen upstream's eligible channels; picking the key
+// out of them is a separate step, because which keys are still available is the
+// upstream's business and not a property of the pool.
+func (s *MemorySelector) pickUpstream(eligible []domain.Channel, policy domain.RoutingPolicy) []domain.Channel {
+	bestPriority := eligible[0].SitePriority
 	for _, channel := range eligible {
-		if channel.SitePriority > bestSite {
-			bestSite, bestLine = channel.SitePriority, channel.Priority
+		if channel.SitePriority > bestPriority {
+			bestPriority = channel.SitePriority
+		}
+	}
+
+	order := make([]int64, 0, len(eligible))
+	bySite := make(map[int64][]domain.Channel, len(eligible))
+	for _, channel := range eligible {
+		if channel.SitePriority != bestPriority {
 			continue
 		}
-		if channel.SitePriority == bestSite && channel.Priority > bestLine {
-			bestLine = channel.Priority
+		if _, seen := bySite[channel.SiteID]; !seen {
+			order = append(order, channel.SiteID)
+		}
+		bySite[channel.SiteID] = append(bySite[channel.SiteID], channel)
+	}
+	if len(order) == 1 {
+		return bySite[order[0]]
+	}
+
+	weights := make([]float64, len(order))
+	total := 0.0
+	for index, siteID := range order {
+		weights[index] = siteWeight(bySite[siteID][0], policy)
+		total += weights[index]
+	}
+	if !(total > 0) {
+		return bySite[order[0]]
+	}
+
+	draw := s.random.Float64() * total
+	for index, weight := range weights {
+		if draw < weight {
+			return bySite[order[index]]
+		}
+		draw -= weight
+	}
+	// Floating-point rounding can leave the draw a hair above the last weight.
+	return bySite[order[len(order)-1]]
+}
+
+// pickKey picks the key inside the chosen upstream, which the upstream's key mode
+// answers on its own: an upstream that prefers its first available key takes the
+// lowest one, and one that rotates spreads the request across its keys by key
+// weight, which with equal weights is a plain rotation. Blocked keys are already
+// gone by this point, so "first available" is the first key still in service.
+func (s *MemorySelector) pickKey(keys []domain.Channel, policy domain.RoutingPolicy) domain.Channel {
+	if len(keys) == 0 {
+		// Callers only reach here with an eligible channel, so this is
+		// unreachable rather than a case with a meaning of its own.
+		return domain.Channel{}
+	}
+	if len(keys) == 1 || firstKeyMode(keys) == keyModeFirstAvailable {
+		return firstKey(keys)
+	}
+	return s.pickWeighted(keys, policy)
+}
+
+// firstKeyMode reads the key mode of an upstream off its channels. Every channel
+// of one upstream carries the strategy of the route that created it, so the first
+// one answers for all of them.
+func firstKeyMode(keys []domain.Channel) string {
+	mode := strings.TrimSpace(keys[0].RoutingStrategy)
+	if mode == "" {
+		return keyModeRotate
+	}
+	return mode
+}
+
+// firstKey is the key an upstream that prefers its first available key is tried
+// on: the lowest line of that upstream, which is the order its keys are stored in
+// and the order the console shows them in.
+func firstKey(keys []domain.Channel) domain.Channel {
+	first := keys[0]
+	for _, channel := range keys[1:] {
+		if lineOrderBefore(channel.ID, first.ID) {
+			first = channel
 		}
 	}
-	pool := make([]domain.Channel, 0, len(eligible))
-	for _, channel := range eligible {
-		if channel.SitePriority == bestSite && channel.Priority == bestLine {
-			pool = append(pool, channel)
-		}
+	return first
+}
+
+// lineOrderBefore orders two lines the way an upstream lists its keys. Line ids
+// are numbers in practice, so they are compared as numbers when they parse and as
+// text when they do not.
+func lineOrderBefore(left, right string) bool {
+	leftID, leftErr := strconv.ParseInt(left, 10, 64)
+	rightID, rightErr := strconv.ParseInt(right, 10, 64)
+	if leftErr == nil && rightErr == nil {
+		return leftID < rightID
 	}
-	return pool
+	return left < right
 }
 
 // HasCandidate reports whether any channel could serve the model, without
@@ -247,10 +345,10 @@ func (s *MemorySelector) eligible(route domain.Route, request domain.SelectionRe
 	return eligible
 }
 
-// pickWeighted draws one channel from a priority tier, each channel's chance
-// proportional to its effective weight: contribution is the channel weight
-// scaled by the site weight and the downstream key's site multiplier. A tier
-// that is a single channel, or whose weights are all unusable, is answered
+// pickWeighted draws one key out of the chosen upstream's keys, each key's chance
+// proportional to its effective weight. Inside one upstream the site factors are
+// the same for every key, so the draw is proportional to the key weights alone. A
+// pool that is a single key, or whose weights are all unusable, is answered
 // without a draw.
 func (s *MemorySelector) pickWeighted(pool []domain.Channel, policy domain.RoutingPolicy) domain.Channel {
 	if len(pool) == 0 {
@@ -287,11 +385,19 @@ func effectiveWeight(channel domain.Channel, policy domain.RoutingPolicy) float6
 	if weight <= 0 {
 		weight = defaultChannelWeight
 	}
+	return weight * siteWeight(channel, policy)
+}
+
+// siteWeight is what one upstream contributes to a draw: the upstream's global
+// weight scaled by the downstream key's multiplier for it. A draw between
+// upstreams uses this on its own, because there the upstream is the unit being
+// chosen and the key's own weight is not part of the question.
+func siteWeight(channel domain.Channel, policy domain.RoutingPolicy) float64 {
 	siteWeight := channel.SiteGlobalWeight
 	if !(siteWeight > 0) {
 		siteWeight = 1
 	}
-	return weight * siteWeight * policy.SiteMultiplier(channel.SiteID)
+	return siteWeight * policy.SiteMultiplier(channel.SiteID)
 }
 
 // displayNameMatches reports whether the request named the route by its alias.

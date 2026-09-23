@@ -275,6 +275,55 @@ func TestRequestLogFiltersAndClears(t *testing.T) {
 	}
 }
 
+// The console reads the log one page at a time, so a read answers with the slice
+// it returned and the size of the whole filtered log.
+func TestRequestLogPagesAndCounts(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-test"}`))
+	}))
+	defer upstream.Close()
+
+	server, _ := requestLogServer(t, denyingAuthenticator("denied-model"), domain.Channel{
+		ID: "line-one", Name: "relay", BaseURL: upstream.URL, Enabled: true,
+	})
+	for index := 0; index < 5; index++ {
+		response := proxyRequest(server, `{"model":"gpt-4.1"}`)
+		response.Body.Close()
+	}
+
+	first := callManagement(server, http.MethodGet, "/management/requests?limit=2", "management-secret", nil)
+	firstPage, _ := first.body["requests"].([]any)
+	if len(firstPage) != 2 {
+		t.Fatalf("page 1 records = %d, want the requested page size", len(firstPage))
+	}
+	if total, _ := first.body["total"].(float64); total != 5 {
+		t.Errorf("total = %v, want every record counted", first.body["total"])
+	}
+	if offset, _ := first.body["offset"].(float64); offset != 0 {
+		t.Errorf("offset = %v, want the first page", first.body["offset"])
+	}
+
+	second := callManagement(server, http.MethodGet, "/management/requests?limit=2&offset=2", "management-secret", nil)
+	secondPage, _ := second.body["requests"].([]any)
+	if len(secondPage) != 2 {
+		t.Fatalf("page 2 records = %d, want the requested page size", len(secondPage))
+	}
+	// Pages do not overlap: the second page holds different requests.
+	newest, _ := firstPage[0].(map[string]any)
+	nextNewest, _ := secondPage[0].(map[string]any)
+	if newest["id"] == nextNewest["id"] {
+		t.Errorf("page 2 starts at the record page 1 started at: %v", nextNewest)
+	}
+
+	// A filter narrows the total as well as the page, so the view can say how many
+	// pages the filtered log has.
+	refused := callManagement(server, http.MethodGet, "/management/requests?failed=1", "management-secret", nil)
+	if total, _ := refused.body["total"].(float64); total != 0 {
+		t.Errorf("failed total = %v, want none for a log of served requests", refused.body["total"])
+	}
+}
+
 // A gateway that keeps no log answers the view with a reason rather than an empty
 // list, so the console can say why there is nothing to show.
 func TestRequestLogUnavailableWithoutARecorder(t *testing.T) {

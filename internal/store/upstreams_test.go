@@ -141,17 +141,24 @@ func TestUpstreamCreatesARoutePerModelAndALinePerKey(t *testing.T) {
 		if model == "claude-3" {
 			target = "claude-3-5-sonnet"
 		}
-		priorities := map[int64]bool{}
-		for _, line := range lines {
+		// The lines are written in the order of the key list, which is what makes
+		// the upstream's first key the first key an operator sees: the router walks
+		// them in that order for the available-first key mode.
+		for index, line := range lines {
 			if line["source_model"] != target {
 				t.Errorf("route %s line source_model = %v, want %v", model, line["source_model"], target)
 			}
-			priorities[line["priority"].(int64)] = true
-		}
-		// Available-first gives the keys distinct priorities, so the selector
-		// drains one before touching the next.
-		if len(priorities) != 2 {
-			t.Errorf("route %s priorities = %v, want two distinct values", model, priorities)
+			if index > 0 && line["id"].(int64) < lines[index-1]["id"].(int64) {
+				t.Errorf("route %s lines are not in key order: %v", model, lines)
+			}
+			// Selection no longer reads a line's own priority, so the console
+			// leaves it at the default instead of encoding the key order in it.
+			if line["priority"].(int64) != 0 {
+				t.Errorf("route %s line priority = %v, want the default", model, line["priority"])
+			}
+			if line["weight"].(int64) != upstreamChannelWeight {
+				t.Errorf("route %s line weight = %v, want %d", model, line["weight"], upstreamChannelWeight)
+			}
 		}
 	}
 
@@ -535,6 +542,84 @@ func TestUpstreamPriorityIsStoredAndLoadedOntoItsLines(t *testing.T) {
 	}
 	if _, present := priorities[siteID]; present {
 		t.Fatalf("priorities = %v, want the deleted upstream forgotten", priorities)
+	}
+}
+
+// The key cooldown mode is stored per upstream and reaches the lines the gateway
+// selects, where it decides whether a failing key leaves rotation as a whole or
+// only for the model it failed on.
+func TestUpstreamCDModeIsStoredAndLoadedOntoItsLines(t *testing.T) {
+	store := prepareUpstreamStore(t)
+	row := createUpstream(t, store, map[string]any{
+		"name":        "PerKeyAndModel",
+		"url":         "https://api.example.com",
+		"key_cd_mode": "key_model_cooldown",
+		"keys":        []any{"key"},
+		"models":      []any{"gpt-4.1"},
+	})
+	if row["key_cd_mode"] != "key_model_cooldown" {
+		t.Fatalf("key_cd_mode = %#v, want key_model_cooldown", row["key_cd_mode"])
+	}
+	siteID := row["id"].(int64)
+
+	loaded, err := store.LoadConfiguration(context.Background())
+	if err != nil {
+		t.Fatalf("LoadConfiguration() error = %v", err)
+	}
+	if len(loaded.Channels) != 1 {
+		t.Fatalf("loaded %d channels, want 1", len(loaded.Channels))
+	}
+	if got := loaded.Channels[0].BreakerMode; got != "key_model_cooldown" {
+		t.Fatalf("loaded channel BreakerMode = %q, want key_model_cooldown", got)
+	}
+
+	// The default is a whole key held out of rotation, and it is what an upstream
+	// created without the field runs in.
+	plain := createUpstream(t, store, map[string]any{
+		"name": "PerKey", "url": "https://api.other.com", "keys": []any{"key"}, "models": []any{"gpt-4.1"},
+	})
+	if plain["key_cd_mode"] != "key_cooldown" {
+		t.Fatalf("key_cd_mode = %#v, want key_cooldown by default", plain["key_cd_mode"])
+	}
+	loaded, err = store.LoadConfiguration(context.Background())
+	if err != nil {
+		t.Fatalf("LoadConfiguration() error = %v", err)
+	}
+	modes := map[string]string{}
+	for _, channel := range loaded.Channels {
+		modes[channel.Name] = channel.BreakerMode
+	}
+	if modes["PerKey"] != "key_cooldown" {
+		t.Fatalf("loaded channel modes = %#v, want the default key_cooldown", modes)
+	}
+
+	// Switching it back is a plain update, and the change reaches the next load.
+	updated, err := store.UpdateResource(context.Background(), "upstreams", siteID, map[string]any{"key_cd_mode": "key_cooldown"})
+	if err != nil {
+		t.Fatalf("UpdateResource(key_cd_mode) error = %v", err)
+	}
+	if updated["key_cd_mode"] != "key_cooldown" {
+		t.Fatalf("key_cd_mode = %#v, want key_cooldown after the update", updated["key_cd_mode"])
+	}
+	loaded, err = store.LoadConfiguration(context.Background())
+	if err != nil {
+		t.Fatalf("LoadConfiguration() error = %v", err)
+	}
+	if got := loaded.Channels[0].BreakerMode; got != "key_cooldown" {
+		t.Fatalf("loaded channel BreakerMode = %q, want key_cooldown after the update", got)
+	}
+
+	// Deleting the upstream forgets its mode, so a reused site id cannot inherit
+	// a cooldown scope it never asked for.
+	if _, err := store.DeleteResource(context.Background(), "upstreams", siteID); err != nil {
+		t.Fatalf("DeleteResource(upstreams) error = %v", err)
+	}
+	cdModes, err := upstreamCDModes(context.Background(), store.db)
+	if err != nil {
+		t.Fatalf("upstreamCDModes() error = %v", err)
+	}
+	if _, present := cdModes[siteID]; present {
+		t.Fatalf("cooldown modes = %v, want the deleted upstream forgotten", cdModes)
 	}
 }
 

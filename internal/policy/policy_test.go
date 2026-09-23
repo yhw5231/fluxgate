@@ -110,6 +110,32 @@ func TestFromSettingsIgnoresForeignKeys(t *testing.T) {
 	}
 }
 
+// The gateway keeps its own bookkeeping in the same settings table under the same
+// prefix — the routes the console created, each upstream's priority and key
+// cooldown mode. Those rows are not policy settings, and a loader that reported
+// them would put a warning in the log of a perfectly configured gateway at every
+// start.
+func TestFromSettingsIgnoresTheGatewaysOwnBookkeeping(t *testing.T) {
+	applied, warnings := FromSettings(map[string]string{
+		"gateway.managed_routes":      "[1,2]",
+		"gateway.upstream_priorities": `{"1":80}`,
+		"gateway.upstream_cd_modes":   `{"1":"key_cooldown"}`,
+		KeyRetryMaxAttempts:           "5",
+	}, Default())
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %v, want none for the gateway's own bookkeeping", warnings)
+	}
+	if applied.Retry.MaxAttempts != 5 {
+		t.Errorf("MaxAttempts = %d, want the stored override applied beside the bookkeeping", applied.Retry.MaxAttempts)
+	}
+
+	// A key inside a namespace the policy does own is still reported when it is
+	// not one of its settings, which is what keeps a typo from passing unnoticed.
+	if _, warnings := FromSettings(map[string]string{"gateway.retry.max_attempt": "5"}, Default()); len(warnings) != 1 {
+		t.Errorf("warnings = %v, want a report about the misspelled setting", warnings)
+	}
+}
+
 // A combination that cannot work is refused, and reported against the field the
 // operator has to change.
 func TestValidateReportsTheFieldToChange(t *testing.T) {

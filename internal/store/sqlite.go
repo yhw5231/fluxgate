@@ -655,7 +655,16 @@ func (s *SQLiteStore) loadRoutes(ctx context.Context, configuration *Configurati
 		return err
 	}
 
-	channels, err := s.loadChannelRows(ctx, routes, routeIndex, priorities)
+	// How each upstream cools a failing key down is stored the same way. An
+	// upstream that has not been given a mode of its own keeps the one its route
+	// strategy implies, which is how the gateway chose it before the setting
+	// existed.
+	cdModes, err := upstreamCDModesFrom(configuration.Settings)
+	if err != nil {
+		return err
+	}
+
+	channels, err := s.loadChannelRows(ctx, routes, routeIndex, priorities, cdModes)
 	if err != nil {
 		return err
 	}
@@ -706,7 +715,7 @@ func (s *SQLiteStore) loadRouteRows(ctx context.Context, groupSources map[int64]
 	return routes, rows.Err()
 }
 
-func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route, routeIndex map[int64]int, sitePriorities map[int64]int) ([]domain.Channel, error) {
+func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route, routeIndex map[int64]int, sitePriorities map[int64]int, siteCDModes map[int64]string) ([]domain.Channel, error) {
 	rows, err := s.db.QueryContext(ctx, channelQuery)
 	if err != nil {
 		return nil, fmt.Errorf("load route channels: %w", err)
@@ -778,13 +787,22 @@ func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route
 			SitePriority:       sitePriorities[siteID],
 			SourceModel:        resolveSourceModel(sourceModel.String, route.ModelPattern),
 		}
-		switch route.RoutingStrategy {
-		case "round_robin":
-			channel.BreakerMode = string(breaker.ModeKeyModelCooldown)
-		case "stable_first":
-			channel.BreakerMode = string(breaker.ModeKeyCooldown)
-		default:
-			channel.BreakerMode = string(breaker.ModeCooldown)
+		// The upstream's own cooldown mode decides how a failing key is held out
+		// of rotation: per key, or per key and model. An upstream the console has
+		// not been given a mode for falls back to what its routing strategy
+		// implies, which is how the gateway chose the scope before the setting
+		// existed.
+		if mode := siteCDModes[siteID]; mode != "" {
+			channel.BreakerMode = mode
+		} else {
+			switch route.RoutingStrategy {
+			case "round_robin":
+				channel.BreakerMode = string(breaker.ModeKeyModelCooldown)
+			case "stable_first":
+				channel.BreakerMode = string(breaker.ModeKeyCooldown)
+			default:
+				channel.BreakerMode = string(breaker.ModeCooldown)
+			}
 		}
 		if tokenID.Valid {
 			id := tokenID.Int64

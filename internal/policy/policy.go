@@ -46,7 +46,6 @@ const (
 	KeyRequestLogEnabled = "gateway.request_log.enabled"
 	KeyRequestLogKeep    = "gateway.request_log.keep"
 
-	keyPrefix                    = "gateway."
 	maxAttemptsCeiling           = 64
 	maxAttemptsPerChannelCeiling = 64
 	maxBackoffCeilingMS          = int64(10 * 60 * 1000)
@@ -214,15 +213,21 @@ func retryStatuses(policy domain.RetryPolicy) []int64 {
 }
 
 // FromSettings applies the stored overrides to a policy, which the caller
-// builds from the process defaults. A key that is absent keeps its default; a
-// key that cannot be read is reported and skipped, so one hand-edited row
-// cannot take the gateway down at startup.
+// builds from the process defaults.
+//
+// Only keys in a namespace this package owns are read. The settings table is
+// shared — the gateway keeps its own bookkeeping in it too, under the same
+// gateway. prefix — so a key that is not a policy setting is not this package's
+// business and is passed over in silence. A key that *is* in an owned namespace
+// and cannot be read is reported and skipped, so one hand-edited row cannot take
+// the gateway down at startup.
 func FromSettings(settings map[string]string, base Policy) (Policy, []string) {
 	applied := base
 	warnings := make([]string, 0)
+	owned := ownedNamespaces()
 	keys := make([]string, 0, len(settings))
 	for key := range settings {
-		if strings.HasPrefix(key, keyPrefix) {
+		if _, mine := owned[namespace(key)]; mine {
 			keys = append(keys, key)
 		}
 	}
@@ -240,6 +245,29 @@ func FromSettings(settings map[string]string, base Policy) (Policy, []string) {
 		applied = next
 	}
 	return applied, warnings
+}
+
+// ownedNamespaces is the set of key namespaces this package reads. It is derived
+// from the fields it declares, so adding a policy setting needs no second
+// registration here.
+func ownedNamespaces() map[string]struct{} {
+	fields := Fields()
+	namespaces := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		namespaces[namespace(field.Key)] = struct{}{}
+	}
+	return namespaces
+}
+
+// namespace is the part of a key up to and including its last dot:
+// gateway.retry.max_attempts belongs to gateway.retry, and a key with no dot
+// beyond the shared prefix — gateway.managed_routes — belongs to no namespace of
+// its own.
+func namespace(key string) string {
+	if index := strings.LastIndex(key, "."); index >= 0 {
+		return key[:index+1]
+	}
+	return key
 }
 
 // Apply validates one management value and returns the policy it produces

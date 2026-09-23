@@ -384,9 +384,12 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 		ConsecutiveFailures int    `json:"consecutive_failures"`
 	}
 	type channelSnapshot struct {
-		ID              string                 `json:"id"`
-		Name            string                 `json:"name"`
-		Enabled         bool                   `json:"enabled"`
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		Enabled bool   `json:"enabled"`
+		// SitePriority is the upstream's priority, which is what selection compares
+		// first; Priority is the line's own, which it no longer uses.
+		SitePriority    int                    `json:"site_priority"`
 		Priority        int                    `json:"priority"`
 		Weight          int                    `json:"weight"`
 		RoutingStrategy string                 `json:"routing_strategy"`
@@ -478,6 +481,7 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 				ID:              channel.ID,
 				Name:            channel.Name,
 				Enabled:         channel.Enabled,
+				SitePriority:    channel.SitePriority,
 				Priority:        channel.Priority,
 				Weight:          channel.Weight,
 				RoutingStrategy: channel.RoutingStrategy,
@@ -489,10 +493,12 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 		}
 	}
 	// Channels are rendered per route so the panel can show each channel
-	// together with the model mappings that apply to it.
+	// together with the model mappings that apply to it. They are listed the way
+	// the gateway would try them: highest upstream priority first, then by
+	// upstream and line so the order is stable between reads.
 	sort.Slice(channels, func(i, j int) bool {
-		if channels[i].Priority != channels[j].Priority {
-			return channels[i].Priority > channels[j].Priority
+		if channels[i].SitePriority != channels[j].SitePriority {
+			return channels[i].SitePriority > channels[j].SitePriority
 		}
 		if channels[i].Name != channels[j].Name {
 			return channels[i].Name < channels[j].Name

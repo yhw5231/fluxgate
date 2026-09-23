@@ -126,6 +126,11 @@ func TestBreakerKeyModelScopeIsIsolatedByModel(t *testing.T) {
 	}
 }
 
+// TestBreakerCooldownIncreasesExponentially walks a line that keeps failing
+// across cooldown expiries. Because the failure count survives the trip, every
+// recovery is followed by a single failure that opens the circuit again at the
+// next level, up to the cap. A line that recovered for real would have succeeded
+// once and started over, which is the next test.
 func TestBreakerCooldownIncreasesExponentially(t *testing.T) {
 	now := time.Date(2026, time.September, 18, 12, 0, 0, 0, time.UTC)
 	breaker := newTestBreaker(ModeCooldown, &now)
@@ -141,18 +146,66 @@ func TestBreakerCooldownIncreasesExponentially(t *testing.T) {
 
 	now = first.BlockedUntil
 	breaker.RecordFailure(failure)
-	breaker.RecordFailure(failure)
 	second, _ := breaker.Store.Load(Scope{ChannelID: channel.ID})
 	if got := second.BlockedUntil.Sub(now); got != 2*time.Minute {
 		t.Fatalf("second cooldown = %s, want 2m", got)
 	}
+	if second.ConsecutiveFailures <= first.ConsecutiveFailures {
+		t.Fatalf("failures after recovery = %d, want more than %d: a recovery must not clear the count",
+			second.ConsecutiveFailures, first.ConsecutiveFailures)
+	}
 
 	now = second.BlockedUntil
-	breaker.RecordFailure(failure)
 	breaker.RecordFailure(failure)
 	third, _ := breaker.Store.Load(Scope{ChannelID: channel.ID})
 	if got := third.BlockedUntil.Sub(now); got != 4*time.Minute {
 		t.Fatalf("third cooldown = %s, want capped 4m", got)
+	}
+
+	// The cooldown is at its cap and the line is still failing: the wait stays at
+	// the cap rather than growing past it.
+	now = third.BlockedUntil
+	breaker.RecordFailure(failure)
+	fourth, _ := breaker.Store.Load(Scope{ChannelID: channel.ID})
+	if got := fourth.BlockedUntil.Sub(now); got != 4*time.Minute {
+		t.Fatalf("cooldown past the cap = %s, want 4m", got)
+	}
+}
+
+// TestBreakerKeepsFailingUntilTheLineSucceeds covers the two ways a circuit
+// starts over: the line answers a request, or an operator clears it. Until then,
+// every failure re-opens the circuit no matter how long it has been cooling.
+func TestBreakerKeepsFailingUntilTheLineSucceeds(t *testing.T) {
+	now := time.Date(2026, time.September, 18, 12, 0, 0, 0, time.UTC)
+	breaker := newTestBreaker(ModeCooldown, &now)
+	channel := domain.Channel{ID: "channel-a", APIKey: "key-a"}
+	failure := retryableFailure(channel.ID, channel.APIKey, "model-a")
+
+	breaker.RecordFailure(failure)
+	breaker.RecordFailure(failure)
+	if !breaker.IsBlocked(channel, "model-a") {
+		t.Fatal("channel not blocked at consecutive-failure threshold")
+	}
+
+	// A recovery is a chance to answer, not a fresh budget: the next failure is
+	// enough to hold the line out of rotation again.
+	now = now.Add(time.Minute)
+	if breaker.IsBlocked(channel, "model-a") {
+		t.Fatal("channel remained blocked at cooldown expiry")
+	}
+	breaker.RecordFailure(failure)
+	if !breaker.IsBlocked(channel, "model-a") {
+		t.Fatal("one failure after expiry did not re-open the circuit")
+	}
+
+	// A success is the only thing that puts the line back on a clean slate.
+	breaker.RecordSuccess(failure.Attempt)
+	state, ok := breaker.Store.Load(Scope{ChannelID: channel.ID})
+	if !ok {
+		t.Fatal("channel state missing after success")
+	}
+	if state != (State{}) {
+		t.Fatalf("state after success = %#v, want zero state", state)
 	}
 }
 

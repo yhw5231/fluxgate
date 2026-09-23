@@ -172,6 +172,70 @@ func TestRequestLogFiltersRecords(t *testing.T) {
 	}
 }
 
+// A view shows one page at a time, so a read says which page it wants and the
+// count says how many there are — under the same filter, or a page and its total
+// would describe different records.
+func TestRequestLogPagesRecords(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if err := store.EnsureRequestLogSchema(ctx); err != nil {
+		t.Fatalf("EnsureRequestLogSchema() error = %v", err)
+	}
+
+	// Five served requests, of which two failed.
+	for index, record := range []domain.RequestRecord{
+		{RequestID: "s1", At: time.Now().UTC(), Model: "gpt-4o", Status: 200},
+		{RequestID: "f2", At: time.Now().UTC(), Model: "gpt-4o", Status: 502},
+		{RequestID: "s3", At: time.Now().UTC(), Model: "gpt-4o", Status: 200},
+		{RequestID: "f4", At: time.Now().UTC(), Model: "claude", Status: 429},
+		{RequestID: "s5", At: time.Now().UTC(), Model: "gpt-4o", Status: 200},
+	} {
+		if err := store.AppendRequestRecord(ctx, record, 0); err != nil {
+			t.Fatalf("AppendRequestRecord(%d) error = %v", index, err)
+		}
+	}
+
+	first, err := store.ListRequestRecords(ctx, RequestLogFilter{Limit: 2})
+	if err != nil {
+		t.Fatalf("ListRequestRecords(page 1) error = %v", err)
+	}
+	if got := requestIDs(first); got != "s5,f4" {
+		t.Errorf("page 1 = %s, want the two newest", got)
+	}
+	second, err := store.ListRequestRecords(ctx, RequestLogFilter{Limit: 2, Offset: 2})
+	if err != nil {
+		t.Fatalf("ListRequestRecords(page 2) error = %v", err)
+	}
+	if got := requestIDs(second); got != "s3,f2" {
+		t.Errorf("page 2 = %s, want the next two", got)
+	}
+	last, err := store.ListRequestRecords(ctx, RequestLogFilter{Limit: 2, Offset: 4})
+	if err != nil {
+		t.Fatalf("ListRequestRecords(page 3) error = %v", err)
+	}
+	if got := requestIDs(last); got != "s1" {
+		t.Errorf("page 3 = %s, want the remainder", got)
+	}
+
+	total, err := store.CountRequestRecords(ctx, RequestLogFilter{})
+	if err != nil {
+		t.Fatalf("CountRequestRecords() error = %v", err)
+	}
+	if total != 5 {
+		t.Errorf("total = %d, want every record counted", total)
+	}
+
+	// The window is not part of the count: the failed filter counts three
+	// pages' worth of a smaller log, not the window that was asked for.
+	failed, err := store.CountRequestRecords(ctx, RequestLogFilter{FailedOnly: true, Limit: 1, Offset: 1})
+	if err != nil {
+		t.Fatalf("CountRequestRecords(failed) error = %v", err)
+	}
+	if failed != 2 {
+		t.Errorf("failed total = %d, want the two failures counted regardless of the page", failed)
+	}
+}
+
 func TestClearRequestRecordsEmptiesTheLog(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)

@@ -43,6 +43,12 @@
   --shadow-glow: 0 0 0 1px rgba(56, 189, 248, 0.12), 0 18px 50px -28px rgba(56, 189, 248, 0.5);
 
   --topbar-height: 64px;
+
+  /* 表格里就地改优先级与权重的那两列：输入框右边一直给「保存」留着位置（脏了才
+   * 显形，免得按钮出现时把输入框挤走），表头要落在输入框上方就得让出同样的宽度，
+   * 所以这段留白写成变量，表头和输入框共用一份。 */
+  --inline-field-action: 48px;
+  --inline-field-gap: 6px;
 }
 
 * { box-sizing: border-box; }
@@ -696,6 +702,11 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   background: var(--accent-soft);
 }
 
+/* 请求记录的分页：翻页按钮和「第 2 / 7 页」挨在一起，翻到哪一页一眼能看见。 */
+.pager { display: inline-flex; align-items: center; gap: 8px; }
+.pager-note { font-size: 11.5px; color: var(--text-muted); white-space: nowrap; }
+.pager-note .pager-total { color: var(--text-faint); }
+
 .detail-panel { padding: 12px 16px 14px; }
 
 .detail-facts {
@@ -1054,8 +1065,31 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 .detail-table td.actions { text-align: right; white-space: nowrap; width: 1%; }
 .status-note { margin-left: 6px; font-size: 11px; color: var(--text-faint); }
 
-/* ===== 就地改权重 ===== */
-.weight-field { display: inline-flex; align-items: center; gap: 6px; justify-content: flex-end; }
+/* 请求记录里的一条线路：上游 → 密钥。箭头是「谁去用了谁」，所以两个名字在同一行
+ * 上左右排开，而不是上下两行。 */
+.line-path { display: inline-flex; align-items: baseline; gap: 6px; }
+.line-path .line-arrow { color: var(--text-faint); font-family: var(--font-mono); font-size: 11px; }
+
+/* 线路表可以嵌套：一次请求记录里的线路表、路由页展开的上游表里再展开的密钥表，
+ * 都在一张展开出来的表里。嵌套的那层去掉外框和内边距，读起来还是同一棵树。 */
+.detail-table .detail-table { margin-top: 2px; }
+.detail-table .detail-table thead th { padding-top: 4px; padding-bottom: 4px; }
+.detail-table .detail-table tbody tr:last-child td { border-bottom: none; }
+
+/* ===== 就地改优先级与权重 ===== */
+
+/* 表头右对齐到输入框的右边缘，而不是列的右边缘：让出保存按钮和它左边的间距，
+ * 「优先级」才落在输入框上方，而不是落在保存按钮上方。 */
+.data-table th.field-column {
+  padding-right: calc(16px + var(--inline-field-action) + var(--inline-field-gap));
+}
+
+.weight-field {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--inline-field-gap);
+  justify-content: flex-end;
+}
 .weight-input {
   width: 76px;
   padding: 5px 8px;
@@ -1067,7 +1101,13 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   border-color: rgba(248, 113, 113, 0.55);
   box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.12);
 }
-.weight-save { visibility: hidden; }
+/* 保存按钮的宽度固定成表头让出的那个宽度，显形时不再推动输入框。 */
+.weight-field .weight-save {
+  width: var(--inline-field-action);
+  padding-left: 0;
+  padding-right: 0;
+  visibility: hidden;
+}
 .weight-field.is-dirty .weight-save { visibility: visible; }
 .weight-field:focus-within .weight-save { visibility: visible; }
 

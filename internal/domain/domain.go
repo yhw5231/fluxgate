@@ -41,10 +41,13 @@ type Channel struct {
 	TokenID          *int64
 	SiteGlobalWeight float64
 	SourceModel      string
-	// SitePriority is the upstream's own priority. It outranks Priority, the
-	// line's: every line of a preferred upstream is tried before any line of a
-	// lower-priority one, so a key mode that orders one upstream's keys never
-	// lifts them past a preferred upstream.
+	// SitePriority is the upstream's own priority, and the only priority
+	// selection compares: the highest one with an eligible line wins, ties are
+	// drawn by SiteGlobalWeight, and the key inside the chosen upstream is then
+	// picked by the upstream's key mode. Priority, the line's own field, is
+	// carried for display only — a key never lifts its upstream above a
+	// preferred one, which is what makes priority mean "use this upstream first"
+	// rather than "give it more traffic".
 	SitePriority int
 }
 

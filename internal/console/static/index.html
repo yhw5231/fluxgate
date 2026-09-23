@@ -217,8 +217,8 @@
               <tr>
                 <th>线路</th>
                 <th>状态</th>
-                <th class="num">优先级</th>
-                <th class="num">权重</th>
+                <th class="num" title="上游的优先级：网关先用优先级最高的上游，同一优先级的按权重随机。">上游优先级</th>
+                <th class="num" title="线路（密钥）的权重：上游被选中后，它的密钥之间按这个权重分配请求。">权重</th>
                 <th>密钥模式</th>
                 <th>代理</th>
               </tr>
@@ -289,7 +289,7 @@
             <span class="panel-note">每 10 秒自动刷新 &middot; <span data-next-refresh>&mdash;</span></span>
           </div>
         </header>
-        <p class="panel-help">选中某个模型后，网关自动建立对应的路由，并把该上游的每个密钥接上去；客户端请求这个模型名时，就在这些上游之间按权重分配，并在失败时转移。同一个模型由多个上游提供时会合并到同一条路由。<strong>点模型名可以展开它下面的线路</strong>：每条线路是一个上游密钥，展开后能看到它走哪个上游模型名、优先级、权重，以及当前是可用、冷却还是已停用。</p>
+        <p class="panel-help">选中某个模型后，网关自动建立对应的路由，并把该上游的每个密钥接上去。客户端请求这个模型名时，网关先选上游：优先级最高的先用，优先级相同的按权重随机；选中上游后再按它的密钥模式挑密钥——可用优先用第一个密钥，加权随机在所有密钥之间分配。某个密钥失败只影响它自己，这个上游的下一个密钥接上，整个上游都不可用才换下一个上游。<strong>点模型名逐级展开</strong>：模型下面是提供它的上游，上游下面是这个上游的密钥，每一级都能看到冷却情况并单独清除。</p>
         <div class="table-wrap">
           <table class="data-table" data-table="routing"><tbody data-body="routing"></tbody></table>
         </div>
@@ -317,6 +317,11 @@
           <button id="requests-failed" class="btn btn-ghost btn-small" type="button" aria-pressed="false">只看失败</button>
           <input id="requests-model" class="filter-input" type="search" placeholder="按模型筛选…" aria-label="按模型筛选">
           <span class="panel-note" data-retention></span>
+          <span class="pager">
+            <button id="requests-prev" class="btn btn-ghost btn-small" type="button">上一页</button>
+            <span class="pager-note" data-page-note></span>
+            <button id="requests-next" class="btn btn-ghost btn-small" type="button">下一页</button>
+          </span>
           <button id="requests-clear" class="btn btn-ghost btn-small" type="button">清空记录</button>
         </div>
         <div class="table-wrap">

@@ -56,7 +56,7 @@
     policySignature: null,
     // requests holds the record of served requests: what the gateway answered,
     // and the filters the operator narrowed the view with.
-    requests: { records: [], retention: null, error: null, failedOnly: false, model: '' },
+    requests: { records: [], total: 0, page: 0, retention: null, error: null, failedOnly: false, model: '' },
     // revealedKeys holds the client keys an operator asked to see, by row id.
     // The listing only ever carries the mask, so a value lives here only after a
     // deliberate read, and it is dropped again on the next configuration read.
@@ -128,6 +128,9 @@
     els.requestsModel = $('requests-model');
     els.requestsRetention = document.querySelector('[data-panel="requests"] [data-retention]');
     els.requestsClear = $('requests-clear');
+    els.requestsPrev = $('requests-prev');
+    els.requestsNext = $('requests-next');
+    els.requestsPageNote = document.querySelector('[data-page-note]');
 
     els.banner = $('error-banner');
     els.bannerTitle = els.banner.querySelector('[data-banner-title]');
@@ -329,6 +332,7 @@
     route_mode: { pattern: '按模型匹配', explicit_group: '显式分组' },
     routing_strategy: { weighted: '加权随机', round_robin: '加权随机', stable_first: '固定优先' },
     key_mode: { available_first: '可用优先', round_robin: '加权随机' },
+    key_cd_mode: { key_cooldown: '按 key 冷却', key_model_cooldown: '按 key + 模型冷却' },
     protocol: { http: 'HTTP', https: 'HTTPS', socks5: 'SOCKS5', socks5h: 'SOCKS5H' }
   };
 
@@ -348,6 +352,17 @@
     { value: 'available_first', label: '可用优先' },
     { value: 'round_robin', label: '加权随机' }
   ];
+
+  var CD_MODE_OPTIONS = [
+    { value: 'key_cooldown', label: '按 key 冷却' },
+    { value: 'key_model_cooldown', label: '按 key + 模型冷却' }
+  ];
+
+  /* 一个上游的 key 冷却模式。默认按 key：一个 key 在一个模型上失败，同一个 key
+   * 在这个上游的其他模型上也不再尝试；按 key + 模型则只退出失败的那个模型。 */
+  function cdModeLabel(value) {
+    return value === 'key_model_cooldown' ? '按 key + 模型' : '按 key';
+  }
 
   function keyModeLabel(value) {
     return value === 'available_first' ? '可用优先' : '加权随机';
@@ -379,6 +394,7 @@
       status: { label: '状态', type: 'select', options: STATUS_OPTIONS, help: '停用后该上游的线路不再参与选路。' },
       keys: { label: '密钥', help: '一行一个，可以整段粘贴。留空表示保持已保存的密钥不变。' },
       key_mode: { label: '密钥模式', type: 'select', options: KEY_MODE_OPTIONS, help: '可用优先：先用第一个密钥，失败或熔断后再用下一个。加权随机：按权重在所有密钥之间随机分配。' },
+      key_cd_mode: { label: 'Key 冷却模式', type: 'select', options: CD_MODE_OPTIONS, help: '按 key 冷却（默认）：一个密钥失败后整个密钥退出轮换，它在这个上游的其他模型上也不再尝试。按 key + 模型冷却：只退出失败的那个模型，密钥在其他模型上照常使用。' },
       models: { label: '模型', help: '勾选这个上游提供的模型，保存后网关自动建立路由。' },
       model_mapping: { label: '模型映射', help: '把客户端请求的模型名换成上游认识的模型名。' }
     },
@@ -432,13 +448,24 @@
       title: '上游',
       create: '添加上游',
       noun: '上游',
+      // 表格按选路顺序列：优先级高的排在上面，网关会先试它的线路。同一个优先级
+      // 按名称排，改优先级时行的位置会跟着变，改完能直接看出谁先被用。
+      order: function (left, right) {
+        var leftPriority = number(left.priority);
+        var rightPriority = number(right.priority);
+        if (leftPriority !== rightPriority) { return rightPriority - leftPriority; }
+        var leftName = text(left.name, '');
+        var rightName = text(right.name, '');
+        if (leftName !== rightName) { return leftName < rightName ? -1 : 1; }
+        return number(left.id) - number(right.id);
+      },
       columns: [
         { label: '名称', cell: function (row) { return element('span', 'cell-strong', text(row.name)); } },
         { label: 'API 地址', cell: function (row) { return element('span', 'mono', text(row.url)); } },
         // 优先级和权重都就地改：它们是选路时最常调的两个值，改一次就写一次，
         // 不用打开编辑框。
-        { label: '优先级', className: 'num', cell: function (row) { return priorityField(row); } },
-        { label: '权重', className: 'num', cell: function (row) { return weightField(row); } },
+        { label: '优先级', className: 'num field-column', cell: function (row) { return priorityField(row); } },
+        { label: '权重', className: 'num field-column', cell: function (row) { return weightField(row); } },
         { label: '密钥', cell: function (row) { return upstreamKeysCell(row); } },
         { label: '模型', cell: function (row) { return upstreamModelsCell(row); } },
         { label: '线路状态', cell: function (row) { return lineSummary(upstreamLines(row.id)); } },
@@ -502,6 +529,7 @@
     var keys = upstreamKeyList(row);
     wrapper.appendChild(tag(keys.length + ' 个'));
     wrapper.appendChild(tag(keyModeLabel(upstreamKeyMode(row))));
+    wrapper.appendChild(tag(cdModeLabel(row.key_cd_mode)));
     return wrapper;
   }
 
@@ -629,7 +657,9 @@
   }
 
   /* upstreamDetail is what an expanded upstream shows: every line it holds, with
-   * the key, the model name, the priority, the weight and the state of each. */
+   * the key, the model name and the state of each, and what its own circuits have
+   * recorded: consecutive failures, how often it has cooled down, and how long the
+   * current cooldown has left. */
   function upstreamDetail(row) {
     var wrapper = element('div', 'detail-body');
     var lines = upstreamLines(row.id);
@@ -639,8 +669,12 @@
       return wrapper;
     }
     wrapper.appendChild(element('p', 'detail-note',
-      '共 ' + lines.length + ' 条线路，按优先级从高到低：网关先用优先级最高的上游的线路，' +
-      '同一优先级之间按权重随机分配请求。'));
+      '共 ' + lines.length + ' 条线路，每个密钥一条。这个上游的冷却模式是' +
+      cdModeLabel(row.key_cd_mode) + '：' +
+      (row.key_cd_mode === 'key_model_cooldown'
+        ? '密钥只在失败的那个模型上退出，其他模型照常使用。'
+        : '密钥一旦失败就整体退出，它在其他模型上也不再被选中。') +
+      '一条线路连续失败到阈值会进入冷却，冷却到期后失败计数继续累加，所以它再失败一次就会重新冷却，冷却时长每次翻倍直到上限。'));
     wrapper.appendChild(lineDetailTable(lines, LINE_LEADING_MODEL));
     return wrapper;
   }
@@ -1422,7 +1456,9 @@
       row.appendChild(nameCell);
 
       cell(row, badge(channel.enabled ? '已启用' : '已禁用', channel.enabled ? 'success' : 'danger'));
-      cell(row, String(channel.priority === undefined ? 0 : channel.priority), 'num');
+      // The priority that decides which upstream answers is the upstream's own;
+      // the line's own priority no longer takes part in selection.
+      cell(row, String(channel.site_priority === undefined ? 0 : channel.site_priority), 'num');
       cell(row, String(channel.weight === undefined ? 0 : channel.weight), 'num');
       cell(row, tag(channelKeyModeLabel(channel.routing_strategy)));
 
@@ -1616,18 +1652,83 @@
       cell(row, String(entry.lines.length), 'num');
       cell(row, lineSummary(entry.lines));
 
-      row.appendChild(expandActionCell('routes', key, expanded));
+      row.appendChild(lineActionsCell(entry.lines, 'routes', key, expanded, renderRouting));
       els.routingBody.appendChild(row);
 
       if (expanded) {
-        els.routingBody.appendChild(detailRow(columns.length, lineDetailTable(entry.lines)));
+        els.routingBody.appendChild(detailRow(columns.length, routeUpstreamTable(entry)));
       }
     });
   }
 
+  /* routeUpstreamTable is the second level of the routing view: one row per
+   * upstream that serves the model, in the order the gateway would try them. A
+   * row opens into that upstream's keys, because which key answers is the
+   * upstream's own business — and seeing it is how an operator tells a dead key
+   * from a dead upstream. */
+  function routeUpstreamTable(entry) {
+    var wrapper = element('div', 'detail-body');
+    wrapper.appendChild(element('p', 'detail-note',
+      '共 ' + entry.groups.length + ' 个上游提供这个模型，网关先用优先级最高的上游；' +
+      '优先级相同的按权重分配，选中上游后再按它的密钥模式挑密钥。展开可以看到每个上游的密钥和各条线路的冷却情况。'));
+
+    var table = element('table', 'data-table detail-table');
+    var head = document.createElement('thead');
+    var headerRow = document.createElement('tr');
+    ['上游', '优先级', '权重', '密钥模式', '冷却模式', '线路状态', '冷却剩余', ''].forEach(function (label) {
+      var th = document.createElement('th');
+      th.textContent = label;
+      if (label === '优先级' || label === '权重') { th.className = 'num'; }
+      if (label === '') { th.className = 'actions'; }
+      headerRow.appendChild(th);
+    });
+    head.appendChild(headerRow);
+    table.appendChild(head);
+
+    var body = document.createElement('tbody');
+    entry.groups.forEach(function (group) {
+      appendRouteUpstreamRow(body, entry, group);
+    });
+    table.appendChild(body);
+    wrapper.appendChild(table);
+    return wrapper;
+  }
+
+  function appendRouteUpstreamRow(body, entry, group) {
+    var rowKey = upstreamRowKey(entry.id, group.siteID);
+    var expanded = isExpanded(UPSTREAM_GROUP, rowKey);
+    var row = document.createElement('tr');
+    row.className = 'row-expandable';
+    row.setAttribute('data-toggle-group', UPSTREAM_GROUP);
+    row.setAttribute('data-toggle-key', rowKey);
+    if (expanded) { row.classList.add('is-expanded'); }
+
+    var nameCell = document.createElement('td');
+    nameCell.className = 'toggle-cell';
+    nameCell.appendChild(expandCaret(expanded, '上游 ' + group.upstream));
+    nameCell.appendChild(element('span', 'cell-strong', group.upstream));
+    row.appendChild(nameCell);
+
+    cell(row, String(group.priority), 'num');
+    cell(row, formatWeight(group.weight), 'num');
+    cell(row, tag(keyModeLabel(group.keyMode)));
+    cell(row, tag(cdModeLabel(group.cdMode)));
+    cell(row, lineSummary(group.lines));
+    row.appendChild(cooldownCell(group.lines));
+    row.appendChild(lineActionsCell(group.lines, UPSTREAM_GROUP, rowKey, expanded, renderRouting));
+    body.appendChild(row);
+
+    // The keys of one upstream appear inside the row that names the upstream, so
+    // the three levels read as one nested structure.
+    if (expanded) {
+      body.appendChild(detailRow(8, lineDetailTable(group.lines, null)));
+    }
+  }
+
   /* routingRows joins each route with the lines that serve it: the upstream each
    * line belongs to, the key it presents, and the model name that upstream knows
-   * the model by. */
+   * the model by. The lines are also grouped by upstream, which is the second
+   * level of the view: the gateway picks an upstream first and a key second. */
   function routingRows() {
     var byRoute = {};
     channelLines().forEach(function (line) {
@@ -1642,13 +1743,56 @@
         model: routeModel(route),
         mode: routingMode(route),
         upstreams: uniqueValues(lines.map(function (line) { return line.upstream; })),
-        lines: lines
+        lines: lines,
+        groups: upstreamGroups(lines)
       };
     }).filter(function (entry) {
       return entry.model !== '';
     }).sort(function (left, right) {
       return left.model < right.model ? -1 : (left.model > right.model ? 1 : 0);
     });
+  }
+
+  /* upstreamGroups collects the lines of one model per upstream, keeping the order
+   * channelLines put them in: highest upstream priority first, which is the order
+   * the gateway would try them. */
+  function upstreamGroups(lines) {
+    var order = [];
+    var bySite = {};
+    lines.forEach(function (line) {
+      if (!bySite[line.siteID]) {
+        order.push(line.siteID);
+        bySite[line.siteID] = {
+          siteID: line.siteID,
+          upstream: line.upstream,
+          priority: line.sitePriority,
+          weight: line.siteWeight,
+          keyMode: line.keyMode,
+          cdMode: line.cdMode,
+          lines: []
+        };
+      }
+      bySite[line.siteID].lines.push(line);
+    });
+    return order.map(function (siteID) { return bySite[siteID]; });
+  }
+
+  /* UPSTREAM_GROUP is the expansion group of the routing view's second level. The
+   * key carries the route as well as the upstream, because one upstream can serve
+   * several models and each of those rows opens on its own. */
+  var UPSTREAM_GROUP = 'route-upstreams';
+
+  function upstreamRowKey(routeID, siteID) {
+    return String(routeID) + ':' + String(siteID);
+  }
+
+  /* lineIDOrder orders two lines by their id, which is the order an upstream
+   * stores its keys in and therefore the order the gateway tries them. */
+  function lineIDOrder(left, right) {
+    var leftID = number(left);
+    var rightID = number(right);
+    if (leftID !== rightID) { return leftID - rightID; }
+    return left < right ? -1 : (left > right ? 1 : 0);
   }
 
   function routeModel(route) {
@@ -1667,9 +1811,10 @@
 
   /* ===== 线路 =====
    *
-   * 一条线路是一个上游密钥在一个模型上的一次机会：网关按优先级挑最高的一批，
-   * 再按权重分配请求。状态来自快照（网关算的），配置侧只负责说清楚它是哪个
-   * 上游、哪个密钥，以及为什么被配置本身停用。
+   * 一条线路是一个上游密钥在一个模型上的一次机会。网关先选上游（优先级最高的一
+   * 批，同级按权重随机），选中之后再按这个上游的密钥模式挑密钥；某条线路失败只
+   * 影响它自己，同一个上游的下一个密钥接上。状态来自快照（网关算的），配置侧只
+   * 负责说清楚它是哪个上游、哪个密钥，以及为什么被配置本身停用。
    */
 
   /* channelLines joins every configured line with what the running gateway
@@ -1713,6 +1858,9 @@
         sourceModel: String(channel.source_model || '').trim(),
         priority: number(channel.priority),
         sitePriority: site ? number(site.priority) : 0,
+        siteWeight: site ? number(site.global_weight) : 0,
+        keyMode: site ? text(site.key_mode, 'round_robin') : 'round_robin',
+        cdMode: site ? text(site.key_cd_mode, 'key_cooldown') : 'key_cooldown',
         weight: number(channel.weight),
         // The configuration row says whether the line itself is on; the snapshot
         // adds whether the route, the key, the credential and the upstream are.
@@ -1721,11 +1869,12 @@
         reasons: lineDisabledReasons(channel, route, account, site, token)
       };
     }).sort(function (left, right) {
-      // 与网关的选路顺序一致：先上游优先级，再线路优先级，最后按名称稳定排序。
+      // 与网关的选路顺序一致：先上游优先级，同一上游的密钥按线路编号排——网关也
+      // 是这么挑密钥的，所以表里的先后就是请求的先后。
       if (left.sitePriority !== right.sitePriority) { return right.sitePriority - left.sitePriority; }
-      if (left.priority !== right.priority) { return right.priority - left.priority; }
       if (left.upstream !== right.upstream) { return left.upstream < right.upstream ? -1 : 1; }
-      return left.id < right.id ? -1 : (left.id > right.id ? 1 : 0);
+      if (left.siteID !== right.siteID) { return left.siteID < right.siteID ? -1 : 1; }
+      return lineIDOrder(left.id, right.id);
     });
 
     linesCache = { configuration: state.configuration, snapshot: state.snapshot, lines: lines };
@@ -1818,8 +1967,8 @@
     return element('span', 'badge badge-' + variant, label);
   }
 
-  /* 展开的线路表前面那一列取决于从哪一页看：路由页一行本来就是一个模型，要知道
-   * 每条线路属于哪个上游；上游页一行本来就是一个上游，要知道每条线路服务哪个模型。 */
+  /* 展开的线路表前面那一列取决于从哪一页看：上游页一行本来就是一个上游，要知道
+   * 每条线路服务哪个模型。路由页的密钥表更下一层，上游已经写在父行上，就不重复了。 */
   var LINE_LEADING_UPSTREAM = {
     label: '上游',
     cell: function (line) { return element('span', 'cell-strong', line.upstream); }
@@ -1829,20 +1978,27 @@
     cell: function (line) { return element('span', 'cell-strong mono', line.model); }
   };
 
-  /* lineDetailTable is what an expanded row shows: one row per line, ordered the
-   * way the gateway picks them (highest upstream priority first, then the
-   * line's own priority). */
+  /* lineDetailTable is the third level: the keys of one upstream, each with the
+   * state of its own circuit — how many failures it has recorded, how many times
+   * it has been cooled down, and how long it has left. `leading` names the column
+   * that identifies a line when the table is read outside the upstream it belongs
+   * to, and is null on the routing page, where the row above already says it. */
   function lineDetailTable(lines, leading) {
-    leading = leading || LINE_LEADING_UPSTREAM;
+    var labels = (leading ? [leading.label] : []).concat(
+      ['密钥', '上游模型名', '状态', '连续失败', '冷却次数', '冷却剩余', '']);
     var table = element('table', 'data-table detail-table');
     var head = document.createElement('thead');
     var headerRow = document.createElement('tr');
-    [leading.label, '密钥', '上游模型名', '优先级', '权重', '状态', '冷却剩余', ''].forEach(function (label) {
+    labels.forEach(function (label) {
       var th = document.createElement('th');
       th.textContent = label;
-      if (label === '优先级' || label === '权重') {
+      if (label === '连续失败') {
         th.className = 'num';
-        th.title = '选路先看上游优先级，再看线路优先级；两者相同才按权重随机分配。';
+        th.title = '这条线路（或它所在的 key）连续失败了多少次。成功后计数清零；冷却到期恢复后计数继续累加，所以再失败一次就会重新进入冷却。';
+      }
+      if (label === '冷却次数') {
+        th.className = 'num';
+        th.title = '累计进入冷却的次数，决定这次冷却有多长：每次翻倍，到上限为止。';
       }
       if (label === '') { th.className = 'actions'; }
       headerRow.appendChild(th);
@@ -1865,39 +2021,95 @@
     var status = lineStatus(line);
     var row = document.createElement('tr');
 
-    cell(row, leading.cell(line));
+    if (leading) { cell(row, leading.cell(line)); }
     cell(row, element('span', 'mono', line.key));
     cell(row, line.sourceModel ? element('span', 'mono', line.sourceModel) : element('span', 'cell-muted', '与模型名相同'));
-    var priorityCell = cell(row, String(line.priority), 'num');
-    if (line.sitePriority) {
-      // 选路先看上游优先级、再看线路优先级，所以非默认的上游优先级要一起
-      // 显示，否则这条线路为什么排在后面看不出来。
-      priorityCell.appendChild(element('span', 'status-note', '（上游 ' + line.sitePriority + '）'));
-    }
-    cell(row, String(line.weight), 'num');
 
     var statusCell = document.createElement('td');
     statusCell.appendChild(badge(status.label, status.variant));
     if (status.reason) { statusCell.appendChild(element('span', 'status-note', status.reason)); }
     row.appendChild(statusCell);
 
-    var countdown = cell(row, '—', 'cd');
-    if (status.blockedUntil) {
-      countdown.setAttribute('data-cd-until', status.blockedUntil);
-      countdown.textContent = cooldownText(status.blockedUntil);
-    }
-    row.appendChild(countdown);
+    cell(row, failureCount(line), 'num');
+    cell(row, cooldownLevel(line), 'num');
+    row.appendChild(cooldownCell([line]));
 
     var actionCell = document.createElement('td');
     actionCell.className = 'actions';
     if (status.tripped) {
-      var restore = busyButton('btn btn-ghost btn-small', '恢复');
+      var restore = busyButton('btn btn-ghost btn-small', '清除冷却');
       restore.title = '清除这条线路的熔断记录，下一个请求会重新尝试它';
-      restore.addEventListener('click', function () { resetLine(line, restore); });
+      restore.addEventListener('click', function () { resetLines([line], restore); });
       actionCell.appendChild(restore);
     }
     row.appendChild(actionCell);
     return row;
+  }
+
+  /* failureCount is how many times in a row the line has failed. It is what the
+   * breaker is counting towards its next cooldown, and it survives a cooldown
+   * expiring: a line that fails again right after recovering is cooled again
+   * immediately, which is why the number is worth showing. */
+  function failureCount(line) {
+    var state = line.state || {};
+    if (!line.enabled || state.consecutive_failures === undefined) { return '—'; }
+    return String(number(state.consecutive_failures));
+  }
+
+  /* cooldownLevel is how many times the line has been cooled down, which is also
+   * how the wait grows: each level doubles the last one up to the configured
+   * maximum. */
+  function cooldownLevel(line) {
+    var state = line.state || {};
+    if (!line.enabled || state.cooldown_level === undefined) { return '—'; }
+    return String(number(state.cooldown_level));
+  }
+
+  /* cooldownCell is the remaining cooldown of one line, or of the first line of a
+   * group that is cooling: the soonest of them, which is the moment the upstream
+   * becomes usable again. */
+  function cooldownCell(lines) {
+    var soonest = '';
+    (lines || []).forEach(function (line) {
+      var status = lineStatus(line);
+      if (status.blockedUntil && (!soonest || status.blockedUntil < soonest)) {
+        soonest = status.blockedUntil;
+      }
+    });
+    var node = cell(document.createElement('tr'), '—', 'cd');
+    if (soonest) {
+      node.setAttribute('data-cd-until', soonest);
+      node.textContent = cooldownText(soonest);
+    }
+    return node;
+  }
+
+  /* lineActionsCell is the trailing cell of a line list: opening and closing the
+   * row, and clearing the circuits of the lines it covers when any of them is
+   * held out of rotation. */
+  function lineActionsCell(lines, group, key, expanded, render) {
+    var td = document.createElement('td');
+    td.className = 'actions';
+    var tripped = (lines || []).some(function (line) { return lineStatus(line).tripped; });
+    if (tripped) {
+      var restore = busyButton('btn btn-ghost btn-small', '清除冷却');
+      restore.title = '清除这些线路的熔断记录，下一个请求会重新尝试它们';
+      restore.addEventListener('click', function (event) {
+        event.stopPropagation();
+        resetLines(lines, restore);
+      });
+      td.appendChild(restore);
+    }
+    var toggle = element('button', 'btn btn-ghost btn-small', expanded ? '收起' : '展开');
+    toggle.type = 'button';
+    toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    toggle.addEventListener('click', function (event) {
+      event.stopPropagation();
+      toggleExpanded(group, key);
+      (render || renderRouting)();
+    });
+    td.appendChild(toggle);
+    return td;
   }
 
   /* cooldownText is the CD a line is serving: how long until it is tried again. */
@@ -1920,27 +2132,43 @@
     }
   }
 
-  /* resetLine clears the circuits that hold one line out of rotation. The line is
-   * named by its channel; which circuits those are is the gateway's to know,
-   * because the key they may be filed under never reaches the browser. */
-  function resetLine(line, button) {
-    var model = (line.state && line.state.model) || line.model;
-    setSubmitting(button, true, '恢复');
-    post('/management/breakers/reset', {
-      scope: 'channel',
-      channel_id: line.id,
-      model: model
-    }).then(function (result) {
-      setSubmitting(button, false, '恢复');
-      if (result.ok) {
-        showNotice('已恢复「' + line.upstream + '」上 ' + model + ' 的线路，下一个请求会重新尝试它。');
-        refresh();
+  /* resetLines clears the circuits that hold lines out of rotation — one line from
+   * the key table, every line of an upstream or of a model from the row above it.
+   * A line is named by its channel; which circuits those are is the gateway's to
+   * know, because the key they may be filed under never reaches the browser. */
+  function resetLines(lines, button) {
+    var targets = (lines || []).filter(function (line) { return lineStatus(line).tripped; });
+    if (targets.length === 0) { return; }
+    setSubmitting(button, true, '清除冷却');
+    var cleared = 0;
+    var failed = null;
+    // One request per line, in sequence: the console has no batch endpoint, and a
+    // handful of lines per upstream is not worth one.
+    var chain = Promise.resolve();
+    targets.forEach(function (line) {
+      chain = chain.then(function () {
+        return post('/management/breakers/reset', {
+          scope: 'channel',
+          channel_id: line.id,
+          model: (line.state && line.state.model) || line.model
+        }).then(function (result) {
+          if (result.ok) { cleared += 1; return; }
+          if (!failed) { failed = result; }
+        });
+      });
+    });
+    chain.then(function () {
+      setSubmitting(button, false, '清除冷却');
+      if (failed) {
+        if (failed.status === 401) { showAuth('登录状态已过期，请重新登录后继续。'); return; }
+        showBanner('清除冷却失败', errorMessage(failed.body, '网关拒绝了这次清除。'));
+        if (cleared > 0) { refresh(); }
         return;
       }
-      if (result.status === 401) { showAuth('登录状态已过期，请重新登录后继续。'); return; }
-      showBanner('恢复失败', errorMessage(result.body, '网关拒绝了这次恢复。'));
+      showNotice('已清除 ' + cleared + ' 条线路的冷却，下一个请求会重新尝试它们。');
+      refresh();
     }).catch(function (err) {
-      setSubmitting(button, false, '恢复');
+      setSubmitting(button, false, '清除冷却');
       showBanner('无法连接网关', String(err && err.message ? err.message : err));
     });
   }
@@ -1951,16 +2179,25 @@
    * 排查一次报错从这里开始：先看是哪条线路、上游说了什么，再判断是地址写错、
    * 密钥用尽还是被限流。 */
 
-  /* REQUEST_LOG_LIMIT 是一次读取返回的条数。网关保留的记录可能更多，页面一次
-   * 只展示最近这么多条，够覆盖最近几分钟的故障。 */
-  var REQUEST_LOG_LIMIT = 200;
+  /* REQUEST_LOG_PAGE_SIZE 是请求记录一页的条数。网关保留的记录可能更多，页面一次
+   * 只读一页，够看清最近发生了什么，又不必把上千条一次画出来。 */
+  var REQUEST_LOG_PAGE_SIZE = 20;
 
   function requestsQuery() {
-    var parts = ['limit=' + REQUEST_LOG_LIMIT];
+    var parts = [
+      'limit=' + REQUEST_LOG_PAGE_SIZE,
+      'offset=' + (state.requests.page * REQUEST_LOG_PAGE_SIZE)
+    ];
     if (state.requests.failedOnly) { parts.push('failed=1'); }
     var model = state.requests.model.trim();
     if (model !== '') { parts.push('model=' + encodeURIComponent(model)); }
     return '/management/requests?' + parts.join('&');
+  }
+
+  /* requestPages is how many pages the filtered log has, at least one so the view
+   * always has a page to name. */
+  function requestPages() {
+    return Math.max(1, Math.ceil(state.requests.total / REQUEST_LOG_PAGE_SIZE));
   }
 
   /* applyRequestLog installs one answer of the request view. A gateway that keeps
@@ -1968,11 +2205,20 @@
   function applyRequestLog(result) {
     if (result && result.ok && result.body) {
       state.requests.records = Array.isArray(result.body.requests) ? result.body.requests : [];
+      state.requests.total = number(result.body.total);
       state.requests.retention = result.body.retention || null;
       state.requests.error = null;
+      // Records age out of the log while a page is open, so the page the operator
+      // is on can stop existing. Falling back to the last page keeps the view on
+      // records rather than on an empty table.
+      if (state.requests.records.length === 0 && state.requests.page > 0 && state.requests.total > 0) {
+        state.requests.page = requestPages() - 1;
+        refresh();
+      }
       return;
     }
     state.requests.records = [];
+    state.requests.total = 0;
     state.requests.retention = null;
     state.requests.error = result ? errorMessage(result.body, '读取请求记录失败。') : '读取请求记录失败。';
   }
@@ -1982,13 +2228,15 @@
     els.requestsBody.textContent = '';
 
     var records = state.requests.records;
-    var failed = records.filter(function (record) { return record && record.failed; }).length;
-    els.requestsMeta.textContent = records.length === 0
+    var total = state.requests.total;
+    var pages = requestPages();
+    els.requestsMeta.textContent = total === 0
       ? '暂无记录'
-      : '最近 ' + records.length + ' 条 · 失败 ' + failed;
+      : '共 ' + total + ' 条 · 第 ' + (state.requests.page + 1) + ' / ' + pages + ' 页';
     els.requestsRetention.textContent = retentionText(state.requests.retention);
     els.requestsFailed.classList.toggle('is-active', state.requests.failedOnly);
     els.requestsFailed.setAttribute('aria-pressed', state.requests.failedOnly ? 'true' : 'false');
+    renderRequestPager(total, pages);
 
     if (state.requests.error) {
       els.requestsTable.hidden = true;
@@ -2073,6 +2321,32 @@
     return '还没有请求记录。经过网关的每个请求都会记在这里。';
   }
 
+  /* renderRequestPager says which page is open and how many there are, and offers
+   * the two moves that make sense from here. The buttons are disabled rather than
+   * hidden, so the pager does not jump around as the log grows. */
+  function renderRequestPager(total, pages) {
+    if (!els.requestsPrev) { return; }
+    var page = state.requests.page;
+    els.requestsPrev.disabled = page <= 0;
+    els.requestsNext.disabled = total === 0 || page >= pages - 1;
+    els.requestsPageNote.textContent = '';
+    // An empty log has no page to name, so it is counted rather than numbered.
+    if (total === 0) {
+      els.requestsPageNote.appendChild(document.createTextNode('共 0 条'));
+      return;
+    }
+    els.requestsPageNote.appendChild(document.createTextNode('第 ' + (page + 1) + ' / ' + pages + ' 页'));
+    els.requestsPageNote.appendChild(element('span', 'pager-total', '（共 ' + total + ' 条）'));
+  }
+
+  /* goToRequestPage moves the view to another page of the same filtered log. */
+  function goToRequestPage(page) {
+    var next = Math.max(0, Math.min(page, requestPages() - 1));
+    if (next === state.requests.page) { return; }
+    state.requests.page = next;
+    refresh();
+  }
+
   /* formatClock renders a record's time as a log line: the time of day is what
    * orders the requests, and the date only matters once the day has changed. */
   function formatClock(value) {
@@ -2105,13 +2379,26 @@
     return node;
   }
 
+  /* requestLineSummary is the failover path of a request, in the order it was
+   * walked: the upstream it was first sent to, then every upstream it was retried
+   * on after that. Keys are deliberately not part of it — which key carried an
+   * attempt is what the expanded record below is for. */
   function requestLineSummary(attempts) {
-    var names = uniqueValues((attempts || []).map(function (attempt) {
-      return text(attempt.channel_name, attempt.channel_id);
-    }));
-    if (names.length === 0) { return element('span', 'cell-muted', '—'); }
-    var node = element('span', '', names.join('、'));
-    node.title = names.join('、');
+    var path = [];
+    (attempts || []).forEach(function (attempt) {
+      var name = text(attempt.channel_name, '#' + attempt.channel_id);
+      // Consecutive repeats are one step: trying another key of the same upstream
+      // is still the same upstream, but coming back to one is a step of its own.
+      if (path.length === 0 || path[path.length - 1] !== name) { path.push(name); }
+    });
+    if (path.length === 0) { return element('span', 'cell-muted', '—'); }
+
+    var node = element('span', 'line-path');
+    path.forEach(function (name, index) {
+      if (index > 0) { node.appendChild(element('span', 'line-arrow', '→')); }
+      node.appendChild(element('span', 'cell-strong', name));
+    });
+    node.title = '按这个顺序尝试的上游：' + path.join(' → ');
     return node;
   }
 
@@ -2169,8 +2456,7 @@
       cell(row, '#' + number(attempt.number), 'num');
 
       var lineCell = document.createElement('td');
-      lineCell.appendChild(element('span', 'cell-strong', text(attempt.channel_name, attempt.channel_id)));
-      lineCell.appendChild(element('span', 'cell-id', '#' + text(attempt.channel_id)));
+      lineCell.appendChild(attemptLine(attempt));
       row.appendChild(lineCell);
 
       cell(row, attempt.model ? element('span', 'mono', attempt.model) : element('span', 'cell-muted', '—'));
@@ -2195,6 +2481,30 @@
       body.appendChild(emptyRow);
     }
     return table;
+  }
+
+  /* attemptLine names the line an attempt went out on: the upstream it belongs to
+   * and the key that carried it. The failover path is the parent row's business;
+   * the key is readable here, which is what this expanded record is for. */
+  function attemptLine(attempt) {
+    var upstream = text(attempt.channel_name, '#' + attempt.channel_id);
+    var key = lineKeyLabel(attempt.channel_id);
+    var node = element('span', 'line-path');
+    node.appendChild(element('span', 'cell-strong', upstream));
+    node.appendChild(element('span', 'cell-muted', key));
+    node.title = upstream + ' · ' + key;
+    return node;
+  }
+
+  /* lineKeyLabel names the key behind a line id: 「令牌 #23」 or 「凭据 #5」 while
+   * the line is still configured, and the bare id when it is not. */
+  function lineKeyLabel(channelID) {
+    var id = String(channelID === null || channelID === undefined ? '' : channelID);
+    var lines = channelLines();
+    for (var index = 0; index < lines.length; index++) {
+      if (lines[index].id === id) { return lines[index].keyLabel; }
+    }
+    return '#' + id;
   }
 
   function attemptResponseCell(attempt) {
@@ -2234,6 +2544,8 @@
     if (result.ok) {
       var cleared = result.body && typeof result.body.cleared === 'number' ? result.body.cleared : 0;
       showNotice(cleared > 0 ? '已清空 ' + cleared + ' 条请求记录。' : '请求记录已经是空的。');
+      // An emptied log has one empty page, so the view goes back to it.
+      state.requests.page = 0;
       refresh();
       return null;
     }
@@ -2301,6 +2613,9 @@
 
   function setupRowToggles() {
     toggleGroupRow(els.routingBody, 'routes', renderRouting);
+    // The routing view nests: a model opens onto its upstreams, and an upstream
+    // opens onto its keys. Both live in the same body, so both are wired here.
+    toggleGroupRow(els.routingBody, UPSTREAM_GROUP, renderRouting);
     toggleGroupRow(els.upstreamsBody, 'upstreams', renderManagement);
     toggleGroupRow(els.requestsBody, 'requests', renderRequests);
   }
@@ -2416,7 +2731,11 @@
       }
       head.appendChild(headerRow);
 
+      // A resource may declare order(left, right): its table lists the rows in that
+      // order instead of the order the API returned them in. The upstream table
+      // uses it to lead with the upstream the gateway would try first.
       var rows = resourceRows(resource);
+      if (typeof metadata.order === 'function') { rows = rows.slice().sort(metadata.order); }
       meta.textContent = '共 ' + rows.length + ' 条';
 
       if (rows.length === 0) {
@@ -4126,6 +4445,8 @@
     if (els.requestsFailed) {
       els.requestsFailed.addEventListener('click', function () {
         state.requests.failedOnly = !state.requests.failedOnly;
+        // A new filter is a new list, so it is read from its first page.
+        state.requests.page = 0;
         refresh();
       });
     }
@@ -4137,8 +4458,19 @@
         window.clearTimeout(modelTimer);
         modelTimer = window.setTimeout(function () {
           state.requests.model = els.requestsModel.value;
+          state.requests.page = 0;
           refresh();
         }, 300);
+      });
+    }
+    if (els.requestsPrev) {
+      els.requestsPrev.addEventListener('click', function () {
+        goToRequestPage(state.requests.page - 1);
+      });
+    }
+    if (els.requestsNext) {
+      els.requestsNext.addEventListener('click', function () {
+        goToRequestPage(state.requests.page + 1);
       });
     }
     if (els.requestsClear) {

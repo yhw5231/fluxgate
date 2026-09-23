@@ -36,13 +36,14 @@ import (
 type RequestLog interface {
 	AppendRequestRecord(ctx context.Context, record domain.RequestRecord, keep int) error
 	ListRequestRecords(ctx context.Context, filter store.RequestLogFilter) ([]domain.RequestRecord, error)
+	CountRequestRecords(ctx context.Context, filter store.RequestLogFilter) (int, error)
 	ClearRequestRecords(ctx context.Context) (int64, error)
 }
 
-// requestLogRecordLimit is how many records a console read returns by default.
-// It is a page of them: enough to cover the last few minutes of a busy gateway
-// and short enough to render without pagination.
-const requestLogRecordLimit = 200
+// requestLogRecordLimit is one page of the console's request view, and the number
+// of records a read returns when the caller does not say: enough to see what the
+// gateway has just done, and short enough to read without scrolling far.
+const requestLogRecordLimit = 20
 
 // requestRecord is one stored record as the management API answers with it.
 type requestRecord struct {
@@ -75,12 +76,22 @@ func (s *Server) handleRequestLog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	applied := s.currentPolicy().RequestLog
-	records, err := s.RequestLog.ListRequestRecords(r.Context(), store.RequestLogFilter{
+	filter := store.RequestLogFilter{
 		Limit:      queryInt(r, "limit", requestLogRecordLimit),
+		Offset:     queryInt(r, "offset", 0),
 		FailedOnly: queryBool(r, "failed"),
 		Model:      strings.TrimSpace(r.URL.Query().Get("model")),
 		SinceID:    int64(queryInt(r, "since", 0)),
-	})
+	}
+	records, err := s.RequestLog.ListRequestRecords(r.Context(), filter)
+	if err != nil {
+		s.logger().Error("request_log_unreadable", "error", err.Error())
+		writeError(w, http.StatusInternalServerError, "request_log_unreadable", "failed to read the request records")
+		return
+	}
+	// The total is counted under the same filter, so the view can say how many
+	// pages it is looking at without reading them.
+	total, err := s.RequestLog.CountRequestRecords(r.Context(), filter)
 	if err != nil {
 		s.logger().Error("request_log_unreadable", "error", err.Error())
 		writeError(w, http.StatusInternalServerError, "request_log_unreadable", "failed to read the request records")
@@ -114,6 +125,11 @@ func (s *Server) handleRequestLog(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"requests": shaped,
+		// The page window and the total travel with the records: the view says
+		// which slice of the log it is showing, and how much there is in all.
+		"total":  total,
+		"limit":  filter.Limit,
+		"offset": filter.Offset,
 		// The retention travels with the records so the view can say how far back
 		// it reaches instead of implying the log is everything ever served.
 		"retention": map[string]any{

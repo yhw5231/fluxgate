@@ -30,14 +30,19 @@ func selectChannel(t *testing.T, selector *MemorySelector, model string, policy 
 	return selection
 }
 
-func TestMemorySelectorPrefersHighestPriorityAndMapsModel(t *testing.T) {
+// The upstream priority decides which upstream answers, and the model mapping of
+// the chosen line is what the upstream is asked for.
+func TestMemorySelectorPrefersTheHigherUpstreamAndMapsModel(t *testing.T) {
 	selector := NewMemorySelector([]domain.Route{{
 		ID:           1,
 		ModelPattern: "gpt-*",
 		Mode:         domain.RouteModePattern,
 		Enabled:      true,
 		ModelMapping: domain.ModelMapping{{Pattern: "gpt-*", Target: "mapped-model"}},
-		Channels:     []domain.Channel{channel("lower", 10, 1), channel("higher", 20, 1)},
+		Channels: []domain.Channel{
+			{ID: "lower", Enabled: true, Weight: 1, SiteID: 1},
+			{ID: "higher", Enabled: true, Weight: 1, SiteID: 2, SitePriority: 5},
+		},
 	}})
 
 	selection := selectChannel(t, selector, "gpt-4.1", domain.RoutingPolicy{})
@@ -67,12 +72,12 @@ func withinShare(count, draws int, share, tolerance float64) bool {
 	return ratio >= share-tolerance && ratio <= share+tolerance
 }
 
-// Lines of one priority are drawn at random, each in proportion to its weight:
-// a 3:1 pair takes about three quarters of the requests.
-func TestMemorySelectorDrawsWithinAPriorityTierByWeight(t *testing.T) {
+// An upstream that rotates spreads its requests across its own keys, each key in
+// proportion to its weight: a 3:1 pair takes about three quarters of the requests.
+func TestMemorySelectorDrawsKeysOfOneUpstreamByKeyWeight(t *testing.T) {
 	selector := NewMemorySelector([]domain.Route{route(1, "*",
-		channel("heavy", 10, 3),
-		channel("light", 10, 1),
+		domain.Channel{ID: "heavy", Enabled: true, Weight: 3, SiteID: 1, RoutingStrategy: keyModeRotate},
+		domain.Channel{ID: "light", Enabled: true, Weight: 1, SiteID: 1, RoutingStrategy: keyModeRotate},
 	)})
 
 	const draws = 4000
@@ -85,25 +90,25 @@ func TestMemorySelectorDrawsWithinAPriorityTierByWeight(t *testing.T) {
 	}
 }
 
-// The same model served by two upstreams of one priority stays one route, and
-// both upstreams keep being drawn from.
-func TestMemorySelectorKeepsEveryLineOfATierReachable(t *testing.T) {
+// Two upstreams of one priority are drawn by upstream weight, and both keep
+// answering: a tie is a split, not a fallback.
+func TestMemorySelectorKeepsEveryUpstreamOfAPriorityReachable(t *testing.T) {
 	selector := NewMemorySelector([]domain.Route{route(1, "*",
-		domain.Channel{ID: "a", Enabled: true, Weight: 10, SiteID: 1},
-		domain.Channel{ID: "b", Enabled: true, Weight: 10, SiteID: 2},
+		domain.Channel{ID: "a", Enabled: true, Weight: 10, SiteID: 1, SiteGlobalWeight: 1},
+		domain.Channel{ID: "b", Enabled: true, Weight: 10, SiteID: 2, SiteGlobalWeight: 1},
 	)})
 
 	counts := drawCounts(t, selector, "model", domain.RoutingPolicy{}, 200)
 	if counts["a"] == 0 || counts["b"] == 0 {
-		t.Fatalf("counts = %#v, want both lines to stay reachable", counts)
+		t.Fatalf("counts = %#v, want both upstreams to stay reachable", counts)
 	}
 }
 
 func TestMemorySelectorHonorsExclusionsAndDisabledChannels(t *testing.T) {
 	selector := NewMemorySelector([]domain.Route{route(1, "*",
-		domain.Channel{ID: "disabled", Enabled: false, Priority: 30, Weight: 1},
-		channel("primary", 20, 1),
-		channel("fallback", 10, 1),
+		domain.Channel{ID: "disabled", Enabled: false, Weight: 1, SiteID: 3, SitePriority: 30},
+		domain.Channel{ID: "primary", Enabled: true, Weight: 1, SiteID: 2, SitePriority: 20},
+		domain.Channel{ID: "fallback", Enabled: true, Weight: 1, SiteID: 1, SitePriority: 10},
 	)})
 
 	selection, err := selector.Select(domain.SelectionRequest{
@@ -332,7 +337,7 @@ func TestMemorySelectorUsesSiteWeightAndMultiplier(t *testing.T) {
 	}
 
 	// A downstream multiplier scales one site's share of the same draws: site 2
-	// falls to 10 × 2 × 0.1 against site 1's 10.
+	// falls to 2 × 0.1 against site 1's 1.
 	policy := domain.RoutingPolicy{SiteMultipliers: map[int64]float64{2: 0.1}}
 	counts = drawCounts(t, newSelector(), "model", policy, draws)
 	if !withinShare(counts["base"], draws, 10.0/12.0, 0.05) {
@@ -370,10 +375,9 @@ func TestMemorySelectorPrefersTheHigherUpstreamPriority(t *testing.T) {
 	}
 }
 
-// A key mode orders one upstream's keys so the first one is tried first. That
-// ordering stays inside its upstream: it must not lift a key of a lower-priority
-// upstream past a preferred one.
-func TestMemorySelectorKeepsLinePriorityInsideItsUpstream(t *testing.T) {
+// A key's own priority must never lift its upstream past a preferred one: the
+// upstream is chosen first, and only then is a key of that upstream picked.
+func TestMemorySelectorNeverLiftsAKeyPastAPreferredUpstream(t *testing.T) {
 	selector := NewMemorySelector([]domain.Route{route(1, "*",
 		domain.Channel{ID: "preferred-key", Enabled: true, Weight: 1, SiteID: 1, SitePriority: 1},
 		domain.Channel{ID: "other-first-key", Enabled: true, Weight: 1, SiteID: 2, Priority: 9},
@@ -384,16 +388,35 @@ func TestMemorySelectorKeepsLinePriorityInsideItsUpstream(t *testing.T) {
 	if counts["preferred-key"] != 100 {
 		t.Fatalf("counts = %#v, want the preferred upstream's key throughout", counts)
 	}
+}
 
-	// Inside one upstream the line priority still decides, so the higher of the
-	// two keys is the one taken while both are usable.
-	sameSite := NewMemorySelector([]domain.Route{route(1, "*",
-		domain.Channel{ID: "first-key", Enabled: true, Weight: 1, SiteID: 2, Priority: 9},
-		domain.Channel{ID: "second-key", Enabled: true, Weight: 1, SiteID: 2, Priority: 8},
-	)})
-	counts = drawCounts(t, sameSite, "model", domain.RoutingPolicy{}, 100)
-	if counts["first-key"] != 100 {
-		t.Fatalf("counts = %#v, want the higher-priority key of one upstream", counts)
+// An upstream that prefers its first key takes the lowest key of its own list,
+// whatever the keys weigh, and moves to the next one only when that key is out.
+func TestMemorySelectorPrefersTheFirstKeyOfAnUpstream(t *testing.T) {
+	newSelector := func() *MemorySelector {
+		return NewMemorySelector([]domain.Route{route(1, "*",
+			domain.Channel{ID: "1", Enabled: true, Weight: 1, SiteID: 1, RoutingStrategy: keyModeFirstAvailable},
+			domain.Channel{ID: "2", Enabled: true, Weight: 1000, SiteID: 1, RoutingStrategy: keyModeFirstAvailable},
+			domain.Channel{ID: "3", Enabled: true, Weight: 1000, SiteID: 1, RoutingStrategy: keyModeFirstAvailable},
+		)})
+	}
+
+	counts := drawCounts(t, newSelector(), "model", domain.RoutingPolicy{}, 100)
+	if counts["1"] != 100 {
+		t.Fatalf("counts = %#v, want the upstream's first key throughout", counts)
+	}
+
+	// The second key takes over once the first one is out of the pool, and the
+	// list order decides that rather than the weights.
+	selection, err := newSelector().Select(domain.SelectionRequest{
+		Model:    "model",
+		Excluded: map[string]struct{}{"1": {}},
+	})
+	if err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+	if selection.Channel.ID != "2" {
+		t.Fatalf("selected channel = %q, want the next key of the same upstream", selection.Channel.ID)
 	}
 }
 
