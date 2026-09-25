@@ -52,7 +52,15 @@ type Engine struct {
 	Client        *http.Client
 	ProxyResolver *Resolver
 	TransportPool *TransportPool
-	Policy        domain.RetryPolicy
+	// MediaClient and MediaTransportPool dispatch a generation request, which is
+	// one whose upstream holds the connection open until it has produced the
+	// artifact. They are what a synchronous image generation needs: the ordinary
+	// client's response-header timeout is shorter than a generation takes, so a
+	// request that legitimately takes a minute would otherwise fail as if the
+	// upstream had gone silent. When either is nil the ordinary client is used.
+	MediaClient        *http.Client
+	MediaTransportPool *TransportPool
+	Policy             domain.RetryPolicy
 	// Failover is the static failover configuration. A nil value means the
 	// engine's own default: a failed channel may be replaced by any other
 	// eligible one.
@@ -96,6 +104,9 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 		return Result{}, errors.New("proxy selector is required")
 	}
 	client := e.Client
+	if input.Media && e.MediaClient != nil {
+		client = e.MediaClient
+	}
 	if client == nil {
 		client = http.DefaultClient
 	}
@@ -154,7 +165,8 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 			StartedAt:   attempt.StartedAt,
 		}
 
-		body, err := transform.ApplyJSON(input.Body, selection.Model, channel.Transform)
+		body := transform.NewBody(input.ContentType, input.Body)
+		body, err = body.Rewrite(selection.Model, channel.Transform)
 		if err != nil {
 			return Result{Trace: trace}, err
 		}
@@ -171,6 +183,9 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 				return Result{Trace: trace}, resolveErr
 			}
 			pool := e.TransportPool
+			if input.Media && e.MediaTransportPool != nil {
+				pool = e.MediaTransportPool
+			}
 			if pool == nil {
 				pool = NewTransportPool(nil)
 			}
@@ -247,12 +262,20 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 }
 
 // selectionRequest builds one lookup, restricted to the channel or the upstream
-// the request has to stay with while failover is limited.
+// the request has to stay with while failover is limited, and to the one line a
+// request that names no model is pinned to.
 func (e *Engine) selectionRequest(input domain.Request, excluded map[string]struct{}, pinned domain.Selection, failover domain.FailoverPolicy) domain.SelectionRequest {
 	request := domain.SelectionRequest{
 		Model:    input.Model,
 		Policy:   input.Policy,
 		Excluded: excluded,
+	}
+	// A pinned request is not a routing question at all: the line that holds the
+	// upstream-side work is the only one that can answer, so it is asked for on
+	// every attempt and failover never moves the request away from it.
+	if pinnedChannel := strings.TrimSpace(input.OnlyChannel); pinnedChannel != "" {
+		request.OnlyChannel = pinnedChannel
+		return request
 	}
 	if pinned.Channel.ID == "" {
 		return request
@@ -266,26 +289,33 @@ func (e *Engine) selectionRequest(input domain.Request, excluded map[string]stru
 	return request
 }
 
-func buildRequest(ctx context.Context, input domain.Request, channel domain.Channel, body []byte) (*http.Request, context.CancelFunc, error) {
+func buildRequest(ctx context.Context, input domain.Request, channel domain.Channel, body transform.Body) (*http.Request, context.CancelFunc, error) {
 	baseURL, err := url.Parse(strings.TrimRight(channel.BaseURL, "/"))
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse channel base URL: %w", err)
 	}
 	target := upstreamTarget(baseURL, input.Path)
 
+	// A generation is bounded by the gateway's media timeout, which is longer than
+	// the per-channel default because producing an image or a video takes longer
+	// than answering a chat completion.
+	timeout := channel.RequestTimeout
+	if input.Timeout > 0 {
+		timeout = input.Timeout
+	}
 	requestContext := ctx
 	cancel := func() {}
-	if channel.RequestTimeout > 0 {
-		requestContext, cancel = context.WithTimeout(ctx, channel.RequestTimeout)
+	if timeout > 0 {
+		requestContext, cancel = context.WithTimeout(ctx, timeout)
 	}
-	request, err := http.NewRequestWithContext(requestContext, input.Method, target.String(), bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(requestContext, input.Method, target.String(), bytes.NewReader(body.Raw))
 	if err != nil {
 		cancel()
 		return nil, nil, fmt.Errorf("build upstream request: %w", err)
 	}
-	request.Header = transform.ApplyHeaders(input.Headers, channel.Transform, channel.APIKey)
+	request.Header = transform.ApplyHeaders(input.Headers, channel.Transform, channel.APIKey, body.ContentType)
 	request.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(body)), nil
+		return io.NopCloser(bytes.NewReader(body.Raw)), nil
 	}
 	return request, cancel, nil
 }

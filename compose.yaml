@@ -44,6 +44,8 @@ services:
       FLUXGATE_MAX_BODY_BYTES: "${FLUXGATE_MAX_BODY_BYTES:-8388608}"
       # 上游请求超时
       FLUXGATE_REQUEST_TIMEOUT: "${FLUXGATE_REQUEST_TIMEOUT:-60s}"
+      # 生成类请求（图片、视频）的超时；上游做出成品才会应答，故长于普通请求超时
+      FLUXGATE_MEDIA_REQUEST_TIMEOUT: "${FLUXGATE_MEDIA_REQUEST_TIMEOUT:-10m}"
       # TCP 连接建立超时
       FLUXGATE_CONNECT_TIMEOUT: "${FLUXGATE_CONNECT_TIMEOUT:-10s}"
       # TLS 握手超时

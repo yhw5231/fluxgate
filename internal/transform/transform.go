@@ -12,7 +12,13 @@ import (
 
 // ApplyHeaders clones incoming headers, removes configured names, overlays configured values,
 // and replaces downstream authorization with the selected channel credential.
-func ApplyHeaders(source http.Header, rules domain.TransformRules, apiKey string) http.Header {
+//
+// contentType is the media type of the body that will actually be sent, which is
+// not always the one the client sent: a rebuilt multipart form carries a new
+// boundary, so its header has to be replaced rather than kept. An empty value
+// leaves the client's own Content-Type in place, and supplies JSON only when the
+// client named none — which is the shape every proxy endpoint reads.
+func ApplyHeaders(source http.Header, rules domain.TransformRules, apiKey, contentType string) http.Header {
 	result := source.Clone()
 	if result == nil {
 		result = make(http.Header)
@@ -36,7 +42,11 @@ func ApplyHeaders(source http.Header, rules domain.TransformRules, apiKey string
 	if strings.TrimSpace(apiKey) != "" {
 		result.Set("Authorization", "Bearer "+strings.TrimSpace(apiKey))
 	}
-	result.Set("Content-Type", "application/json")
+	if trimmed := strings.TrimSpace(contentType); trimmed != "" {
+		result.Set("Content-Type", trimmed)
+	} else if strings.TrimSpace(result.Get("Content-Type")) == "" {
+		result.Set("Content-Type", "application/json")
+	}
 	return result
 }
 

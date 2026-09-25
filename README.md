@@ -1,6 +1,6 @@
 # Fluxgate
 
-Fluxgate is a lightweight, independently deployable Go gateway that reads the existing upstream SQLite configuration and provides OpenAI-compatible proxy endpoints, bounded server-side retries, priority-then-weight routing, proxy selection, and persistent circuit-breaker state. It ships with an embedded management console that both shows the running state and edits that configuration: upstreams with their priorities, weights, keys and models, the routing the gateway derives from them, client keys, proxy profiles, and the retry, failover, and circuit-breaker policy the gateway applies while it runs.
+Fluxgate is a lightweight, independently deployable Go gateway that reads the existing upstream SQLite configuration and provides OpenAI-compatible proxy endpoints — chat, responses, embeddings, images and video — with bounded server-side retries, priority-then-weight routing, proxy selection, and persistent circuit-breaker state. It ships with an embedded management console that both shows the running state and edits that configuration: upstreams with their priorities, weights, keys and models, the routing the gateway derives from them, client keys, proxy profiles, and the retry, failover, and circuit-breaker policy the gateway applies while it runs.
 
 ## Requirements
 
@@ -697,6 +697,11 @@ Authenticated model and proxy endpoints:
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 - `POST /v1/messages`
+- `POST /v1/embeddings`
+- `POST /v1/images/generations`
+- `POST /v1/images/edits`
+- `POST /v1/images/variations`
+- `POST /v1/videos`, `GET /v1/videos/{id}`, `GET /v1/videos/{id}/content`, `DELETE /v1/videos/{id}`
 
 Authenticated endpoints expect an enabled, unexpired downstream API key:
 
@@ -708,7 +713,11 @@ Proxy errors use the OpenAI error envelope with a `code` field:
 
 - `401 invalid_api_key`: missing, unknown, expired, or exhausted key.
 - `403 model_not_allowed`: the key's `supported_models` denies the model.
-- `400 missing_model`, `400 invalid_json`, `413 request_too_large`.
+- `400 missing_model`, `400 invalid_json`, `400 invalid_body`, `413 request_too_large`.
+- `404 video_not_found`: the identifier names no video this gateway created for
+  this key.
+- `500 media_jobs_unreadable`, `503 media_jobs_unavailable`: the record video jobs
+  are found by could not be read, or was never configured.
 - `503 no_available_channel`: no enabled route matches the model, or no channel
   can serve it. No upstream request is attempted.
 - `502 upstream_unavailable`: every attempt against the selected channels
@@ -739,6 +748,90 @@ Invoke-RestMethod `
   -Headers @{ Authorization = "Bearer YOUR_DOWNSTREAM_API_KEY" } `
   -Body $body
 ```
+
+### Embeddings, images, and video
+
+Embeddings, image generation and video generation are proxied the same way a chat
+completion is: the request names a model, the route decides which upstreams may
+answer for it, the model name is rewritten to the one that upstream knows, and the
+answer — or the upstream's own error — comes back unchanged. The same key
+restrictions, retries, failover and circuit-breaker rules apply, and every request
+is recorded in the console's request view like any other.
+
+An embedding is an ordinary request in every respect: `POST /v1/embeddings` with
+`{"model": "...", "input": ...}` reaches the upstream's own `/v1/embeddings`.
+
+Two things are different for a generation, and both are about time:
+
+- **It is bounded by `FLUXGATE_MEDIA_REQUEST_TIMEOUT` (default `10m`), not by
+  `FLUXGATE_REQUEST_TIMEOUT`.** An image or video upstream answers only once it has
+  produced the artifact, which routinely outlives the `60s` a chat completion is
+  given. A generation is also dispatched over a connection that does not apply
+  `FLUXGATE_RESPONSE_HEADER_TIMEOUT`, so a slow image is not cut off as if the
+  upstream had gone silent. This covers `POST /v1/images/*`, `POST /v1/videos`, and
+  the follow-up requests below — including the artifact download, which is a
+  multi-megabyte transfer.
+- **A video is created asynchronously.** `POST /v1/videos` answers with the job the
+  upstream has started, and the client polls `GET /v1/videos/{id}` until it is
+  done, then downloads `GET /v1/videos/{id}/content`.
+
+An image edit and a variation upload the image they work from as a
+`multipart/form-data` form, with the model as one field beside it. The gateway
+reads the model out of the form, rebuilds the form for the channel it has chosen —
+the model field carries the name that upstream knows, and the form gets a new
+boundary — and forwards it with the uploaded parts byte-for-byte. A form is the one
+body shape the gateway rebuilds rather than passes along; the console's per-upstream
+body mutations (`delete`/`override` JSON paths) are JSON-pointer paths and so are
+not applied to a form. The `model` field is required, as it is for a JSON request:
+without one the gateway cannot tell which route the request belongs to and answers
+`400 missing_model`. The upload is bounded by `FLUXGATE_MAX_BODY_BYTES` (default
+8 MiB) like every other request body, and `413 request_too_large` is the answer when
+it is exceeded.
+
+#### Following up on a video job
+
+A request about a video that already exists names no model — only an identifier —
+so the routing table cannot say where it belongs, and no upstream other than the one
+that accepted the job can answer for it. The gateway is the one party that knows
+both, so when a creation answers with an identifier it records which line the job
+was created on, and every later request for that identifier is pinned to that same
+line: it is never load-balanced or failed over to an upstream that has never heard
+of the job. The routing table is not consulted, but the line's own settings —
+credential, proxy, timeout, circuit state — still apply.
+
+Consequences worth knowing:
+
+- **A video is the property of the key that created it.** Another downstream key
+  asking for the same identifier is answered `404 video_not_found`, the same answer
+  it gets for an identifier that does not exist, so one client's job is never
+  revealed to another. This matches the OpenAI behavior of scoping a video to the
+  project that created it.
+- **The record is bounded to the newest 2000 jobs** and lives in the gateway's own
+  `gateway_media_jobs` table, in the same database as everything else, so it
+  survives a restart. A job that has aged out — or one created before the gateway
+  was last pointed at a different database — is answered `404 video_not_found`
+  rather than being sent somewhere at random.
+- **`DELETE /v1/videos/{id}` forgets the job only once the upstream has confirmed
+  the deletion.** A deletion the upstream refused leaves the record in place, so the
+  next request finds the job and shows the upstream's own reason instead of losing
+  the trail.
+- The identifier is read from the creation answer's `id`, `task_id`, `video_id` or
+  `job_id`, at the top level or under `data`, `result` or `output`, because
+  providers that speak this shape disagree about what to call it.
+- There is no `GET /v1/videos` listing and no `/v1/videos/{id}/remix`. Neither can
+  be routed: a listing names no model and no job, so there is no upstream it
+  belongs to, and the gateway does not poll every upstream on a client's behalf.
+
+#### Upstream paths
+
+A generation reaches the upstream at the path the client called. The base address
+supplies the version segment and any sub-path it names, so an upstream mounted at
+the API root receives `/v1/images/generations`, and one stored as
+`https://host/v1` receives `/images/generations`. A provider whose video endpoint is
+not reachable at `/v1/videos` — one that serves, say, `/v1/video_generation` — cannot
+be reached through these routes, because the gateway does not rewrite the upstream
+path; put such a provider behind a small adapter, or use the base address's own
+sub-path if its layout allows one.
 
 ## Model routing
 
@@ -982,9 +1075,15 @@ removes its entry rather than storing one.
 ### Network timeout settings
 
 - `FLUXGATE_REQUEST_TIMEOUT`: Default per-channel request timeout. Default: `60s`.
+- `FLUXGATE_MEDIA_REQUEST_TIMEOUT`: Request timeout for a generation endpoint — an
+  image or a video — which takes the place of the per-channel timeout above,
+  because an upstream that produces an artifact answers far later than one that
+  answers a chat completion. Default: `10m`.
 - `FLUXGATE_CONNECT_TIMEOUT`: TCP connection timeout. Default: `10s`.
 - `FLUXGATE_TLS_HANDSHAKE_TIMEOUT`: TLS handshake timeout. Default: `10s`.
 - `FLUXGATE_RESPONSE_HEADER_TIMEOUT`: Upstream response-header timeout. Default: `30s`.
+  It does not apply to a generation request, whose upstream legitimately takes
+  longer than this to begin answering.
 - `FLUXGATE_IDLE_CONN_TIMEOUT`: Upstream idle connection timeout. Default: `90s`.
 - `FLUXGATE_READ_HEADER_TIMEOUT`: Downstream request-header timeout. Default: `10s`.
 - `FLUXGATE_READ_TIMEOUT`: Downstream request read timeout. Default: `30s`.
@@ -1047,9 +1146,10 @@ go test -race ./...
 
 The Go gateway is an independent service that can run alongside the existing React
 and TypeScript application during gradual migration. It reads the same SQLite
-configuration and owns three additional tables of its own: `gateway_breaker_states`
+configuration and owns four additional tables of its own: `gateway_breaker_states`
 for circuit-breaker persistence, `gateway_request_log` for the record of served
-requests, and the `gateway_admin_*` tables for the console
+requests, `gateway_media_jobs` for the line each generation job was created on, and
+the `gateway_admin_*` tables for the console
 credential and its sessions.
 
 The console can also edit that configuration, which makes the gateway a writer of

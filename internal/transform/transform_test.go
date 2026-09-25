@@ -23,7 +23,7 @@ func TestApplyHeadersRemovesOverridesAndReplacesAuthorization(t *testing.T) {
 		},
 	}
 
-	result := ApplyHeaders(source, rules, "upstream-key")
+	result := ApplyHeaders(source, rules, "upstream-key", "")
 
 	if got := result.Get("Authorization"); got != "Bearer upstream-key" {
 		t.Fatalf("Authorization = %q, want upstream credential", got)

@@ -16,6 +16,13 @@ func TestDefaultProductionSettings(t *testing.T) {
 	if cfg.MaxRequestBodyBytes <= 0 || cfg.RequestTimeout <= 0 {
 		t.Fatal("default request limits must be positive")
 	}
+	// A generation outlives a chat completion, so the bound it is given has to be
+	// the longer one: a media timeout that was not would cut a slow image off
+	// before the request it belongs to had finished.
+	if cfg.MediaRequestTimeout <= cfg.RequestTimeout {
+		t.Fatalf("MediaRequestTimeout = %s, want it above the request timeout %s",
+			cfg.MediaRequestTimeout, cfg.RequestTimeout)
+	}
 	if cfg.ConnectTimeout <= 0 || cfg.TLSHandshakeTimeout <= 0 || cfg.ResponseHeaderTimeout <= 0 || cfg.IdleConnTimeout <= 0 {
 		t.Fatal("default HTTP client timeouts must be positive")
 	}
@@ -35,6 +42,7 @@ func TestLoadOverridesProductionSettings(t *testing.T) {
 	t.Setenv("FLUXGATE_DATABASE_PATH", "test.db")
 	t.Setenv("FLUXGATE_MAX_BODY_BYTES", "4096")
 	t.Setenv("FLUXGATE_REQUEST_TIMEOUT", "45s")
+	t.Setenv("FLUXGATE_MEDIA_REQUEST_TIMEOUT", "7m")
 	t.Setenv("FLUXGATE_CONNECT_TIMEOUT", "2s")
 	t.Setenv("FLUXGATE_TLS_HANDSHAKE_TIMEOUT", "3s")
 	t.Setenv("FLUXGATE_RESPONSE_HEADER_TIMEOUT", "4s")
@@ -60,7 +68,7 @@ func TestLoadOverridesProductionSettings(t *testing.T) {
 	if cfg.Address != "127.0.0.1:9090" || cfg.DatabasePath != "test.db" || cfg.MaxRequestBodyBytes != 4096 {
 		t.Fatalf("basic overrides not loaded: %#v", cfg)
 	}
-	if cfg.RequestTimeout != 45*time.Second || cfg.ConnectTimeout != 2*time.Second || cfg.TLSHandshakeTimeout != 3*time.Second || cfg.ResponseHeaderTimeout != 4*time.Second {
+	if cfg.RequestTimeout != 45*time.Second || cfg.MediaRequestTimeout != 7*time.Minute || cfg.ConnectTimeout != 2*time.Second || cfg.TLSHandshakeTimeout != 3*time.Second || cfg.ResponseHeaderTimeout != 4*time.Second {
 		t.Fatalf("client timeout overrides not loaded: %#v", cfg)
 	}
 	if cfg.ReadHeaderTimeout != 6*time.Second || cfg.ReadTimeout != 7*time.Second || cfg.IdleTimeout != 8*time.Second || cfg.ShutdownTimeout != 9*time.Second {

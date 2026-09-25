@@ -18,6 +18,7 @@ const (
 	defaultDatabasePath          = "../data/hub.db"
 	defaultMaxRequestBodyBytes   = int64(8 << 20)
 	defaultRequestTimeout        = 60 * time.Second
+	defaultMediaRequestTimeout   = 10 * time.Minute
 	defaultConnectTimeout        = 10 * time.Second
 	defaultTLSHandshakeTimeout   = 10 * time.Second
 	defaultResponseHeaderTimeout = 30 * time.Second
@@ -32,11 +33,14 @@ const (
 
 // Config contains process-level settings for the production gateway runtime.
 type Config struct {
-	Address               string
-	DatabasePath          string
-	ManagementToken       string
-	MaxRequestBodyBytes   int64
-	RequestTimeout        time.Duration
+	Address             string
+	DatabasePath        string
+	ManagementToken     string
+	MaxRequestBodyBytes int64
+	RequestTimeout      time.Duration
+	// MediaRequestTimeout bounds one generation request — an image or a video —
+	// whose upstream works longer than a chat completion takes to answer.
+	MediaRequestTimeout   time.Duration
 	ConnectTimeout        time.Duration
 	TLSHandshakeTimeout   time.Duration
 	ResponseHeaderTimeout time.Duration
@@ -80,6 +84,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.RequestTimeout, err = durationEnv("FLUXGATE_REQUEST_TIMEOUT", cfg.RequestTimeout, true); err != nil {
+		return Config{}, err
+	}
+	if cfg.MediaRequestTimeout, err = durationEnv("FLUXGATE_MEDIA_REQUEST_TIMEOUT", cfg.MediaRequestTimeout, true); err != nil {
 		return Config{}, err
 	}
 	if cfg.ConnectTimeout, err = durationEnv("FLUXGATE_CONNECT_TIMEOUT", cfg.ConnectTimeout, true); err != nil {
@@ -181,6 +188,7 @@ func Default() Config {
 		DatabasePath:          defaultDatabasePath,
 		MaxRequestBodyBytes:   defaultMaxRequestBodyBytes,
 		RequestTimeout:        defaultRequestTimeout,
+		MediaRequestTimeout:   defaultMediaRequestTimeout,
 		ConnectTimeout:        defaultConnectTimeout,
 		TLSHandshakeTimeout:   defaultTLSHandshakeTimeout,
 		ResponseHeaderTimeout: defaultResponseHeaderTimeout,

@@ -77,6 +77,13 @@ func run(parent context.Context, logger *slog.Logger) error {
 		return err
 	}
 
+	// Where each generation job was created is what lets a request naming only a
+	// job identifier reach the upstream holding it, so the record is created at
+	// startup too.
+	if err := persistentStore.EnsureMediaJobSchema(parent); err != nil {
+		return err
+	}
+
 	// A fresh deployment gets a built-in administrator so the console is
 	// reachable without a CLI step. The account is flagged as needing a password
 	// change, and the data endpoints refuse it until that happens, so the
@@ -120,19 +127,30 @@ func run(parent context.Context, logger *slog.Logger) error {
 	baseTransport.IdleConnTimeout = cfg.IdleConnTimeout
 
 	transportPool := proxy.NewTransportPool(baseTransport)
+	// A generation request is answered only when the upstream has produced the
+	// artifact, which is minutes for a video and can easily be longer than the
+	// response-header timeout a chat completion is held to. The media pool carries
+	// the same connection settings with that one bound lifted: what a generation is
+	// bounded by is the gateway's media timeout, applied per request, and a
+	// response-header timeout underneath it would cut the request off first.
+	mediaTransport := baseTransport.Clone()
+	mediaTransport.ResponseHeaderTimeout = 0
+	mediaTransportPool := proxy.NewTransportPool(mediaTransport)
 	// The selector and the resolver are updated in place by a console write
 	// rather than replaced, so a request already in flight finishes with the
 	// configuration it started with.
 	selector := router.NewMemorySelectorWithFilter(configuration.Routes, circuitBreaker)
 	proxyResolver := buildProxyResolver(configuration)
 	engine := &proxy.Engine{
-		Selector:      selector,
-		Observer:      circuitBreaker,
-		Client:        &http.Client{Transport: baseTransport},
-		ProxyResolver: proxyResolver,
-		TransportPool: transportPool,
-		Policy:        cfg.Retry,
-		Failover:      &cfg.Failover,
+		Selector:           selector,
+		Observer:           circuitBreaker,
+		Client:             &http.Client{Transport: baseTransport},
+		MediaClient:        &http.Client{Transport: mediaTransport},
+		ProxyResolver:      proxyResolver,
+		TransportPool:      transportPool,
+		MediaTransportPool: mediaTransportPool,
+		Policy:             cfg.Retry,
+		Failover:           &cfg.Failover,
 	}
 	// The runtime policy is the environment's settings with whatever the console
 	// stored on top of them. It is installed once here and again after every
@@ -154,8 +172,10 @@ func run(parent context.Context, logger *slog.Logger) error {
 		BreakerSnapshotter:  breakerStore,
 		BreakerReset:        breakerStore,
 		RequestLog:          persistentStore,
+		MediaJobs:           persistentStore,
 		PolicyDefaults:      cfg.Policy(),
 		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,
+		MediaRequestTimeout: cfg.MediaRequestTimeout,
 		Logger:              logger,
 		StartedAt:           time.Now().UTC(),
 	}

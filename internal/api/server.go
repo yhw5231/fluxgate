@@ -23,6 +23,7 @@ import (
 	"github.com/yhw5231/fluxgate/internal/proxy"
 	"github.com/yhw5231/fluxgate/internal/router"
 	"github.com/yhw5231/fluxgate/internal/store"
+	"github.com/yhw5231/fluxgate/internal/transform"
 	"github.com/yhw5231/fluxgate/internal/version"
 )
 
@@ -70,7 +71,16 @@ type Server struct {
 	// RequestLog keeps the record of the requests the gateway served, which is
 	// what the console's request view reads and what explains a failure after the
 	// fact. When nil, no record is kept and the request endpoints answer 503.
-	RequestLog          RequestLog
+	RequestLog RequestLog
+	// MediaJobs keeps where each upstream-side generation job was created, which
+	// is what lets a request that names no model reach the line that holds the
+	// work. When nil, a job cannot be recorded and the follow-up endpoints answer
+	// 503 rather than guessing at an upstream.
+	MediaJobs MediaJobStore
+	// MediaRequestTimeout bounds one generation request — an image or a video —
+	// which outlives the per-channel timeout a chat completion is bounded by. When
+	// zero, the gateway's own default is used.
+	MediaRequestTimeout time.Duration
 	Models              []string
 	MaxRequestBodyBytes int64
 	Logger              *slog.Logger
@@ -199,9 +209,17 @@ func (s *Server) Handler() http.Handler {
 	// Clearing a recorded circuit, which is the manual half of breaker recovery.
 	mux.HandleFunc("POST /management/breakers/reset", s.handleBreakerReset)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
-	mux.HandleFunc("POST /v1/chat/completions", s.handleProxy)
-	mux.HandleFunc("POST /v1/responses", s.handleProxy)
-	mux.HandleFunc("POST /v1/messages", s.handleProxy)
+	// The OpenAI-compatible proxy surface. Each endpoint is registered from its own
+	// description, so how long an upstream may take to answer and whether the answer
+	// creates work the gateway has to remember are stated once, beside the route.
+	for _, endpoint := range proxyEndpoints {
+		mux.HandleFunc(endpoint.method+" "+endpoint.path, s.handleProxy(endpoint))
+	}
+	// Following up on work an upstream is still doing. These name no model, so they
+	// are routed by the record the gateway kept when the work was created.
+	mux.HandleFunc("GET /v1/videos/{id}", s.handleVideoJob)
+	mux.HandleFunc("GET /v1/videos/{id}/content", s.handleVideoJobContent)
+	mux.HandleFunc("DELETE /v1/videos/{id}", s.handleVideoJobDelete)
 	// Anything else that a browser navigated to is a visitor looking for the
 	// console, so unknown pages redirect to it. The API namespaces keep their
 	// 404s: a mistyped endpoint must not answer with a login page.
@@ -702,109 +720,141 @@ func (s *Server) hasRoutableChannel(model string, policy domain.RoutingPolicy) b
 	return s.Engine.Selector.HasCandidate(model, policy)
 }
 
-func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
-	if s.Engine == nil {
-		writeError(w, http.StatusServiceUnavailable, "gateway_not_ready", "gateway engine is not configured")
-		return
-	}
-	key, ok := s.authenticate(w, r)
-	if !ok {
-		return
-	}
-
-	// Every request that got past authentication leaves a record, whichever way it
-	// ends. The record is filled in as the request is handled and written once, so
-	// a refusal the gateway itself makes — an unreadable body, a model this key
-	// may not use — is as findable as an upstream failure.
-	started := time.Now()
-	record := domain.RequestRecord{
-		RequestID: newRequestID(),
-		At:        started.UTC(),
-		Method:    r.Method,
-		Path:      r.URL.Path,
-		ClientIP:  clientIP(r),
-		KeyID:     key.ID,
-		KeyName:   key.Name,
-	}
-	// refuse answers the client and records why, so the two cannot disagree about
-	// what happened.
-	refuse := func(status int, code, message string, details map[string]any) {
-		record.Status = status
-		record.ErrorCode = code
-		record.ErrorMessage = message
-		writeErrorDetails(w, status, code, message, details)
-	}
-	// The client is told which request this was, so a failure it reports can be
-	// looked up rather than guessed at from a timestamp.
-	w.Header().Set("X-Fluxgate-Request-Id", record.RequestID)
-	defer func() {
-		record.DurationMS = time.Since(started).Milliseconds()
-		s.recordProxiedRequest(r, record)
-	}()
-
-	limit := s.MaxRequestBodyBytes
-	if limit <= 0 {
-		limit = 8 << 20
-	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
-	if err != nil {
-		var maxBytesError *http.MaxBytesError
-		if errors.As(err, &maxBytesError) {
-			refuse(http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds the configured limit", nil)
+// handleProxy serves one OpenAI-compatible proxy endpoint: it authenticates the
+// caller, reads the model the request is for, checks the caller may reach it, and
+// dispatches it through the engine.
+//
+// The endpoint description decides the two things that differ between the routes:
+// how long an upstream may take to answer, and whether the answer creates work
+// the gateway has to remember so the client can come back to it.
+func (s *Server) handleProxy(endpoint proxyEndpoint) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.Engine == nil {
+			writeError(w, http.StatusServiceUnavailable, "gateway_not_ready", "gateway engine is not configured")
 			return
 		}
-		refuse(http.StatusBadRequest, "invalid_request", "failed to read request body", nil)
-		return
-	}
+		key, ok := s.authenticate(w, r)
+		if !ok {
+			return
+		}
 
-	var envelope struct {
-		Model  string `json:"model"`
-		Stream bool   `json:"stream"`
-	}
-	if err := json.Unmarshal(body, &envelope); err != nil {
-		refuse(http.StatusBadRequest, "invalid_json", "request body must be a JSON object", nil)
-		return
-	}
-	record.Model = strings.TrimSpace(envelope.Model)
-	record.Stream = envelope.Stream
-	if record.Model == "" {
-		refuse(http.StatusBadRequest, "missing_model", "request model is required", nil)
-		return
-	}
-	policy := key.Policy()
-	if !domain.AllowsModel(s.currentRoutes(), policy, record.Model) {
-		refuse(http.StatusForbidden, "model_not_allowed", "requested model is not allowed for this API key", nil)
-		return
-	}
+		// Every request that got past authentication leaves a record, whichever way it
+		// ends. The record is filled in as the request is handled and written once, so
+		// a refusal the gateway itself makes — an unreadable body, a model this key
+		// may not use — is as findable as an upstream failure.
+		started := time.Now()
+		record := domain.RequestRecord{
+			RequestID: newRequestID(),
+			At:        started.UTC(),
+			Method:    r.Method,
+			Path:      r.URL.Path,
+			ClientIP:  clientIP(r),
+			KeyID:     key.ID,
+			KeyName:   key.Name,
+		}
+		// refuse answers the client and records why, so the two cannot disagree about
+		// what happened.
+		refuse := func(status int, code, message string, details map[string]any) {
+			record.Status = status
+			record.ErrorCode = code
+			record.ErrorMessage = message
+			writeErrorDetails(w, status, code, message, details)
+		}
+		// The client is told which request this was, so a failure it reports can be
+		// looked up rather than guessed at from a timestamp.
+		w.Header().Set("X-Fluxgate-Request-Id", record.RequestID)
+		defer func() {
+			record.DurationMS = time.Since(started).Milliseconds()
+			s.recordProxiedRequest(r, record)
+		}()
 
-	result, err := s.Engine.Forward(r.Context(), domain.Request{
-		Method:    http.MethodPost,
-		Path:      r.URL.Path,
-		Headers:   sanitizedHeaders(r.Header),
-		Body:      body,
-		Model:     envelope.Model,
-		Policy:    policy,
-		RequestID: record.RequestID,
-	})
-	record.Attempts = result.Trace.Attempts
-	if err != nil {
-		// A model with no usable route or channel is an availability problem,
-		// not a bad gateway: no upstream request was attempted.
-		failure := classifyDispatchError(err, result.Trace, record.RequestID)
-		refuse(failure.Status, failure.Code, failure.Message, failure.Details)
-		return
-	}
-	defer result.Response.Body.Close()
+		limit := s.MaxRequestBodyBytes
+		if limit <= 0 {
+			limit = 8 << 20
+		}
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+		if err != nil {
+			var maxBytesError *http.MaxBytesError
+			if errors.As(err, &maxBytesError) {
+				refuse(http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds the configured limit", nil)
+				return
+			}
+			refuse(http.StatusBadRequest, "invalid_request", "failed to read request body", nil)
+			return
+		}
 
-	record.Status = result.Response.StatusCode
-	copyResponseHeaders(w.Header(), result.Response.Header)
-	w.Header().Set("X-Fluxgate-Upstream-Channel", result.Attempt.ChannelID)
-	w.WriteHeader(result.Response.StatusCode)
-	if envelope.Stream || strings.Contains(strings.ToLower(result.Response.Header.Get("Content-Type")), "text/event-stream") {
-		streamResponse(w, result.Response.Body)
-		return
+		// The model is read the way the body carries it: a JSON field for a
+		// completion, an embedding or an image generation, and a form field for an
+		// image edit, which uploads its source image beside it.
+		content := transform.NewBody(r.Header.Get("Content-Type"), body)
+		model, err := content.Model()
+		if err != nil {
+			if content.Shape == transform.ShapeJSON {
+				refuse(http.StatusBadRequest, "invalid_json", "request body must be a JSON object", nil)
+				return
+			}
+			refuse(http.StatusBadRequest, "invalid_body", "failed to read the request body", nil)
+			return
+		}
+		// The stream flag is a JSON body's own field; an endpoint that answers with
+		// an artifact has no stream to ask for.
+		var envelope struct {
+			Stream bool `json:"stream"`
+		}
+		_ = json.Unmarshal(body, &envelope)
+		record.Model = model
+		record.Stream = envelope.Stream
+		if model == "" {
+			refuse(http.StatusBadRequest, "missing_model", "request model is required", nil)
+			return
+		}
+		policy := key.Policy()
+		if !domain.AllowsModel(s.currentRoutes(), policy, model) {
+			refuse(http.StatusForbidden, "model_not_allowed", "requested model is not allowed for this API key", nil)
+			return
+		}
+
+		result, err := s.Engine.Forward(r.Context(), domain.Request{
+			Method:      endpoint.method,
+			Path:        r.URL.Path,
+			Headers:     sanitizedHeaders(r.Header),
+			Body:        body,
+			ContentType: content.ContentType,
+			Model:       model,
+			Policy:      policy,
+			Media:       endpoint.media,
+			Timeout:     s.mediaTimeout(endpoint),
+			RequestID:   record.RequestID,
+		})
+		record.Attempts = result.Trace.Attempts
+		if err != nil {
+			// A model with no usable route or channel is an availability problem,
+			// not a bad gateway: no upstream request was attempted.
+			failure := classifyDispatchError(err, result.Trace, record.RequestID)
+			refuse(failure.Status, failure.Code, failure.Message, failure.Details)
+			return
+		}
+		defer result.Response.Body.Close()
+
+		// An endpoint that creates upstream-side work answers with the identifier of
+		// that work, which is the only thing that can route the requests that follow:
+		// they name no model, and only the line that accepted the job can answer for
+		// it. The answer is read for it here, before the client is given a byte of
+		// it, and put back so it reaches the client unchanged.
+		if endpoint.recordsJob {
+			result.Response.Body = s.captureMediaJob(r, result, key, record)
+		}
+
+		record.Status = result.Response.StatusCode
+		copyResponseHeaders(w.Header(), result.Response.Header)
+		w.Header().Set("X-Fluxgate-Upstream-Channel", result.Attempt.ChannelID)
+		w.WriteHeader(result.Response.StatusCode)
+		if envelope.Stream || strings.Contains(strings.ToLower(result.Response.Header.Get("Content-Type")), "text/event-stream") {
+			streamResponse(w, result.Response.Body)
+			return
+		}
+		_, _ = io.Copy(w, result.Response.Body)
 	}
-	_, _ = io.Copy(w, result.Response.Body)
 }
 
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (store.DownstreamAPIKey, bool) {

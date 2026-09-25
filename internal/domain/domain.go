@@ -374,7 +374,26 @@ type Request struct {
 	Headers http.Header
 	Body    []byte
 	Model   string
-	Policy  RoutingPolicy
+	// ContentType is the media type of Body, which decides how the model name is
+	// read and rewritten: a JSON object, or a multipart form whose file parts
+	// must travel untouched.
+	ContentType string
+	Policy      RoutingPolicy
+	// OnlyChannel pins dispatch to one line instead of selecting one by model. It
+	// is how a request that follows up on work an upstream is already doing — a
+	// video job being polled for its status — reaches the upstream holding it,
+	// because such a request names no model and only one line can answer it.
+	OnlyChannel string
+	// Media marks a request to a generation endpoint, whose upstream may hold the
+	// connection open for as long as the artifact takes to produce. It is
+	// dispatched through the media client, whose transport does not bound how long
+	// an upstream may take to start answering, because the channel's
+	// response-header timeout is shorter than a generation takes.
+	Media bool
+	// Timeout, when positive, replaces the channel's own request timeout. A
+	// generation is bounded by the gateway's media timeout rather than by the
+	// per-channel default a chat completion is bounded by.
+	Timeout time.Duration
 	// RequestID identifies this downstream request. It travels into every attempt
 	// the request makes, which is what lets a circuit count one failing request
 	// once instead of once per attempt, and it is what a record of the request is
