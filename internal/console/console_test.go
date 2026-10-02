@@ -743,6 +743,27 @@ func TestUpstreamAddressIsCompletedInTheForm(t *testing.T) {
 	}
 }
 
+// A channel renames itself upstream, so asking for the model list again has to
+// rebuild it from the answer: an entry the upstream now lists under another name
+// is re-pointed at that name instead of keeping the one it was picked under, and
+// an entry the upstream no longer lists is kept and marked rather than dropped.
+func TestConsoleRebuildsTheModelListOnEveryFetch(t *testing.T) {
+	script := consoleScript(t)
+
+	for _, wanted := range []string{
+		"function applyListing(",
+		"function refreshEntry(",
+		"var listing = applyListing(models)",
+		// 上游现在的写法覆盖旧的，除非「上游模型名」是手写的另一个模型。
+		"canonicalModelName(entry.target) === entry.name",
+		"（上游未列出）",
+	} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("console script is missing %q", wanted)
+		}
+	}
+}
+
 // A create shows the value the gateway would store for an omitted field, so an
 // upstream added in the console is enabled rather than left unset.
 func TestConsoleShowsTheServerDefaultInTheForm(t *testing.T) {

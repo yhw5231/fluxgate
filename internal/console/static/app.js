@@ -3115,10 +3115,61 @@
         if (target && !known[exposed].target) { known[exposed].target = target; }
         return;
       }
-      var entry = { name: exposed, listed: listed, checked: checked === true, target: target || '' };
+      var entry = {
+        name: exposed, listed: listed, checked: checked === true, target: target || '', unlisted: false
+      };
       known[exposed] = entry;
       rows.push(entry);
       rows.sort(function (left, right) { return left.name < right.name ? -1 : (left.name > right.name ? 1 : 0); });
+    }
+
+    /* refreshEntry points an entry at what the upstream lists now. The spelling
+     * is taken over as it is, and the name to send follows it whenever that name
+     * was derived from a listing rather than typed: the entry carries none, or it
+     * carries a spelling of this same model under another channel path or variant
+     * (canonicalModelName reduces those to the same model). A target that names a
+     * different model is a deliberate remap and is left alone. */
+    function refreshEntry(entry, spelling) {
+      var derived = !entry.target || canonicalModelName(entry.target) === entry.name;
+      var changed = entry.listed !== spelling;
+      entry.listed = spelling;
+      entry.unlisted = false;
+      if (derived) {
+        var target = spelling === entry.name ? '' : spelling;
+        if (target !== entry.target) {
+          entry.target = target;
+          changed = true;
+        }
+      }
+      return changed;
+    }
+
+    /* applyListing rebuilds the list from a probe. Every model the upstream lists
+     * now is filed under its canonical name with the spelling the upstream uses
+     * now, so a channel that renamed itself stops being asked for by its old
+     * name; the models the upstream did not list are kept and marked instead of
+     * dropped, because a selection is the operator's to drop, not the probe's.
+     * Returns what changed, for the message the probe reports itself with. */
+    function applyListing(models) {
+      var seen = {};
+      var refreshed = 0;
+      models.forEach(function (name) {
+        var spelling = String(name || '').trim();
+        if (!spelling) { return; }
+        var exposed = canonicalModelName(spelling);
+        if (!exposed || seen[exposed]) { return; }
+        seen[exposed] = true;
+        var entry = known[exposed];
+        if (!entry) { addModel(spelling, false, ''); return; }
+        if (refreshEntry(entry, spelling)) { refreshed += 1; }
+      });
+      var unlisted = 0;
+      rows.forEach(function (entry) {
+        if (seen[entry.name]) { return; }
+        entry.unlisted = true;
+        unlisted += 1;
+      });
+      return { refreshed: refreshed, unlisted: unlisted };
     }
 
     function visibleRows() {
@@ -3150,6 +3201,12 @@
           // 自己勾选的模型被改掉了。
           label.title = '上游列出的名字：' + entry.listed;
           label.appendChild(element('span', 'model-listed', '（上游写法 ' + entry.listed + '）'));
+        }
+        if (entry.unlisted) {
+          // 上一次获取模型时上游没有列出它：条目留着，但要说清楚，否则 operator
+          // 会以为它还路由得到。
+          label.title = (label.title ? label.title + '；' : '') + '上一次获取模型时上游没有列出它。';
+          label.appendChild(element('span', 'model-unlisted', '（上游未列出）'));
         }
         line.appendChild(label);
         var target = document.createElement('input');
@@ -3201,14 +3258,22 @@
         setSubmitting(button, false, '获取模型');
         if (result.ok) {
           var models = (result.body && result.body.models) || [];
-          models.forEach(function (name) { addModel(name, false, ''); });
+          // 列表按这次探测重建：已有模型换成上游现在的写法，上游没列出的条目留着
+          // 并标出，勾选与否仍由 operator 决定。
+          var listing = applyListing(models);
           var endpoint = result.body && result.body.endpoint;
           // 选择计数由 picker 自己维护，探测结果放在反馈区：说清楚是从哪个地址
           // 拿到的，地址写错时一眼就能看出来。
           paint();
-          showFeedback(els.editorFeedback,
-            '上游返回 ' + models.length + ' 个模型' + (endpoint ? '（来自 ' + endpoint + '）' : '') + '，勾选要使用的模型。',
-            'success');
+          var summary = '上游返回 ' + models.length + ' 个模型' +
+            (endpoint ? '（来自 ' + endpoint + '）' : '') + '，勾选要使用的模型。';
+          if (listing.refreshed > 0) {
+            summary += '已按上游现在的写法更新 ' + listing.refreshed + ' 个已有模型。';
+          }
+          if (listing.unlisted > 0) {
+            summary += '另有 ' + listing.unlisted + ' 个条目上游这次没有列出，已标出。';
+          }
+          showFeedback(els.editorFeedback, summary, 'success');
           return;
         }
         status.textContent = '';

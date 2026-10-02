@@ -1352,6 +1352,14 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   color: var(--text-faint);
 }
 
+/* 上一次获取模型时上游没有列出的条目：留着不删，但要说清楚它已经不在上游的列表
+ * 里，否则 operator 会以为它照样路由得到。 */
+.model-unlisted {
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--warning);
+}
+
 .model-line .model-target { padding: 5px 8px; font-size: 12px; }
 
 .picker-manual {

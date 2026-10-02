@@ -362,7 +362,12 @@ upstreams:
   `cline-free/deepseek-v4.1-flash:free` and `DeepSeek-V4.1-Flash` are one model
   exposed once, and the spelling the upstream listed is carried as the name to send
   it. Each selected model takes an optional upstream model name, prefilled with that
-  spelling and editable, so it can be pointed somewhere else. The
+  spelling and editable, so it can be pointed somewhere else. Asking again rebuilds
+  the list from the answer: a model the upstream now lists under a renamed channel is
+  re-pointed at the name it uses now instead of keeping the one it was picked under,
+  a name typed by hand is left alone, and an entry the upstream no longer lists is
+  kept and marked 上游未列出 rather than dropped, because dropping a selection is the
+  operator's call and not the probe's. The
   probe goes out the way a real request to that upstream would: through the proxy
   in the form, or the default proxy profile when the form leaves it open, and the
   answer names the address that served the listing. A probe that fails says which
