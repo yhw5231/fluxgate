@@ -365,9 +365,11 @@ upstreams:
   spelling and editable, so it can be pointed somewhere else. Asking again rebuilds
   the list from the answer: a model the upstream now lists under a renamed channel is
   re-pointed at the name it uses now instead of keeping the one it was picked under,
-  a name typed by hand is left alone, and an entry the upstream no longer lists is
-  kept and marked 上游未列出 rather than dropped, because dropping a selection is the
-  operator's call and not the probe's. The
+  a name typed by hand is left alone, a model that has just appeared in the listing is
+  selected, and one the upstream no longer lists is kept, marked 上游未列出 and
+  deselected — left selected it would be a route that cannot be reached, and dropped
+  outright it would be a choice taken away before the operator saw it. A model the
+  upstream keeps listing keeps the choice the operator made for it. The
   probe goes out the way a real request to that upstream would: through the proxy
   in the form, or the default proxy profile when the form leaves it open, and the
   answer names the address that served the listing. A probe that fails says which

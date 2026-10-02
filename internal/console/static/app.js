@@ -3044,7 +3044,9 @@
       '渠道路径（/ 前面）的差别，:free、:nitro 这类已知变体后缀也算同一个模型：' +
       'cline-free/deepseek-v4.1-flash:free 和 DeepSeek-V4.1-Flash 是同一个模型。' +
       '「上游模型名」填上游认识的写法，留空表示与模型名相同。注意 cn:deepseek-v4.1-flash ' +
-      '这类带渠道分组的名字：冒号后面才是模型本身，不会当成后缀去掉。'));
+      '这类带渠道分组的名字：冒号后面才是模型本身，不会当成后缀去掉。' +
+      '「获取模型」按上游最新的列表重建：新出现的模型自动勾选，上游不再提供的自动取消' +
+      '勾选并标出。'));
 
     var rows = [];
     var known = {};
@@ -3147,12 +3149,17 @@
     /* applyListing rebuilds the list from a probe. Every model the upstream lists
      * now is filed under its canonical name with the spelling the upstream uses
      * now, so a channel that renamed itself stops being asked for by its old
-     * name; the models the upstream did not list are kept and marked instead of
-     * dropped, because a selection is the operator's to drop, not the probe's.
+     * name. A model that was not in the previous answer is selected, because a
+     * listing that has just gained a model is the operator asking to use it; one
+     * the upstream no longer lists is kept and marked but deselected, because a
+     * selection that is left on is a route that cannot be reached. What the
+     * operator chose for a model the upstream keeps listing is left alone.
      * Returns what changed, for the message the probe reports itself with. */
     function applyListing(models) {
       var seen = {};
       var refreshed = 0;
+      var added = 0;
+      var returned = 0;
       models.forEach(function (name) {
         var spelling = String(name || '').trim();
         if (!spelling) { return; }
@@ -3160,16 +3167,30 @@
         if (!exposed || seen[exposed]) { return; }
         seen[exposed] = true;
         var entry = known[exposed];
-        if (!entry) { addModel(spelling, false, ''); return; }
+        if (!entry) {
+          addModel(spelling, true, '');
+          added += 1;
+          return;
+        }
+        // 上一次没列出、这次又出现的模型按新出现的处理：它当时的取消勾选是探测
+        // 做的，不是 operator 选的。
+        var returning = entry.unlisted === true;
         if (refreshEntry(entry, spelling)) { refreshed += 1; }
+        if (returning) {
+          entry.checked = true;
+          returned += 1;
+        }
       });
       var unlisted = 0;
       rows.forEach(function (entry) {
         if (seen[entry.name]) { return; }
         entry.unlisted = true;
+        // 上游不再提供它了：留着让 operator 看得见，但不能还勾着，否则保存后
+        // 会留下一条走不通的路由。
+        entry.checked = false;
         unlisted += 1;
       });
-      return { refreshed: refreshed, unlisted: unlisted };
+      return { refreshed: refreshed, unlisted: unlisted, added: added, returned: returned };
     }
 
     function visibleRows() {
@@ -3258,20 +3279,23 @@
         setSubmitting(button, false, '获取模型');
         if (result.ok) {
           var models = (result.body && result.body.models) || [];
-          // 列表按这次探测重建：已有模型换成上游现在的写法，上游没列出的条目留着
-          // 并标出，勾选与否仍由 operator 决定。
+          // 列表按这次探测重建：新出现的模型自动勾上，上游不再提供的取消勾选并
+          // 标出，勾选与否由 operator 复核。
           var listing = applyListing(models);
           var endpoint = result.body && result.body.endpoint;
           // 选择计数由 picker 自己维护，探测结果放在反馈区：说清楚是从哪个地址
           // 拿到的，地址写错时一眼就能看出来。
           paint();
           var summary = '上游返回 ' + models.length + ' 个模型' +
-            (endpoint ? '（来自 ' + endpoint + '）' : '') + '，勾选要使用的模型。';
+            (endpoint ? '（来自 ' + endpoint + '）' : '') + '。';
+          if (listing.added + listing.returned > 0) {
+            summary += '新出现或重新出现的 ' + (listing.added + listing.returned) + ' 个模型已勾选。';
+          }
           if (listing.refreshed > 0) {
             summary += '已按上游现在的写法更新 ' + listing.refreshed + ' 个已有模型。';
           }
           if (listing.unlisted > 0) {
-            summary += '另有 ' + listing.unlisted + ' 个条目上游这次没有列出，已标出。';
+            summary += '另有 ' + listing.unlisted + ' 个条目上游这次没有列出，已取消勾选并标出。';
           }
           showFeedback(els.editorFeedback, summary, 'success');
           return;
