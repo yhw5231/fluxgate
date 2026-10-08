@@ -86,21 +86,41 @@ func TestCanonicalReducesEverySpellingOfOneModel(t *testing.T) {
 }
 
 // A platform that serves its models from channel groups writes the group before
-// the colon, so there the name after it is the model and not a variant of one.
-// Reading every colon as a variant suffix would leave "cn" as the identity of
-// every model that platform serves, and the plain model name it lists would be
-// spelled by its display label instead.
-func TestCanonicalKeepsAChannelGroupPrefix(t *testing.T) {
-	for _, value := range []string{"cn:deepseek-v4.1-flash", "cn:auto", "global:deepseek-v4.1-flash", "cn:hy3-x"} {
-		if got := Canonical(value); got != value {
-			t.Errorf("Canonical(%q) = %q, want the name kept whole", value, got)
+// the colon — "cn:deepseek-v4.1-flash" — so what follows it is the model. The
+// group names the line a model is served from rather than the model: read as part
+// of the name it would expose one model per group, and read as a variant suffix it
+// would leave the group as the name of every model that group serves.
+func TestCanonicalReadsAChannelGroupAsTheLine(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  string
+	}{
+		{value: "cn:deepseek-v4.1-flash", want: "deepseek-v4.1-flash"},
+		{value: "cn:auto", want: "auto"},
+		{value: "global:deepseek-v4.1-flash", want: "deepseek-v4.1-flash"},
+		{value: "cn:hy3-x", want: "hy3-x"},
+		{value: "CN:DeepSeek-V4.1-Flash", want: "deepseek-v4.1-flash"},
+		// A channel path, a group and a variant suffix are three arrangements of
+		// one model, and each is read for what it is.
+		{value: "cline-free/cn:deepseek-v4.1-flash", want: "deepseek-v4.1-flash"},
+		{value: "cn:deepseek-v4.1-flash:free", want: "deepseek-v4.1-flash"},
+		// A name that carries no group is left as it was.
+		{value: "deepseek-v4.1-flash", want: "deepseek-v4.1-flash"},
+	} {
+		if got := Canonical(test.value); got != test.want {
+			t.Errorf("Canonical(%q) = %q, want %q", test.value, got, test.want)
 		}
 	}
 	if Equivalent("cn:auto", "cn:deepseek-v4.1-flash") {
 		t.Fatal("two models of one channel group compared equivalent")
 	}
-	if Equivalent("cn:deepseek-v4.1-flash", "deepseek-v4.1-flash") {
-		t.Fatal("a channel group's model compared equivalent to the plain name")
+	// One model served from two groups is one model, which is what lets a single
+	// exposed name reach either line.
+	if !Equivalent("cn:deepseek-v4.1-flash", "deepseek-v4.1-flash") {
+		t.Fatal("a channel group's model is not equivalent to the plain name")
+	}
+	if !Equivalent("cn:deepseek-v4.1-flash", "global:deepseek-v4.1-flash") {
+		t.Fatal("one model served from two channel groups compared as two models")
 	}
 }
 

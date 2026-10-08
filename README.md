@@ -357,12 +357,15 @@ upstreams:
   entry's identifier (`id`, or `model`/`name` when that is all an entry carries), and
   a display label a platform writes beside the identifier is not offered as a second
   model — it is what that platform's own console shows, not a name it would accept.
-  A picked name is filed under the model's canonical name — the
-  part after any `channel/` path, without a known `:variant` suffix, lowercased — so
-  `cline-free/deepseek-v4.1-flash:free` and `DeepSeek-V4.1-Flash` are one model
-  exposed once, and the spelling the upstream listed is carried as the name to send
-  it. Each selected model takes an optional upstream model name, prefilled with that
-  spelling and editable, so it can be pointed somewhere else. Asking again rebuilds
+  A picked name is filed under the model's canonical name — the part after any
+  `channel/` path, after the channel group a platform writes before a colon, without a
+  known `:variant` suffix, lowercased — so `cline-free/deepseek-v4.1-flash:free`,
+  `DeepSeek-V4.1-Flash` and `cn:deepseek-v4.1-flash` are one model exposed once, and the
+  spelling the upstream listed is carried as the name to send it: a model picked as
+  `cn:deepseek-v4.1-flash` is exposed as `deepseek-v4.1-flash` and still sent to that
+  upstream as `cn:deepseek-v4.1-flash`. Each selected model takes an optional upstream
+  model name, prefilled with that spelling and editable, so it can be pointed somewhere
+  else. Asking again rebuilds
   the list from the answer: a model the upstream now lists under a renamed channel is
   re-pointed at the name it uses now instead of keeping the one it was picked under,
   a name typed by hand is left alone, a model that has just appeared in the listing is
@@ -552,9 +555,11 @@ Writing `keys` or `models` creates the account, the token
 rows, the routes, and the channels behind them; the route ids the console created are
 recorded in the settings table under `gateway.managed_routes`, so an edit prunes only
 what it owns. A selected model is exposed under its canonical name — the part after any
-`channel/` path, without a known `:variant` suffix, lowercased — while the spelling it was
-picked by becomes the name that upstream receives, so two upstreams that call one model
-different things meet on one route. `priority` is stored in the settings table under
+`channel/` path, after the channel group before a colon, without a known `:variant`
+suffix, lowercased — while the spelling it was picked by becomes the name that upstream
+receives, so two upstreams that call one model different things meet on one route, and
+one model a platform serves from two channel groups is one route with a line per group.
+`priority` is stored in the settings table under
 `gateway.upstream_priorities` as a JSON object of upstream id to whole number, because
 it is not a `sites` column; an upstream the object does not mention has priority `0`.
 The tables themselves remain addressable one by one for a detail the form
@@ -884,23 +889,27 @@ identity rather than as a string. Case, the channel path before the last `/`, a
 known variant suffix after the last `:` (`:free`, `:nitro`, `:thinking`, `:online`,
 `:extended`, `:floor`, `:beta`, `:self-moderated`), and a trailing `-free` are naming
 rather than a
-different model, so `DeepSeek-V4.1-Flash`, `cline-free/deepseek-v4.1-flash`, and
-`cline-free/deepseek-v4.1-flash:free` all reach the route that exposes
-`deepseek-v4.1-flash`, and that name is what the gateway exposes and lists. Route
+different model, so `DeepSeek-V4.1-Flash`, `cline-free/deepseek-v4.1-flash`,
+`cline-free/deepseek-v4.1-flash:free` and `cn:deepseek-v4.1-flash` all reach the route
+that exposes `deepseek-v4.1-flash`, and that name is what the gateway exposes and lists.
+Route
 patterns, group display names, `source_model` checks, `model_mapping` keys, and a
 downstream key's deny list are all compared this way, so a restriction written for
 the plain name covers every decorated spelling of it. A `re:` pattern is the
 exception: it is matched against the name as sent, because it is written against
 what the client spells out.
 
-Only those variant tags are read as naming, because a colon also writes the channel
-group a platform serves a model from — `cn:deepseek-v4.1-flash` — and there the name
-after the colon is the model itself. Such a name is kept whole: it keeps its own
-identity instead of collapsing into its channel group, and every model that group
-serves stays a model of its own. A suffix the gateway does not know is kept for the
-same reason, so a name is never reduced to something no upstream ever wrote. To
-expose a friendlier name for one, map it (`model_mapping`) or give the route a
-display name.
+A colon that is left writes the channel group a platform serves a model from —
+`cn:deepseek-v4.1-flash`, `global:gpt-5.5` — and there the name after the colon is the
+model itself. The group names the line that serves the model rather than the model, so
+the identity is what follows the first colon: `cn:deepseek-v4.1-flash` is exposed as
+`deepseek-v4.1-flash`, and one exposed model reaches every group that serves it, so two
+platforms listing `cn:deepseek-v4.1-flash` and `global:deepseek-v4.1-flash` meet on one
+route with a line each. The group is not lost: the spelling an upstream listed travels
+as the channel's `source_model`, and that is the name it receives. A suffix the gateway
+does not know is kept rather than dropped on a guess, so a name is never reduced to
+something no upstream ever wrote. To expose another name for one, map it
+(`model_mapping`) or give the route a display name.
 
 The upstream still receives the spelling it knows: a channel's `source_model` (or
 the name the console stored when the model was picked) is written into the request
@@ -910,9 +919,10 @@ different.
 Candidate channels are then filtered by:
 
 - `route_channels.source_model`: when set, the channel only serves models that
-  equal it, are the same model under another spelling (case, channel path, known
-  variant suffix, `-free`), or match it as a pattern. A channel on an exact-pattern route
-  inherits that pattern as its source model when the column is empty. A channel
+  equal it, are the same model under another spelling (case, channel path, channel
+  group, known variant suffix, `-free`), or match it as a pattern. A channel on an
+  exact-pattern route inherits that pattern as its source model when the column is
+  empty. A channel
   that names its own model on an exact-pattern route is a candidate for that
   route regardless, which is what lets one exposed model reach several upstreams
   that each spell it differently.

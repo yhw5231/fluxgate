@@ -592,6 +592,41 @@ func TestMemorySelectorReachesARouteUnderEverySpellingOfTheModel(t *testing.T) {
 	}
 }
 
+// A platform that serves a model from a channel group is reached under the plain
+// model name: the group names the line a model is served from rather than the
+// model, so one exposed model covers every group, and each line still receives the
+// spelling its own upstream accepts.
+func TestMemorySelectorReachesAChannelGroupsModelByItsPlainName(t *testing.T) {
+	selector := NewMemorySelector([]domain.Route{route(1, "deepseek-v4-flash",
+		domain.Channel{ID: "cn", Enabled: true, Weight: 10, SiteID: 1, SourceModel: "cn:deepseek-v4-flash"},
+		domain.Channel{ID: "global", Enabled: true, Weight: 10, SiteID: 2, SourceModel: "global:deepseek-v4-flash"},
+	)})
+
+	seen := map[string]string{}
+	for index := 0; index < 40; index++ {
+		selection := selectChannel(t, selector, "deepseek-v4-flash", domain.RoutingPolicy{})
+		seen[selection.Channel.ID] = selection.Model
+	}
+	if len(seen) != 2 {
+		t.Fatalf("only %v were selected, want both channel groups reachable", seen)
+	}
+	if seen["cn"] != "cn:deepseek-v4-flash" {
+		t.Errorf("the cn line received %q, want the spelling its upstream accepts", seen["cn"])
+	}
+	if seen["global"] != "global:deepseek-v4-flash" {
+		t.Errorf("the global line received %q, want the spelling its upstream accepts", seen["global"])
+	}
+
+	// A client that still asks under the grouped spelling reaches the same route,
+	// because the group is not part of the model's identity.
+	if !selector.HasCandidate("cn:deepseek-v4-flash", domain.RoutingPolicy{}) {
+		t.Error("a request for the grouped spelling did not reach the route that exposes the model")
+	}
+	if selector.HasCandidate("cn:deepseek-v4-pro", domain.RoutingPolicy{}) {
+		t.Error("another model of the same channel group reached the route")
+	}
+}
+
 // A glob route written for the plain model name covers the decorated spellings
 // of it too, which is how one route can serve a whole family of listings.
 func TestMemorySelectorMatchesAGlobRouteAgainstTheCanonicalName(t *testing.T) {

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -670,11 +671,12 @@ func TestUpstreamExposesTheCanonicalModelName(t *testing.T) {
 	}
 }
 
-// A platform that writes the channel group before the colon serves several
-// models as "cn:<model>". Reading that colon as a variant suffix would leave
-// "cn" as the name of every one of them, so they would all land on one route
-// named after the group and the model the operator picked would be gone.
-func TestUpstreamKeepsAChannelGroupInTheModelName(t *testing.T) {
+// A platform that serves its models from channel groups lists them as
+// "cn:<model>". The group names the line a model is served from rather than the
+// model itself, so the model is exposed as what follows the colon while the line
+// keeps the spelling the upstream accepts — the same shape as any other channel
+// decoration, and what lets one exposed name be served from several groups.
+func TestUpstreamReadsAChannelGroupAsTheLine(t *testing.T) {
 	store := prepareUpstreamStore(t)
 	created := createUpstream(t, store, map[string]any{
 		"name": "Grouped", "url": "https://api.example.com",
@@ -682,16 +684,68 @@ func TestUpstreamKeepsAChannelGroupInTheModelName(t *testing.T) {
 	})
 
 	models := stringsOf(t, created["models"])
-	if len(models) != 2 || models[0] != "cn:auto" || models[1] != "cn:deepseek-v4.1-flash" {
-		t.Fatalf("models = %v, want both names kept whole", models)
+	if len(models) != 2 || models[0] != "auto" || models[1] != "deepseek-v4.1-flash" {
+		t.Fatalf("models = %v, want the model behind each channel group", models)
+	}
+	mapping, ok := created["model_mapping"].(map[string]any)
+	if !ok || mapping["auto"] != "cn:auto" || mapping["deepseek-v4.1-flash"] != "cn:deepseek-v4.1-flash" {
+		t.Fatalf("model_mapping = %#v, want the spelling each group serves", created["model_mapping"])
 	}
 	if routes := rowsOf(t, store, "routes"); len(routes) != 2 {
 		t.Fatalf("routes = %v, want one route per model", routes)
 	}
+	sources := map[string]bool{}
 	for _, channel := range rowsOf(t, store, "channels") {
-		source := channel["source_model"].(string)
-		if source != "cn:auto" && source != "cn:deepseek-v4.1-flash" {
-			t.Errorf("source model = %q, want the name the upstream serves", source)
-		}
+		sources[channel["source_model"].(string)] = true
+	}
+	if len(sources) != 2 || !sources["cn:auto"] || !sources["cn:deepseek-v4.1-flash"] {
+		t.Fatalf("source models = %v, want the name the upstream serves", sources)
+	}
+}
+
+// One model served from two channel groups is one model: the groups are two lines
+// of it, so the second upstream meets the first on one route instead of exposing a
+// second name for the same model.
+func TestUpstreamMeetsAnotherChannelGroupOnOneRoute(t *testing.T) {
+	store := prepareUpstreamStore(t)
+	createUpstream(t, store, map[string]any{
+		"name": "CN", "url": "https://api.cn.example.com",
+		"keys": []any{"key"}, "models": []any{"cn:deepseek-v4.1-flash"},
+	})
+	second := createUpstream(t, store, map[string]any{
+		"name": "Global", "url": "https://api.global.example.com",
+		"keys": []any{"key"}, "models": []any{"global:deepseek-v4.1-flash"},
+	})
+
+	if got := stringsOf(t, second["models"]); len(got) != 1 || got[0] != "deepseek-v4.1-flash" {
+		t.Fatalf("models = %v, want both groups on the exposed model name", got)
+	}
+	if routes := rowsOf(t, store, "routes"); len(routes) != 1 {
+		t.Fatalf("routes = %v, want one route for one model", routes)
+	}
+	sources := map[string]bool{}
+	for _, channel := range rowsOf(t, store, "channels") {
+		sources[channel["source_model"].(string)] = true
+	}
+	if len(sources) != 2 || !sources["cn:deepseek-v4.1-flash"] || !sources["global:deepseek-v4.1-flash"] {
+		t.Fatalf("source models = %v, want one line per group spelling", sources)
+	}
+}
+
+// Two spellings of one model are one route with one line per key, so selecting
+// both would leave one of them unroutable: the second write replaces the first
+// one's line on the route they share. The submission is refused instead of
+// quietly keeping the last one.
+func TestUpstreamRefusesTwoSpellingsOfOneModel(t *testing.T) {
+	store := prepareUpstreamStore(t)
+	_, err := store.CreateResource(context.Background(), "upstreams", map[string]any{
+		"name": "Grouped", "url": "https://api.example.com",
+		"keys": []any{"key"}, "models": []any{"cn:deepseek-v4.1-flash", "global:deepseek-v4.1-flash"},
+	})
+	if err == nil {
+		t.Fatal("CreateResource(upstreams) accepted two spellings of one model")
+	}
+	if !strings.Contains(err.Error(), "the same model") {
+		t.Fatalf("error = %v, want it to name the two spellings as one model", err)
 	}
 }

@@ -176,7 +176,7 @@ func checkUpstreamRow(ctx context.Context, tx *sql.Tx, id int64, row map[string]
 			return invalidField("models", "%s", err.Error())
 		}
 		seen := make(map[string]struct{}, len(models))
-		identities := make(map[string]struct{}, len(models))
+		identities := make(map[string]string, len(models))
 		for _, model := range models {
 			if len(model) > 512 {
 				return invalidValue("models", ReasonTooLong, map[string]any{"limit": 512}, "use at most %d bytes per model name", 512)
@@ -185,7 +185,14 @@ func checkUpstreamRow(ctx context.Context, tx *sql.Tx, id int64, row map[string]
 				return invalidField("models", "the model %q is listed twice", model)
 			}
 			seen[model] = struct{}{}
-			identities[modelIdentity(model)] = struct{}{}
+			// Two spellings of one model are one route with one line per key, so
+			// selecting both would silently leave one of them unroutable: the
+			// second write replaces the first one's line on the shared route.
+			identity := modelIdentity(model)
+			if other, duplicate := identities[identity]; duplicate {
+				return invalidField("models", "%q and %q are the same model: %q", other, model, identity)
+			}
+			identities[identity] = model
 		}
 		// A mapping that names no selected model would be stored and never used,
 		// so it is refused rather than silently ignored. The key is the exposed
@@ -520,7 +527,9 @@ func routeChannelIDs(ctx context.Context, db queryer, routeID, accountID int64) 
 // modelIdentity is the name a selected model is exposed under: the canonical
 // form of whatever spelling the upstream listed. One model serves every
 // spelling of itself from one route, which is what keeps an upstream that calls
-// it "cline-free/deepseek-v4.1-flash:free" reachable as "deepseek-v4.1-flash".
+// it "cline-free/deepseek-v4.1-flash:free" reachable as "deepseek-v4.1-flash",
+// and a platform that serves it from a channel group — "cn:deepseek-v4.1-flash"
+// — reachable as "deepseek-v4.1-flash" as well, whichever group answers.
 func modelIdentity(model string) string {
 	if canonical := pattern.Canonical(model); canonical != "" {
 		return canonical
@@ -533,6 +542,11 @@ func modelIdentity(model string) string {
 // itself listed, which is the name that was submitted. A target equal to the
 // exposed name is stored as written; the loader treats the two as the same and
 // the channel then sends the exposed name.
+//
+// The submitted spelling is what the upstream receives, so a model picked as
+// "cn:deepseek-v4.1-flash" is exposed as "deepseek-v4.1-flash" and still sent as
+// "cn:deepseek-v4.1-flash": the group names the line that serves it, and the
+// line has to keep the name that reaches the model.
 func upstreamModelTarget(model string, mapping map[string]string) string {
 	if target := strings.TrimSpace(mapping[model]); target != "" {
 		return target

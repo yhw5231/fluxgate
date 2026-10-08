@@ -3005,7 +3005,8 @@
    * a model rather than a different model, mirroring the gateway's own list. The
    * set is closed on purpose: a colon also writes the channel group a model is
    * served from, in the shape "cn:deepseek-v4.1-flash", and there the name after
-   * it is the model. */
+   * it is the model, so a suffix that is not listed here is not read as a variant
+   * but as the model behind a group. */
   var MODEL_VARIANTS = {
     free: true, nitro: true, thinking: true, online: true,
     extended: true, floor: true, beta: true, 'self-moderated': true
@@ -3021,13 +3022,17 @@
   /* canonicalModelName is the name a model is exposed by, mirroring the
    * gateway's own rule: case, the channel path before the last "/", a known
    * variant suffix after the last ":", and a trailing "-free" are a channel's
-   * own arrangement of the model rather than a different model. */
+   * own arrangement of the model rather than a different model, and the channel
+   * group before the first ":" names the line a platform serves the model from
+   * rather than the model, so what follows that colon is the model itself. */
   function canonicalModelName(value) {
     var name = String(value === null || value === undefined ? '' : value).trim().toLowerCase();
     var slash = name.lastIndexOf('/');
     if (slash >= 0) { name = name.slice(slash + 1); }
     var colon = name.lastIndexOf(':');
     if (colon >= 0 && isModelDecoration(name.slice(colon + 1))) { name = name.slice(0, colon); }
+    var group = name.indexOf(':');
+    if (group > 0 && group < name.length - 1) { name = name.slice(group + 1); }
     if (name.slice(-5) === '-free') { name = name.slice(0, -5); }
     return name;
   }
@@ -3043,8 +3048,10 @@
       '勾选这个上游提供的模型；保存后网关会自动为它们建立路由。模型名会去掉大小写和' +
       '渠道路径（/ 前面）的差别，:free、:nitro 这类已知变体后缀也算同一个模型：' +
       'cline-free/deepseek-v4.1-flash:free 和 DeepSeek-V4.1-Flash 是同一个模型。' +
-      '「上游模型名」填上游认识的写法，留空表示与模型名相同。注意 cn:deepseek-v4.1-flash ' +
-      '这类带渠道分组的名字：冒号后面才是模型本身，不会当成后缀去掉。' +
+      'cn:deepseek-v4.1-flash 这类名字里，第一个冒号前是渠道分组，冒号后面才是模型：' +
+      '模型名是 deepseek-v4.1-flash，「上游模型名」自动填 cn:deepseek-v4.1-flash，' +
+      '发往上游的就是上游列出的写法；同一个模型由多个分组提供时（cn: 与 global:）' +
+      '只留一条，行里标出另一种写法，「上游模型名」可改成想要的那一组。' +
       '「获取模型」按上游最新的列表重建：新出现的模型自动勾选，上游不再提供的自动取消' +
       '勾选并标出。'));
 
@@ -3105,8 +3112,10 @@
 
     /* addModel files a model under the name it is exposed by, which is its
      * canonical form: the same model listed by another upstream as
-     * "cline-free/deepseek-v4.1-flash:free" is one entry, and the spelling this
-     * upstream uses is carried as the name to send it. */
+     * "cline-free/deepseek-v4.1-flash:free" is one entry, a platform that serves
+     * it from a channel group files it as "deepseek-v4.1-flash" rather than as
+     * "cn:deepseek-v4.1-flash", and the spelling this upstream uses is carried
+     * as the name to send it. */
     function addModel(name, checked, target) {
       var listed = String(name || '').trim();
       if (!listed) { return; }
@@ -3115,10 +3124,14 @@
       if (known[exposed]) {
         if (checked) { known[exposed].checked = true; }
         if (target && !known[exposed].target) { known[exposed].target = target; }
+        if (known[exposed].spellings.indexOf(listed) < 0) { known[exposed].spellings.push(listed); }
         return;
       }
       var entry = {
-        name: exposed, listed: listed, checked: checked === true, target: target || '', unlisted: false
+        name: exposed, listed: listed, checked: checked === true, target: target || '', unlisted: false,
+        // spellings are the ways the upstream writes this model — its channel
+        // groups, for a platform that serves it from more than one.
+        spellings: [listed]
       };
       known[exposed] = entry;
       rows.push(entry);
@@ -3154,6 +3167,12 @@
      * the upstream no longer lists is kept and marked but deselected, because a
      * selection that is left on is a route that cannot be reached. What the
      * operator chose for a model the upstream keeps listing is left alone.
+     *
+     * Every spelling of one model is remembered, so a model a platform serves
+     * from two channel groups says so in its row: one entry carries one name to
+     * send, and the group it does not carry is a choice the operator has to be
+     * able to see.
+     *
      * Returns what changed, for the message the probe reports itself with. */
     function applyListing(models) {
       var seen = {};
@@ -3164,8 +3183,12 @@
         var spelling = String(name || '').trim();
         if (!spelling) { return; }
         var exposed = canonicalModelName(spelling);
-        if (!exposed || seen[exposed]) { return; }
-        seen[exposed] = true;
+        if (!exposed) { return; }
+        if (seen[exposed]) {
+          if (seen[exposed].indexOf(spelling) < 0) { seen[exposed].push(spelling); }
+          return;
+        }
+        seen[exposed] = [spelling];
         var entry = known[exposed];
         if (!entry) {
           addModel(spelling, true, '');
@@ -3183,14 +3206,21 @@
       });
       var unlisted = 0;
       rows.forEach(function (entry) {
-        if (seen[entry.name]) { return; }
+        var spellings = seen[entry.name];
+        // 上游这次列出的每一种写法，含没被选中的那一组。
+        entry.spellings = spellings || [entry.listed];
+        if (spellings) { return; }
         entry.unlisted = true;
         // 上游不再提供它了：留着让 operator 看得见，但不能还勾着，否则保存后
         // 会留下一条走不通的路由。
         entry.checked = false;
         unlisted += 1;
       });
-      return { refreshed: refreshed, unlisted: unlisted, added: added, returned: returned };
+      return {
+        refreshed: refreshed, unlisted: unlisted, added: added, returned: returned,
+        // 这次列表归并出多少个模型，与上游返回的记录条数不同就在于渠道分组。
+        models: Object.keys(seen).length
+      };
     }
 
     function visibleRows() {
@@ -3222,6 +3252,15 @@
           // 自己勾选的模型被改掉了。
           label.title = '上游列出的名字：' + entry.listed;
           label.appendChild(element('span', 'model-listed', '（上游写法 ' + entry.listed + '）'));
+        }
+        // 同一个模型由多个渠道分组提供时，一条只带走一个上游模型名；另一种写法
+        // 必须看得见，否则 operator 不知道还有别的分组可选。
+        var others = (entry.spellings || []).filter(function (spelling) {
+          return spelling !== entry.listed && spelling !== entry.target;
+        });
+        if (others.length > 0) {
+          label.title = (label.title ? label.title + '；' : '') + '上游还列出的写法：' + others.join('、');
+          label.appendChild(element('span', 'model-listed', '（上游另有 ' + others.join('、') + '）'));
         }
         if (entry.unlisted) {
           // 上一次获取模型时上游没有列出它：条目留着，但要说清楚，否则 operator
@@ -3288,6 +3327,10 @@
           paint();
           var summary = '上游返回 ' + models.length + ' 个模型' +
             (endpoint ? '（来自 ' + endpoint + '）' : '') + '。';
+          if (listing.models < models.length) {
+            // 同一个模型由多个渠道分组提供时，记录条数比模型个数多。
+            summary += '按渠道分组归并后是 ' + listing.models + ' 个模型。';
+          }
           if (listing.added + listing.returned > 0) {
             summary += '新出现或重新出现的 ' + (listing.added + listing.returned) + ' 个模型已勾选。';
           }

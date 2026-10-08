@@ -36,12 +36,10 @@ func IsExact(pat string) bool {
 
 // variantTags are the colon-separated suffixes that are naming rather than a
 // different model, which is how a router that resells one model under several
-// arrangements spells them: ":free", ":nitro". The set is closed on purpose,
-// because a colon also writes the channel group a platform serves a model from
-// — "cn:deepseek-v4.1-flash" — and a rule that read every suffix as a variant
-// would reduce such a name to its group and give every model of that platform
-// one identity. A suffix that is not listed here stays part of the name, so
-// nothing is ever dropped on a guess.
+// arrangements spells them: ":free", ":nitro". The set is closed on purpose: a
+// suffix that is not listed here stays part of the name, so nothing is ever
+// dropped on a guess, and the colon that is left is read as the channel group
+// instead — see Canonical.
 var variantTags = map[string]struct{}{
 	"free":           {},
 	"nitro":          {},
@@ -72,6 +70,15 @@ func isDecoration(suffix string) bool {
 // arrangement of the model rather than a different model, so dropping them makes
 // the spellings compare equal.
 //
+// A colon that is left is the channel group a platform serves the model from —
+// "cn:deepseek-v4.1-flash", "global:gpt-5.5" — and there the name after it is the
+// model itself: the group says which of a platform's lines serves the model, not
+// which model it is. So the identity is what follows the first colon, which is
+// what lets one model reachable as "deepseek-v4.1-flash" be served by several
+// groups at once. The upstream still receives the spelling it listed, because
+// that spelling travels as the channel's source model rather than in the
+// identity.
+//
 // An empty result means the value carried nothing else, which a caller should
 // treat as no model name at all rather than as one that matches everything.
 func Canonical(value string) string {
@@ -81,6 +88,9 @@ func Canonical(value string) string {
 	}
 	if index := strings.LastIndex(name, ":"); index >= 0 && isDecoration(name[index+1:]) {
 		name = name[:index]
+	}
+	if index := strings.Index(name, ":"); index > 0 && index < len(name)-1 {
+		name = name[index+1:]
 	}
 	return strings.TrimSuffix(name, "-free")
 }

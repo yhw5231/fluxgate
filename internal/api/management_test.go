@@ -494,3 +494,49 @@ func TestManagementUpstreamCarriesPriorityAndCanonicalModelNames(t *testing.T) {
 		t.Errorf("models = %v, want the canonical model listed", listed)
 	}
 }
+
+// A platform that serves its models from channel groups lists them as
+// "cn:<model>". The group names the line that serves the model, so the model is
+// exposed under the name after the colon and the line keeps the group: a client
+// asks for the model, and the upstream is asked for the spelling it serves.
+func TestManagementUpstreamKeepsTheChannelGroupAsTheUpstreamModel(t *testing.T) {
+	server, persistent := managementServer(t)
+
+	created := callManagement(server, http.MethodPost, "/management/configuration/upstreams", "management-secret", map[string]any{
+		"name":   "Grouped",
+		"url":    "https://api.grouped.example.com/v1",
+		"keys":   []string{"grouped-key"},
+		"models": []string{"cn:deepseek-v4-flash"},
+	})
+	if created.status != http.StatusCreated {
+		t.Fatalf("create upstream status = %d, body = %v", created.status, created.body)
+	}
+	row, ok := created.body["row"].(map[string]any)
+	if !ok {
+		t.Fatalf("create upstream response has no row: %v", created.body)
+	}
+	models, _ := row["models"].([]any)
+	if len(models) != 1 || models[0] != "deepseek-v4-flash" {
+		t.Errorf("models = %v, want the model behind the channel group", row["models"])
+	}
+	mapping, _ := row["model_mapping"].(map[string]any)
+	if mapping["deepseek-v4-flash"] != "cn:deepseek-v4-flash" {
+		t.Errorf("model_mapping = %v, want the spelling the upstream serves", row["model_mapping"])
+	}
+
+	// What the gateway routes on is the same pair: the route exposes the model
+	// and its line carries the group's spelling to the upstream.
+	loaded, err := persistent.LoadConfiguration(context.Background())
+	if err != nil {
+		t.Fatalf("LoadConfiguration() error = %v", err)
+	}
+	if len(loaded.Routes) != 1 || loaded.Routes[0].ModelPattern != "deepseek-v4-flash" {
+		t.Fatalf("loaded routes = %+v, want the model exposed under its own name", loaded.Routes)
+	}
+	if len(loaded.Channels) != 1 || loaded.Channels[0].SourceModel != "cn:deepseek-v4-flash" {
+		t.Fatalf("loaded channels = %+v, want the group's spelling forwarded", loaded.Channels)
+	}
+	if len(loaded.Models) != 1 || loaded.Models[0] != "deepseek-v4-flash" {
+		t.Fatalf("loaded models = %v, want the model listed for clients", loaded.Models)
+	}
+}

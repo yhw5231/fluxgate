@@ -768,6 +768,33 @@ func TestConsoleRebuildsTheModelListOnEveryFetch(t *testing.T) {
 	}
 }
 
+// A platform that serves its models from channel groups lists them as
+// "cn:<model>", so the console has to file such a model under the name after the
+// colon and carry the group's spelling as the name to send: the group names the
+// line that serves the model, and the operator picks a model rather than one of a
+// platform's groups.
+func TestConsoleReadsAChannelGroupAsTheLine(t *testing.T) {
+	script := consoleScript(t)
+
+	for _, wanted := range []string{
+		// 第一个冒号前是渠道分组，冒号后面才是模型。
+		"var group = name.indexOf(':')",
+		"name = name.slice(group + 1)",
+		// 表单里说清楚模型名与「上游模型名」各填什么。
+		"cn:deepseek-v4.1-flash",
+		"「上游模型名」自动填",
+		// 同一个模型的另一种分组写法留在行里，operator 才知道还有别的可选。
+		"entry.spellings",
+		"（上游另有 ",
+		// 记录条数与模型个数不同时说清楚是按分组归并的。
+		"按渠道分组归并后是 ",
+	} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("console script is missing %q", wanted)
+		}
+	}
+}
+
 // A create shows the value the gateway would store for an omitted field, so an
 // upstream added in the console is enabled rather than left unset.
 func TestConsoleShowsTheServerDefaultInTheForm(t *testing.T) {
