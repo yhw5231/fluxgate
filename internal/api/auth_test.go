@@ -20,7 +20,7 @@ import (
 
 // fakeSessionStore is an in-memory SessionStore so handler tests do not need a
 // SQLite file. It mirrors the real store's contract: only token hashes are
-// retained, and expired sessions do not authenticate.
+// retained, and a session stays valid until it is revoked.
 type fakeSessionStore struct {
 	mu       sync.Mutex
 	account  admin.Account
@@ -31,7 +31,6 @@ type fakeSessionStore struct {
 
 type fakeSession struct {
 	accountID int64
-	expiresAt time.Time
 }
 
 func newFakeSessionStore(username, password string) *fakeSessionStore {
@@ -61,21 +60,17 @@ func (f *fakeSessionStore) LoadAdminAccount(context.Context) (admin.Account, err
 	return f.account, nil
 }
 
-func (f *fakeSessionStore) CreateAdminSession(_ context.Context, accountID int64, tokenHash string, _ time.Time, expiresAt time.Time) error {
+func (f *fakeSessionStore) CreateAdminSession(_ context.Context, accountID int64, tokenHash string, _ time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.sessions[tokenHash] = fakeSession{accountID: accountID, expiresAt: expiresAt}
+	f.sessions[tokenHash] = fakeSession{accountID: accountID}
 	return nil
 }
 
-func (f *fakeSessionStore) AuthenticateAdminSession(_ context.Context, token string, now time.Time) (admin.Account, error) {
+func (f *fakeSessionStore) AuthenticateAdminSession(_ context.Context, token string) (admin.Account, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	session, ok := f.sessions[admin.HashSessionToken(token)]
-	if !ok {
-		return admin.Account{}, store.ErrSessionNotFound
-	}
-	if !now.UTC().Before(session.expiresAt) {
+	if _, ok := f.sessions[admin.HashSessionToken(token)]; !ok {
 		return admin.Account{}, store.ErrSessionNotFound
 	}
 	return f.account, nil
@@ -162,6 +157,24 @@ func TestLoginIssuesSessionCookieAndAuthorizesManagement(t *testing.T) {
 	handler.ServeHTTP(statusResponse, request)
 	if statusResponse.Code != http.StatusOK {
 		t.Fatalf("management status with a session = %d, want 200", statusResponse.Code)
+	}
+}
+
+// Sign-in must survive a browser restart: the session has no server-side expiry,
+// and the cookie is persistent rather than a browser-session cookie. The cookie
+// is still given a lifetime because a browser keeps nothing forever.
+func TestLoginIssuesAPersistentCookie(t *testing.T) {
+	sessions := newFakeSessionStore("admin", "correct-horse-battery-staple")
+	handler := (&Server{Sessions: sessions}).Handler()
+
+	before := time.Now().UTC()
+	cookie := sessionCookie(t, submitLogin(t, handler, "admin", "correct-horse-battery-staple"))
+
+	if cookie.MaxAge != int(sessionCookieLifetime.Seconds()) {
+		t.Fatalf("cookie MaxAge = %d, want %d", cookie.MaxAge, int(sessionCookieLifetime.Seconds()))
+	}
+	if !cookie.Expires.After(before.Add(24 * time.Hour)) {
+		t.Fatalf("cookie Expires = %v, want a date well beyond a day from %v", cookie.Expires, before)
 	}
 }
 
@@ -561,11 +574,11 @@ func (erroringSessionStore) LoadAdminAccount(context.Context) (admin.Account, er
 	return admin.Account{}, errors.New("boom")
 }
 
-func (erroringSessionStore) CreateAdminSession(context.Context, int64, string, time.Time, time.Time) error {
+func (erroringSessionStore) CreateAdminSession(context.Context, int64, string, time.Time) error {
 	return errors.New("boom")
 }
 
-func (erroringSessionStore) AuthenticateAdminSession(context.Context, string, time.Time) (admin.Account, error) {
+func (erroringSessionStore) AuthenticateAdminSession(context.Context, string) (admin.Account, error) {
 	return admin.Account{}, errors.New("boom")
 }
 

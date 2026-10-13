@@ -78,14 +78,14 @@ type Account struct {
 }
 
 // Session is an issued console session. Token is the raw bearer value returned
-// to the browser; only TokenHash is persisted.
+// to the browser; only TokenHash is persisted. A session carries no expiry: it
+// stays valid until it is revoked by signing out or by a credential reset.
 type Session struct {
 	ID        int64
 	Token     string
 	TokenHash string
 	AccountID int64
 	IssuedAt  time.Time
-	ExpiresAt time.Time
 }
 
 // HashPassword hashes a password for storage.

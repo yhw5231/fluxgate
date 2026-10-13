@@ -436,7 +436,9 @@ The console page itself is unauthenticated so it can render the sign-in form; ev
 data request it makes — reads and writes alike — goes to the authenticated management
 endpoints below. Sign-in issues an HTTP-only session cookie, so no credential is kept
 in JavaScript-accessible storage, and the panel is served with a strict
-Content-Security-Policy, `nosniff`, and framing protection.
+Content-Security-Policy, `nosniff`, and framing protection. The cookie is persistent
+and the session has no server-side expiry, so a sign-in survives a browser restart
+until you sign out or reset the credential.
 
 ### Sign in and the default password
 
@@ -1153,7 +1155,7 @@ go test -race ./...
 - The administrator password is stored as a bcrypt hash and never in plaintext; session tokens are stored only as SHA-256 hashes, so a leaked database cannot be replayed as a live session. Console sign-in is rate limited per client address and every attempt is logged.
 - A gateway with no administrator starts with `admin` / `admin`. That credential cannot read anything until it is changed, because the data endpoints answer `403 password_change_required` to an account holding it. Someone who finds the console before you sign in can therefore still claim the account by setting its password, so on a publicly reachable deployment sign in and change it promptly, or set `FLUXGATE_ADMIN_PASSWORD` to a value only you know before the first start.
 - There is no password strength requirement by design: the gateway will accept a one-character password. Strength is the operator's decision, and the rate limiter plus the audit log are the compensating controls.
-- Console sessions last 12 hours and are revoked by `admin reset` and by signing out. Set `FLUXGATE_MANAGEMENT_TOKEN` only when automation needs to call the management endpoints; leaving it unset means a console session is the only way in.
+- Console sessions do not expire: a session stays valid until it is revoked by `admin reset` or by signing out. The sign-in cookie is persistent, so it survives a browser restart; browsers cap a persistent cookie at 400 days, which is therefore the longest a sign-in lasts before you sign in again. Set `FLUXGATE_MANAGEMENT_TOKEN` only when automation needs to call the management endpoints; leaving it unset means a console session is the only way in.
 - Use a reverse proxy with TLS when exposing the gateway outside a trusted network. Forward `X-Forwarded-Proto` so the session cookie is marked `Secure` behind TLS termination.
 - The gateway trusts `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Prefix` from its peer. Only place it behind a proxy that overwrites those headers, or the login rate limiter can be evaded by spoofing `X-Forwarded-For`. A forged `X-Forwarded-Prefix` cannot escape the origin — unsafe values are rejected — but an accepted one steers where the console redirect lands.
 - Restrict filesystem access to the SQLite database because it contains sensitive account and credential configuration.

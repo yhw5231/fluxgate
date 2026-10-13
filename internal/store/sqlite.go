@@ -299,30 +299,42 @@ func (s *SQLiteStore) EnsureUpstreamSchema(ctx context.Context) error {
 }
 
 // addColumnIfMissing adds a column to a table when an older database predates
-// it. SQLite has no IF NOT EXISTS for a column, so the current shape is compared
-// first.
+// it.
 func (s *SQLiteStore) addColumnIfMissing(ctx context.Context, table, column, definition string) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT name FROM pragma_table_info(?)`, table)
+	exists, err := s.columnExists(ctx, table, column)
 	if err != nil {
-		return fmt.Errorf("inspect %s: %w", table, err)
+		return err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return fmt.Errorf("scan %s column: %w", table, err)
-		}
-		if name == column {
-			return nil
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate %s columns: %w", table, err)
+	if exists {
+		return nil
 	}
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+column+` `+definition); err != nil {
 		return fmt.Errorf("add %s.%s: %w", table, column, err)
 	}
 	return nil
+}
+
+// columnExists reports whether a table already has a column. SQLite has no
+// IF NOT EXISTS for a column, so the current shape is compared instead.
+func (s *SQLiteStore) columnExists(ctx context.Context, table, column string) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return false, fmt.Errorf("inspect %s: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return false, fmt.Errorf("scan %s column: %w", table, err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate %s columns: %w", table, err)
+	}
+	return false, nil
 }
 
 func (s *SQLiteStore) EnsureBreakerSchema(ctx context.Context) error {

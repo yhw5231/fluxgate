@@ -145,10 +145,10 @@ func TestReplaceAdminAccountUpdatesCredentialAndRevokesSessions(t *testing.T) {
 		t.Fatalf("NewSessionToken() error = %v", err)
 	}
 	now := time.Now().UTC()
-	if err := store.CreateAdminSession(ctx, account.ID, tokenHash, now, now.Add(time.Hour)); err != nil {
+	if err := store.CreateAdminSession(ctx, account.ID, tokenHash, now); err != nil {
 		t.Fatalf("CreateAdminSession() error = %v", err)
 	}
-	if _, err := store.AuthenticateAdminSession(ctx, token, now); err != nil {
+	if _, err := store.AuthenticateAdminSession(ctx, token); err != nil {
 		t.Fatalf("the freshly created session did not authenticate: %v", err)
 	}
 
@@ -166,7 +166,7 @@ func TestReplaceAdminAccountUpdatesCredentialAndRevokesSessions(t *testing.T) {
 	if err := admin.VerifyPassword(replaced.PasswordHash, "a-completely-different-password"); err != nil {
 		t.Fatalf("the replaced hash does not verify the new password: %v", err)
 	}
-	if _, err := store.AuthenticateAdminSession(ctx, token, time.Now().UTC()); !errors.Is(err, ErrSessionNotFound) {
+	if _, err := store.AuthenticateAdminSession(ctx, token); !errors.Is(err, ErrSessionNotFound) {
 		t.Fatalf("a session survived the credential reset: error = %v", err)
 	}
 }
@@ -200,11 +200,11 @@ func TestAdminSessionLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSessionToken() error = %v", err)
 	}
-	if err := store.CreateAdminSession(ctx, account.ID, tokenHash, now, now.Add(time.Hour)); err != nil {
+	if err := store.CreateAdminSession(ctx, account.ID, tokenHash, now); err != nil {
 		t.Fatalf("CreateAdminSession() error = %v", err)
 	}
 
-	authenticated, err := store.AuthenticateAdminSession(ctx, token, now)
+	authenticated, err := store.AuthenticateAdminSession(ctx, token)
 	if err != nil {
 		t.Fatalf("AuthenticateAdminSession() error = %v", err)
 	}
@@ -215,7 +215,7 @@ func TestAdminSessionLifecycle(t *testing.T) {
 	if err := store.DeleteAdminSession(ctx, tokenHash); err != nil {
 		t.Fatalf("DeleteAdminSession() error = %v", err)
 	}
-	if _, err := store.AuthenticateAdminSession(ctx, token, now); !errors.Is(err, ErrSessionNotFound) {
+	if _, err := store.AuthenticateAdminSession(ctx, token); !errors.Is(err, ErrSessionNotFound) {
 		t.Fatalf("a revoked session still authenticates: error = %v", err)
 	}
 }
@@ -223,15 +223,14 @@ func TestAdminSessionLifecycle(t *testing.T) {
 func TestAuthenticateAdminSessionRejectsUnknownAndEmptyTokens(t *testing.T) {
 	store, _ := newAdminTestStore(t)
 	ctx := context.Background()
-	now := time.Now().UTC()
 
-	if _, err := store.AuthenticateAdminSession(ctx, "", now); !errors.Is(err, ErrSessionNotFound) {
+	if _, err := store.AuthenticateAdminSession(ctx, ""); !errors.Is(err, ErrSessionNotFound) {
 		t.Errorf("empty token error = %v, want ErrSessionNotFound", err)
 	}
-	if _, err := store.AuthenticateAdminSession(ctx, "   ", now); !errors.Is(err, ErrSessionNotFound) {
+	if _, err := store.AuthenticateAdminSession(ctx, "   "); !errors.Is(err, ErrSessionNotFound) {
 		t.Errorf("blank token error = %v, want ErrSessionNotFound", err)
 	}
-	if _, err := store.AuthenticateAdminSession(ctx, "not-a-real-token", now); !errors.Is(err, ErrSessionNotFound) {
+	if _, err := store.AuthenticateAdminSession(ctx, "not-a-real-token"); !errors.Is(err, ErrSessionNotFound) {
 		t.Errorf("unknown token error = %v, want ErrSessionNotFound", err)
 	}
 }
@@ -247,7 +246,7 @@ func TestAdminSessionStoresOnlyTheTokenHash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSessionToken() error = %v", err)
 	}
-	if err := store.CreateAdminSession(ctx, account.ID, tokenHash, now, now.Add(time.Hour)); err != nil {
+	if err := store.CreateAdminSession(ctx, account.ID, tokenHash, now); err != nil {
 		t.Fatalf("CreateAdminSession() error = %v", err)
 	}
 
@@ -263,66 +262,86 @@ func TestAdminSessionStoresOnlyTheTokenHash(t *testing.T) {
 	}
 }
 
-func TestAuthenticateAdminSessionRejectsExpiredSession(t *testing.T) {
+// A session carries no expiry, so a token issued long ago still authenticates
+// until it is explicitly revoked.
+func TestAuthenticateAdminSessionDoesNotExpire(t *testing.T) {
 	store, account := newAdminTestStore(t)
 	ctx := context.Background()
-	issuedAt := time.Now().UTC().Add(-2 * time.Hour)
 
 	token, tokenHash, err := admin.NewSessionToken()
 	if err != nil {
 		t.Fatalf("NewSessionToken() error = %v", err)
 	}
-	// Expired one hour ago.
-	if err := store.CreateAdminSession(ctx, account.ID, tokenHash, issuedAt, issuedAt.Add(time.Hour)); err != nil {
+	issuedAt := time.Now().UTC().AddDate(-5, 0, 0)
+	if err := store.CreateAdminSession(ctx, account.ID, tokenHash, issuedAt); err != nil {
 		t.Fatalf("CreateAdminSession() error = %v", err)
 	}
 
-	if _, err := store.AuthenticateAdminSession(ctx, token, time.Now().UTC()); !errors.Is(err, ErrSessionNotFound) {
-		t.Fatalf("an expired session authenticated: error = %v", err)
+	authenticated, err := store.AuthenticateAdminSession(ctx, token)
+	if err != nil {
+		t.Fatalf("a session issued five years ago was refused: %v", err)
 	}
-
-	// The expired session is cleaned up rather than left to be retried.
-	var remaining int
-	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM gateway_admin_sessions`).Scan(&remaining); err != nil {
-		t.Fatalf("count sessions: %v", err)
-	}
-	if remaining != 0 {
-		t.Fatalf("expired session rows remaining = %d, want 0", remaining)
+	if authenticated.ID != account.ID {
+		t.Fatalf("authenticated account ID = %d, want %d", authenticated.ID, account.ID)
 	}
 }
 
-func TestCleanupAdminSessions(t *testing.T) {
+// A database created by a version that gave sessions an expiry must lose the
+// column, and the rows must survive the rebuild so nobody is signed out by the
+// upgrade.
+func TestEnsureAdminSchemaDropsTheSessionExpiryColumn(t *testing.T) {
 	store, account := newAdminTestStore(t)
 	ctx := context.Background()
+
+	// Reproduce the previous shape with a live row, then migrate.
+	token, tokenHash, err := admin.NewSessionToken()
+	if err != nil {
+		t.Fatalf("NewSessionToken() error = %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DROP TABLE gateway_admin_sessions`); err != nil {
+		t.Fatalf("drop the current session table: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `CREATE TABLE gateway_admin_sessions (
+		id INTEGER PRIMARY KEY,
+		token_hash TEXT NOT NULL UNIQUE,
+		account_id INTEGER NOT NULL,
+		issued_at TEXT NOT NULL,
+		expires_at TEXT NOT NULL
+	)`); err != nil {
+		t.Fatalf("create legacy session table: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx,
+		`CREATE INDEX gateway_admin_sessions_expires_at_idx ON gateway_admin_sessions(expires_at)`); err != nil {
+		t.Fatalf("create legacy session index: %v", err)
+	}
 	now := time.Now().UTC()
-
-	expiredToken, expiredHash, err := admin.NewSessionToken()
-	if err != nil {
-		t.Fatalf("NewSessionToken() error = %v", err)
-	}
-	liveToken, liveHash, err := admin.NewSessionToken()
-	if err != nil {
-		t.Fatalf("NewSessionToken() error = %v", err)
-	}
-	if err := store.CreateAdminSession(ctx, account.ID, expiredHash, now.Add(-2*time.Hour), now.Add(-time.Hour)); err != nil {
-		t.Fatalf("CreateAdminSession() expired error = %v", err)
-	}
-	if err := store.CreateAdminSession(ctx, account.ID, liveHash, now, now.Add(time.Hour)); err != nil {
-		t.Fatalf("CreateAdminSession() live error = %v", err)
+	if _, err := store.db.ExecContext(ctx,
+		`INSERT INTO gateway_admin_sessions (token_hash, account_id, issued_at, expires_at) VALUES (?, ?, ?, ?)`,
+		tokenHash, account.ID, now.Format(time.RFC3339Nano), now.Add(-time.Hour).Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("insert legacy session: %v", err)
 	}
 
-	removed, err := store.CleanupAdminSessions(ctx, now)
+	if err := store.EnsureAdminSchema(ctx); err != nil {
+		t.Fatalf("EnsureAdminSchema() on a legacy session table error = %v", err)
+	}
+
+	legacy, err := store.columnExists(ctx, "gateway_admin_sessions", "expires_at")
 	if err != nil {
-		t.Fatalf("CleanupAdminSessions() error = %v", err)
+		t.Fatalf("columnExists() error = %v", err)
 	}
-	if removed != 1 {
-		t.Fatalf("removed = %d, want 1", removed)
+	if legacy {
+		t.Fatal("the expires_at column survived the migration")
 	}
-	if _, err := store.AuthenticateAdminSession(ctx, expiredToken, now); !errors.Is(err, ErrSessionNotFound) {
-		t.Errorf("the expired session survived cleanup: %v", err)
+
+	// The row came across, so an operator signed in before the upgrade stays
+	// signed in even though its old expiry has passed.
+	if _, err := store.AuthenticateAdminSession(ctx, token); err != nil {
+		t.Fatalf("the migrated session no longer authenticates: %v", err)
 	}
-	if _, err := store.AuthenticateAdminSession(ctx, liveToken, now); err != nil {
-		t.Errorf("cleanup removed a live session: %v", err)
+
+	// Running it again must stay a no-op.
+	if err := store.EnsureAdminSchema(ctx); err != nil {
+		t.Fatalf("EnsureAdminSchema() is not idempotent: %v", err)
 	}
 }
 
@@ -336,7 +355,7 @@ func TestDeleteAllAdminSessions(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewSessionToken() error = %v", err)
 		}
-		if err := store.CreateAdminSession(ctx, account.ID, tokenHash, now, now.Add(time.Hour)); err != nil {
+		if err := store.CreateAdminSession(ctx, account.ID, tokenHash, now); err != nil {
 			t.Fatalf("CreateAdminSession() error = %v", err)
 		}
 	}
@@ -441,7 +460,7 @@ func TestChangeAdminPasswordClearsChangeRequiredAndKeepsSessions(t *testing.T) {
 		t.Fatalf("NewSessionToken() error = %v", err)
 	}
 	now := time.Now().UTC()
-	if err := store.CreateAdminSession(ctx, account.ID, tokenHash, now, now.Add(time.Hour)); err != nil {
+	if err := store.CreateAdminSession(ctx, account.ID, tokenHash, now); err != nil {
 		t.Fatalf("CreateAdminSession() error = %v", err)
 	}
 

@@ -18,16 +18,21 @@ import (
 // is satisfied by the SQLite store; tests substitute an in-memory double.
 type SessionStore interface {
 	LoadAdminAccount(context.Context) (admin.Account, error)
-	CreateAdminSession(ctx context.Context, accountID int64, tokenHash string, issuedAt, expiresAt time.Time) error
-	AuthenticateAdminSession(ctx context.Context, token string, now time.Time) (admin.Account, error)
+	CreateAdminSession(ctx context.Context, accountID int64, tokenHash string, issuedAt time.Time) error
+	AuthenticateAdminSession(ctx context.Context, token string) (admin.Account, error)
 	DeleteAdminSession(ctx context.Context, tokenHash string) error
 	ChangeAdminPassword(ctx context.Context, accountID int64, passwordHash string) error
 }
 
-// Console session lifetime. A session is a convenience for the operator, not a
-// long-lived API credential, so it expires on its own.
+// A console session has no expiry: it stays valid until it is revoked by signing
+// out or by an administrator credential reset.
+//
+// The cookie still carries a lifetime, because a browser will not keep a cookie
+// forever. Browsers clamp a persistent cookie to 400 days (Chrome and Firefox
+// shorten anything longer), so that is the longest a sign-in can survive without
+// the browser discarding the cookie; after that the operator signs in again.
 const (
-	sessionLifetime = 12 * time.Hour
+	sessionCookieLifetime = 400 * 24 * time.Hour
 
 	// loginMaxAttempts and loginLockout bound online password guessing per
 	// client address.
@@ -300,8 +305,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
-	expiresAt := now.Add(sessionLifetime)
-	if err := s.Sessions.CreateAdminSession(r.Context(), account.ID, tokenHash, now, expiresAt); err != nil {
+	if err := s.Sessions.CreateAdminSession(r.Context(), account.ID, tokenHash, now); err != nil {
 		writeError(w, http.StatusInternalServerError, "authentication_failed", "could not store the session")
 		return
 	}
@@ -314,8 +318,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 		Secure:   requestIsHTTPS(r),
-		Expires:  expiresAt,
-		MaxAge:   int(sessionLifetime.Seconds()),
+		Expires:  now.Add(sessionCookieLifetime),
+		MaxAge:   int(sessionCookieLifetime.Seconds()),
 	})
 	s.logAuthEvent(r, "console_login_succeeded", account.Username)
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -358,7 +362,7 @@ func (s *Server) currentSession(r *http.Request) (admin.Account, bool) {
 	if err != nil || strings.TrimSpace(cookie.Value) == "" {
 		return admin.Account{}, false
 	}
-	account, err := s.Sessions.AuthenticateAdminSession(r.Context(), cookie.Value, time.Now().UTC())
+	account, err := s.Sessions.AuthenticateAdminSession(r.Context(), cookie.Value)
 	if err != nil {
 		return admin.Account{}, false
 	}

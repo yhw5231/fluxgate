@@ -21,7 +21,7 @@ var ErrNoAdminAccount = errors.New("no administrator account has been created")
 // instead.
 var ErrAdminAccountExists = errors.New("an administrator account already exists")
 
-// ErrSessionNotFound reports an unknown, expired, or revoked session token.
+// ErrSessionNotFound reports an unknown or revoked session token.
 var ErrSessionNotFound = errors.New("session is not valid")
 
 // adminSchemaDDL creates the gateway-owned authentication tables. These are not
@@ -36,14 +36,14 @@ var adminSchemaDDL = []string{
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL
 	)`,
+	// A session carries no expiry. It stays valid until it is revoked by signing
+	// out or by a credential reset, so the row records only when it was issued.
 	`CREATE TABLE IF NOT EXISTS gateway_admin_sessions (
 		id INTEGER PRIMARY KEY,
 		token_hash TEXT NOT NULL UNIQUE,
 		account_id INTEGER NOT NULL,
-		issued_at TEXT NOT NULL,
-		expires_at TEXT NOT NULL
+		issued_at TEXT NOT NULL
 	)`,
-	`CREATE INDEX IF NOT EXISTS gateway_admin_sessions_expires_at_idx ON gateway_admin_sessions(expires_at)`,
 }
 
 // EnsureAdminSchema prepares the authentication tables at startup and brings a
@@ -58,6 +58,52 @@ func (s *SQLiteStore) EnsureAdminSchema(ctx context.Context) error {
 	// not forced through a password change it does not need.
 	if err := s.addColumnIfMissing(ctx, "gateway_admin_users", "change_required", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
+	}
+	return s.dropSessionExpiryColumn(ctx)
+}
+
+// dropSessionExpiryColumn removes the expires_at column a database created by an
+// earlier version still carries, along with the index that served it. SQLite
+// cannot drop a column an index depends on, so the table is rebuilt once; the
+// rows are copied, which keeps every signed-in operator signed in across the
+// upgrade.
+func (s *SQLiteStore) dropSessionExpiryColumn(ctx context.Context) error {
+	legacy, err := s.columnExists(ctx, "gateway_admin_sessions", "expires_at")
+	if err != nil {
+		return err
+	}
+	if !legacy {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("rebuild gateway_admin_sessions: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// A previous attempt that failed partway can leave the scratch table behind,
+	// so it is cleared before being created again.
+	statements := []string{
+		`DROP TABLE IF EXISTS gateway_admin_sessions_current`,
+		`CREATE TABLE gateway_admin_sessions_current (
+			id INTEGER PRIMARY KEY,
+			token_hash TEXT NOT NULL UNIQUE,
+			account_id INTEGER NOT NULL,
+			issued_at TEXT NOT NULL
+		)`,
+		`INSERT INTO gateway_admin_sessions_current (id, token_hash, account_id, issued_at)
+			SELECT id, token_hash, account_id, issued_at FROM gateway_admin_sessions`,
+		`DROP TABLE gateway_admin_sessions`,
+		`ALTER TABLE gateway_admin_sessions_current RENAME TO gateway_admin_sessions`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("rebuild gateway_admin_sessions: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("rebuild gateway_admin_sessions: %w", err)
 	}
 	return nil
 }
@@ -229,23 +275,23 @@ func (s *SQLiteStore) LoadAdminAccount(ctx context.Context) (admin.Account, erro
 
 // CreateAdminSession persists a new session for the account. Only the token
 // hash is written; the raw token lives in the client's cookie.
-func (s *SQLiteStore) CreateAdminSession(ctx context.Context, accountID int64, tokenHash string, issuedAt, expiresAt time.Time) error {
+func (s *SQLiteStore) CreateAdminSession(ctx context.Context, accountID int64, tokenHash string, issuedAt time.Time) error {
 	if strings.TrimSpace(tokenHash) == "" {
 		return errors.New("session token hash must not be empty")
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO gateway_admin_sessions (token_hash, account_id, issued_at, expires_at) VALUES (?, ?, ?, ?)`,
-		tokenHash, accountID, formatTime(issuedAt), formatTime(expiresAt))
+		`INSERT INTO gateway_admin_sessions (token_hash, account_id, issued_at) VALUES (?, ?, ?)`,
+		tokenHash, accountID, formatTime(issuedAt))
 	if err != nil {
 		return fmt.Errorf("create admin session: %w", err)
 	}
 	return nil
 }
 
-// AuthenticateAdminSession resolves a session token to its account, rejecting
-// sessions that have expired. The caller passes the raw token; hashing happens
-// here so a raw token is never compared against stored rows.
-func (s *SQLiteStore) AuthenticateAdminSession(ctx context.Context, token string, now time.Time) (admin.Account, error) {
+// AuthenticateAdminSession resolves a session token to its account. A session
+// has no expiry, so it is refused only when it is unknown, which covers both a
+// token that never existed and one that was revoked.
+func (s *SQLiteStore) AuthenticateAdminSession(ctx context.Context, token string) (admin.Account, error) {
 	token = strings.TrimSpace(token)
 	if token == "" {
 		return admin.Account{}, ErrSessionNotFound
@@ -256,10 +302,9 @@ func (s *SQLiteStore) AuthenticateAdminSession(ctx context.Context, token string
 	hash := admin.HashSessionToken(token)
 
 	var accountID int64
-	var expiresAt string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT account_id, expires_at FROM gateway_admin_sessions WHERE token_hash = ?`, hash,
-	).Scan(&accountID, &expiresAt)
+		`SELECT account_id FROM gateway_admin_sessions WHERE token_hash = ?`, hash,
+	).Scan(&accountID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return admin.Account{}, ErrSessionNotFound
 	}
@@ -267,22 +312,10 @@ func (s *SQLiteStore) AuthenticateAdminSession(ctx context.Context, token string
 		return admin.Account{}, fmt.Errorf("load admin session: %w", err)
 	}
 
-	expiry, err := parseTime(expiresAt)
-	if err != nil {
-		return admin.Account{}, fmt.Errorf("parse admin session expiry: %w", err)
-	}
-
 	// The indexed equality lookup is the authentication step. A constant-time
 	// comparison would add nothing here: the stored value is a SHA-256 of a
 	// 32-byte random token, so there is no guessable structure for an attacker
 	// to steer toward a partial match.
-	if !now.UTC().Before(expiry) {
-		// Clean up lazily so an expired session cannot be replayed even if the
-		// periodic sweep has not run yet.
-		_ = s.DeleteAdminSession(ctx, hash)
-		return admin.Account{}, ErrSessionNotFound
-	}
-
 	account, err := s.LoadAdminAccount(ctx)
 	if err != nil {
 		return admin.Account{}, err
@@ -309,15 +342,6 @@ func (s *SQLiteStore) DeleteAllAdminSessions(ctx context.Context) error {
 		return fmt.Errorf("delete all admin sessions: %w", err)
 	}
 	return nil
-}
-
-// CleanupAdminSessions removes sessions that expired before the given time.
-func (s *SQLiteStore) CleanupAdminSessions(ctx context.Context, before time.Time) (int64, error) {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM gateway_admin_sessions WHERE expires_at < ?`, formatTime(before))
-	if err != nil {
-		return 0, fmt.Errorf("cleanup admin sessions: %w", err)
-	}
-	return result.RowsAffected()
 }
 
 func formatTime(value time.Time) string {

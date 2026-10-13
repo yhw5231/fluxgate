@@ -643,7 +643,7 @@
       }
       setSubmitting(button, false, '保存');
       button.disabled = false;
-      if (result.status === 401) { showAuth('登录状态已过期，请重新登录后继续。'); return; }
+      if (result.status === 401) { showAuth('登录状态已失效，请重新登录后继续。'); return; }
       if (result.status === 400) {
         input.value = formatWeight(stored);
         showBanner(options.label + '未保存', errorMessage(result.body, options.label + '的取值不合法。'));
@@ -805,7 +805,7 @@
     return post('/management/configuration/keys/' + row.id + '/reveal', {}).then(function (result) {
       if (result.ok && result.body && result.body.key) { return String(result.body.key); }
       if (result.status === 401) {
-        showAuth('登录状态已过期，请重新登录后继续。');
+        showAuth('登录状态已失效，请重新登录后继续。');
         return null;
       }
       showBanner('读取密钥失败', errorMessage(result.body, '网关拒绝了这次读取。'));
@@ -987,7 +987,7 @@
    * The session lives in an HTTP-only cookie set by the gateway, so this script
    * never holds a credential it could leak. It asks the gateway who it is
    * instead of remembering, which also means a session revoked elsewhere
-   * (a password reset, an expiry) is noticed on the next request. */
+   * (a password reset, a sign-out) is noticed on the next request. */
 
   function showAuth(message) {
     stopAutoRefresh();
@@ -1295,7 +1295,7 @@
       var configuration = configurationIndex === -1 ? null : results[configurationIndex];
 
       if (status.status === 401 || snapshot.status === 401) {
-        showAuth('登录状态已过期，请重新登录后继续。');
+        showAuth('登录状态已失效，请重新登录后继续。');
         return;
       }
       // The gateway refuses data to an account that still holds the default
@@ -1567,7 +1567,7 @@
         refresh();
         return;
       }
-      if (result.status === 401) { showAuth('登录状态已过期，请重新登录后继续。'); return; }
+      if (result.status === 401) { showAuth('登录状态已失效，请重新登录后继续。'); return; }
       showBanner('恢复失败', errorMessage(result.body, '网关拒绝了这次恢复。'));
     }).catch(function (err) {
       setSubmitting(button, false, '恢复');
@@ -1585,7 +1585,7 @@
         refresh();
         return;
       }
-      if (result.status === 401) { showAuth('登录状态已过期，请重新登录后继续。'); return; }
+      if (result.status === 401) { showAuth('登录状态已失效，请重新登录后继续。'); return; }
       showBanner('恢复失败', errorMessage(result.body, '网关拒绝了这次恢复。'));
     }).catch(function (err) {
       setSubmitting(els.breakersResetAll, false, '全部恢复');
@@ -2172,7 +2172,7 @@
     chain.then(function () {
       setSubmitting(button, false, '清除冷却');
       if (failed) {
-        if (failed.status === 401) { showAuth('登录状态已过期，请重新登录后继续。'); return; }
+        if (failed.status === 401) { showAuth('登录状态已失效，请重新登录后继续。'); return; }
         showBanner('清除冷却失败', errorMessage(failed.body, '网关拒绝了这次清除。'));
         if (cleared > 0) { refresh(); }
         return;
@@ -2573,7 +2573,7 @@
       return null;
     }
     if (result.status === 401) {
-      showAuth('登录状态已过期，请重新登录后继续。');
+      showAuth('登录状态已失效，请重新登录后继续。');
       return null;
     }
     throw new Error(errorMessage(result.body, '清空请求记录失败。'));
@@ -3344,7 +3344,7 @@
           return;
         }
         status.textContent = '';
-        if (result.status === 401) { showAuth('登录状态已过期，请重新登录后继续。'); return; }
+        if (result.status === 401) { showAuth('登录状态已失效，请重新登录后继续。'); return; }
         showFeedback(els.editorFeedback, errorMessage(result.body, '获取模型失败。'), 'error');
       }).catch(function (err) {
         setSubmitting(button, false, '获取模型');
@@ -3911,7 +3911,7 @@
       }
       if (result.status === 401) {
         closeEditor();
-        showAuth('登录状态已过期，请重新登录后继续。');
+        showAuth('登录状态已失效，请重新登录后继续。');
         return;
       }
       var field = fieldErrorField(result.body);
@@ -3947,7 +3947,7 @@
         return null;
       }
       if (result.status === 401) {
-        showAuth('登录状态已过期，请重新登录后继续。');
+        showAuth('登录状态已失效，请重新登录后继续。');
         return null;
       }
       throw new Error(errorMessage(result.body, '删除失败。'));
@@ -3979,7 +3979,7 @@
         return null;
       }
       if (result.status === 401) {
-        showAuth('登录状态已过期，请重新登录后继续。');
+        showAuth('登录状态已失效，请重新登录后继续。');
         return null;
       }
       throw new Error(errorMessage(result.body, '轮换失败。'));
@@ -4242,7 +4242,7 @@
         showNotice(restore ? '已恢复默认设置。' : '运行策略已保存，立即生效。');
         return;
       }
-      if (result.status === 401) { showAuth('登录状态已过期，请重新登录后继续。'); return; }
+      if (result.status === 401) { showAuth('登录状态已失效，请重新登录后继续。'); return; }
       showFeedback(feedback, errorMessage(result.body, '网关拒绝了这次修改。'), 'error');
     }).catch(function (err) {
       setSubmitting(button, false, idleLabel);
