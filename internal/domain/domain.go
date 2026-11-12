@@ -394,6 +394,12 @@ type Request struct {
 	// generation is bounded by the gateway's media timeout rather than by the
 	// per-channel default a chat completion is bounded by.
 	Timeout time.Duration
+	// Stream marks a request whose answer the client reads as it arrives. Such an
+	// answer is bounded by silence rather than by a deadline: it may take as long
+	// as the model needs, but the upstream may not stop sending, because a
+	// whole-request deadline would cut a healthy long answer off and leave the
+	// upstream recording a request it was asked to cancel.
+	Stream bool
 	// RequestID identifies this downstream request. It travels into every attempt
 	// the request makes, which is what lets a circuit count one failing request
 	// once instead of once per attempt, and it is what a record of the request is

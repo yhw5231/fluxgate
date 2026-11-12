@@ -149,6 +149,7 @@ func run(parent context.Context, logger *slog.Logger) error {
 		ProxyResolver:      proxyResolver,
 		TransportPool:      transportPool,
 		MediaTransportPool: mediaTransportPool,
+		StreamIdleTimeout:  cfg.StreamIdleTimeout,
 		Policy:             cfg.Retry,
 		Failover:           &cfg.Failover,
 	}
@@ -176,6 +177,7 @@ func run(parent context.Context, logger *slog.Logger) error {
 		PolicyDefaults:      cfg.Policy(),
 		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,
 		MediaRequestTimeout: cfg.MediaRequestTimeout,
+		StreamKeepAlive:     cfg.StreamKeepAlive,
 		Logger:              logger,
 		StartedAt:           time.Now().UTC(),
 	}

@@ -14,14 +14,33 @@ import (
 )
 
 const (
-	defaultAddress               = ":8081"
-	defaultDatabasePath          = "../data/hub.db"
-	defaultMaxRequestBodyBytes   = int64(8 << 20)
-	defaultRequestTimeout        = 60 * time.Second
-	defaultMediaRequestTimeout   = 10 * time.Minute
-	defaultConnectTimeout        = 10 * time.Second
-	defaultTLSHandshakeTimeout   = 10 * time.Second
-	defaultResponseHeaderTimeout = 30 * time.Second
+	defaultAddress             = ":8081"
+	defaultDatabasePath        = "../data/hub.db"
+	defaultMaxRequestBodyBytes = int64(8 << 20)
+	// defaultRequestTimeout bounds one upstream attempt end to end for a request
+	// that is answered as a single body. It is a limit on how long a model may
+	// take to answer, not a limit on how long the caller waits: a reasoning model
+	// regularly needs several minutes, and a gateway that gave up at the sixty
+	// seconds this used to be turned every long answer into a canceled request at
+	// the upstream.
+	defaultRequestTimeout = 5 * time.Minute
+	// defaultStreamIdleTimeout bounds how long a streamed answer may go without a
+	// byte from the upstream. A stream is bounded by silence rather than by total
+	// duration, so a long answer is served while a stalled upstream is given up.
+	defaultStreamIdleTimeout = 2 * time.Minute
+	// defaultStreamKeepAlive is how often a silent event stream is reminded that it
+	// is alive, which is what keeps a client or an intermediary proxy from hanging
+	// up on a reasoning model that is thinking.
+	defaultStreamKeepAlive     = 15 * time.Second
+	defaultMediaRequestTimeout = 10 * time.Minute
+	defaultConnectTimeout      = 10 * time.Second
+	defaultTLSHandshakeTimeout = 10 * time.Second
+	// defaultResponseHeaderTimeout is zero on purpose: the per-attempt request
+	// timeout already bounds how long the upstream may take to start answering,
+	// and a second, shorter bound underneath it cut requests off before that
+	// timeout could apply — the upstream then saw a canceled request while the
+	// gateway was still waiting as intended.
+	defaultResponseHeaderTimeout = 0
 	defaultIdleConnTimeout       = 90 * time.Second
 	defaultReadHeaderTimeout     = 10 * time.Second
 	defaultReadTimeout           = 30 * time.Second
@@ -38,6 +57,14 @@ type Config struct {
 	ManagementToken     string
 	MaxRequestBodyBytes int64
 	RequestTimeout      time.Duration
+	// StreamIdleTimeout bounds how long a streamed answer may be silent before the
+	// gateway gives up on the upstream. A stream is not held to the request
+	// timeout above, because a long answer would be cut off as if it had failed.
+	StreamIdleTimeout time.Duration
+	// StreamKeepAlive is the heartbeat written into a silent event stream, so the
+	// caller and any proxy in front of the gateway do not decide the request has
+	// stalled. Zero switches it off.
+	StreamKeepAlive time.Duration
 	// MediaRequestTimeout bounds one generation request — an image or a video —
 	// whose upstream works longer than a chat completion takes to answer.
 	MediaRequestTimeout   time.Duration
@@ -84,6 +111,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.RequestTimeout, err = durationEnv("FLUXGATE_REQUEST_TIMEOUT", cfg.RequestTimeout, true); err != nil {
+		return Config{}, err
+	}
+	if cfg.StreamIdleTimeout, err = durationEnv("FLUXGATE_STREAM_IDLE_TIMEOUT", cfg.StreamIdleTimeout, true); err != nil {
+		return Config{}, err
+	}
+	if cfg.StreamKeepAlive, err = durationEnv("FLUXGATE_STREAM_KEEPALIVE", cfg.StreamKeepAlive, false); err != nil {
 		return Config{}, err
 	}
 	if cfg.MediaRequestTimeout, err = durationEnv("FLUXGATE_MEDIA_REQUEST_TIMEOUT", cfg.MediaRequestTimeout, true); err != nil {
@@ -166,6 +199,18 @@ func Load() (Config, error) {
 	if cfg.Retry.MaxAttemptsPerChannel > cfg.Retry.MaxAttempts {
 		return Config{}, errors.New("FLUXGATE_MAX_ATTEMPTS_PER_CHANNEL must not exceed FLUXGATE_MAX_ATTEMPTS")
 	}
+	// A generation outlives an answer: an upstream that produces an artifact
+	// answers far later than one that answers a chat completion, so a media
+	// timeout that is not longer than the request timeout would fail every image
+	// and video before the request timeout could matter.
+	if cfg.MediaRequestTimeout <= cfg.RequestTimeout {
+		return Config{}, errors.New("FLUXGATE_MEDIA_REQUEST_TIMEOUT must be greater than FLUXGATE_REQUEST_TIMEOUT")
+	}
+	// A heartbeat that arrives after the stream has already been given up is of no
+	// use to the caller, so it has to be shorter than the silence it is covering.
+	if cfg.StreamKeepAlive > 0 && cfg.StreamKeepAlive >= cfg.StreamIdleTimeout {
+		return Config{}, errors.New("FLUXGATE_STREAM_KEEPALIVE must be less than FLUXGATE_STREAM_IDLE_TIMEOUT")
+	}
 	if cfg.Retry.MaxBackoff < cfg.Retry.BaseBackoff {
 		return Config{}, errors.New("FLUXGATE_RETRY_MAX_BACKOFF must not be less than FLUXGATE_RETRY_BASE_BACKOFF")
 	}
@@ -188,6 +233,8 @@ func Default() Config {
 		DatabasePath:          defaultDatabasePath,
 		MaxRequestBodyBytes:   defaultMaxRequestBodyBytes,
 		RequestTimeout:        defaultRequestTimeout,
+		StreamIdleTimeout:     defaultStreamIdleTimeout,
+		StreamKeepAlive:       defaultStreamKeepAlive,
 		MediaRequestTimeout:   defaultMediaRequestTimeout,
 		ConnectTimeout:        defaultConnectTimeout,
 		TLSHandshakeTimeout:   defaultTLSHandshakeTimeout,

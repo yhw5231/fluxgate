@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode"
@@ -25,6 +26,19 @@ const (
 	// reads.
 	errorSnippetBytes = 512
 )
+
+// DefaultStreamIdleTimeout bounds how long a streamed answer may go without a byte
+// from the upstream. A stream is bounded by silence, not by duration: a reasoning
+// model may think for minutes before its first token, and a long answer may take
+// longer still, while an upstream that has stopped sending is never going to
+// resume. Holding a stream to a whole-request deadline instead would cut healthy
+// answers off, which the upstream records as a request it was asked to cancel.
+const DefaultStreamIdleTimeout = 2 * time.Minute
+
+// ErrStreamSilent reports a streamed attempt given up because the upstream stopped
+// sending: it either never started answering, or went quiet for longer than the
+// idle bound.
+var ErrStreamSilent = errors.New("upstream stream went silent")
 
 // Result contains the final upstream response and the successful attempt.
 type Result struct {
@@ -60,7 +74,12 @@ type Engine struct {
 	// upstream had gone silent. When either is nil the ordinary client is used.
 	MediaClient        *http.Client
 	MediaTransportPool *TransportPool
-	Policy             domain.RetryPolicy
+	// StreamIdleTimeout bounds how long a streamed answer may be silent before the
+	// attempt is given up. A stream is not held to a whole-request deadline,
+	// because a long answer would be cut off as if the upstream had failed. When
+	// zero, DefaultStreamIdleTimeout is used.
+	StreamIdleTimeout time.Duration
+	Policy            domain.RetryPolicy
 	// Failover is the static failover configuration. A nil value means the
 	// engine's own default: a failed channel may be replaced by any other
 	// eligible one.
@@ -120,6 +139,10 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 	if now == nil {
 		now = time.Now
 	}
+	streamIdle := e.StreamIdleTimeout
+	if streamIdle <= 0 {
+		streamIdle = DefaultStreamIdleTimeout
+	}
 
 	excluded := make(map[string]struct{})
 	attemptsByChannel := make(map[string]int)
@@ -170,16 +193,17 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 		if err != nil {
 			return Result{Trace: trace}, err
 		}
-		request, cancelRequest, err := buildRequest(ctx, input, channel, body)
+		call, err := buildRequest(ctx, input, channel, body, streamIdle)
 		if err != nil {
 			return Result{Trace: trace}, err
 		}
+		request := call.request
 
 		dispatchClient := client
 		if e.ProxyResolver != nil {
 			resolved, resolveErr := e.ProxyResolver.Resolve(ProxyRequest{KeyID: channel.APIKey, TargetURL: request.URL})
 			if resolveErr != nil {
-				cancelRequest()
+				call.cancel()
 				return Result{Trace: trace}, resolveErr
 			}
 			pool := e.TransportPool
@@ -191,17 +215,19 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 			}
 			dispatchClient, err = pool.Client(resolved)
 			if err != nil {
-				cancelRequest()
+				call.cancel()
 				return Result{Trace: trace}, err
 			}
 		}
 
 		response, dispatchErr := dispatchClient.Do(request)
-		if response != nil {
-			response.Body = &cancelReadCloser{ReadCloser: response.Body, cancel: cancelRequest}
-		} else {
-			cancelRequest()
+		if dispatchErr != nil && call.silent() {
+			// The attempt failed because the upstream never started answering. The
+			// transport reports that as a canceled context, which says nothing about
+			// who canceled it, so the bound that actually expired is named here.
+			dispatchErr = fmt.Errorf("%w: the upstream did not start answering within %s", ErrStreamSilent, call.firstByte)
 		}
+		call.answer(response, streamIdle)
 		traced.DurationMS = now().Sub(attempt.StartedAt).Milliseconds()
 		if dispatchErr == nil && response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
 			traced.StatusCode = response.StatusCode
@@ -289,10 +315,58 @@ func (e *Engine) selectionRequest(input domain.Request, excluded map[string]stru
 	return request
 }
 
-func buildRequest(ctx context.Context, input domain.Request, channel domain.Channel, body transform.Body) (*http.Request, context.CancelFunc, error) {
+// upstreamCall is one prepared attempt: the request, the cancel that ends it, and
+// the watchdog that bounds a streamed answer by silence rather than by duration.
+type upstreamCall struct {
+	request *http.Request
+	cancel  context.CancelFunc
+	// guard is nil for an attempt that is read as one body, which its context
+	// deadline bounds instead.
+	guard *silenceGuard
+	// firstByte is how long the upstream was given to start answering, kept so a
+	// failure to do so can say which bound it missed.
+	firstByte time.Duration
+}
+
+// silent reports whether the attempt was given up because the upstream stopped
+// sending, as opposed to being canceled by the caller or by the transport.
+func (c upstreamCall) silent() bool {
+	return c.guard != nil && c.guard.expired()
+}
+
+// answer puts the bounds of the attempt on the response that came back: a stream's
+// watchdog is retuned from "must start answering" to "may not go silent", and the
+// body is released from the watchdog once it is closed, which also ends the
+// upstream request.
+func (c upstreamCall) answer(response *http.Response, idle time.Duration) {
+	if response == nil {
+		if c.guard != nil {
+			c.guard.stop()
+		}
+		c.cancel()
+		return
+	}
+	if c.guard == nil {
+		response.Body = &cancelReadCloser{ReadCloser: response.Body, cancel: c.cancel}
+		return
+	}
+	c.guard.retune(idle)
+	response.Body = &watchedBody{ReadCloser: response.Body, guard: c.guard, cancel: c.cancel, idle: idle}
+}
+
+// buildRequest prepares one upstream attempt and the bounds that apply to it.
+//
+// A request answered as a single body is bounded by the channel's request timeout
+// from dispatch to the last byte. A streamed answer is not: what bounds it is
+// silence, not duration. The upstream must still start answering within that
+// timeout — a request that never begins has failed — but once it has started it may
+// take as long as the answer needs, provided it does not go quiet for longer than
+// idle. A whole-request deadline on a stream would cut a long answer off and leave
+// the upstream recording a canceled request it had done nothing to deserve.
+func buildRequest(ctx context.Context, input domain.Request, channel domain.Channel, body transform.Body, idle time.Duration) (upstreamCall, error) {
 	baseURL, err := url.Parse(strings.TrimRight(channel.BaseURL, "/"))
 	if err != nil {
-		return nil, nil, fmt.Errorf("parse channel base URL: %w", err)
+		return upstreamCall{}, fmt.Errorf("parse channel base URL: %w", err)
 	}
 	target := upstreamTarget(baseURL, input.Path)
 
@@ -304,20 +378,158 @@ func buildRequest(ctx context.Context, input domain.Request, channel domain.Chan
 		timeout = input.Timeout
 	}
 	requestContext := ctx
-	cancel := func() {}
-	if timeout > 0 {
+	var cancel context.CancelFunc = func() {}
+	call := upstreamCall{firstByte: timeout}
+	if input.Stream {
+		// The request outlives its deadline by design, so the context it is sent
+		// with carries no deadline of its own; the watchdog is what ends it, either
+		// because the upstream never started answering or because it went quiet.
+		requestContext, cancel = context.WithCancel(ctx)
+		firstByte := timeout
+		if firstByte <= 0 {
+			firstByte = idle
+		}
+		call.firstByte = firstByte
+		call.guard = newSilenceGuard(cancel, firstByte)
+	} else if timeout > 0 {
 		requestContext, cancel = context.WithTimeout(ctx, timeout)
 	}
+	call.cancel = cancel
 	request, err := http.NewRequestWithContext(requestContext, input.Method, target.String(), bytes.NewReader(body.Raw))
 	if err != nil {
 		cancel()
-		return nil, nil, fmt.Errorf("build upstream request: %w", err)
+		return upstreamCall{}, fmt.Errorf("build upstream request: %w", err)
 	}
 	request.Header = transform.ApplyHeaders(input.Headers, channel.Transform, channel.APIKey, body.ContentType)
 	request.GetBody = func() (io.ReadCloser, error) {
 		return io.NopCloser(bytes.NewReader(body.Raw)), nil
 	}
-	return request, cancel, nil
+	call.request = request
+	return call, nil
+}
+
+// silenceGuard ends an attempt whose upstream has gone quiet. It measures the time
+// between bytes rather than the time the request takes, so a slow answer is served
+// while a stalled one is given up instead of holding the downstream connection
+// open until the client gives up on it.
+type silenceGuard struct {
+	cancel context.CancelFunc
+
+	mu      sync.Mutex
+	timeout time.Duration
+	timer   *time.Timer
+	fired   bool
+	stopped bool
+}
+
+func newSilenceGuard(cancel context.CancelFunc, timeout time.Duration) *silenceGuard {
+	guard := &silenceGuard{cancel: cancel, timeout: timeout}
+	if timeout > 0 {
+		guard.timer = time.AfterFunc(timeout, guard.fire)
+	}
+	return guard
+}
+
+// fire ends the attempt. It is the timer callback, so it must not hold mu while
+// canceling: the cancel wakes the read that is blocked on the request context.
+func (g *silenceGuard) fire() {
+	g.mu.Lock()
+	alreadyStopped := g.stopped
+	if !alreadyStopped {
+		g.fired = true
+	}
+	g.mu.Unlock()
+	if !alreadyStopped {
+		g.cancel()
+	}
+}
+
+// expired reports whether the guard gave up on the attempt.
+func (g *silenceGuard) expired() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.fired
+}
+
+// retune replaces the bound the guard measures. It is what moves a stream from
+// "the upstream has this long to start answering" to "it may not stay silent for
+// longer than this".
+func (g *silenceGuard) retune(timeout time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.stopped || g.fired {
+		// The attempt has already been given up; re-arming the timer would only
+		// cancel a request whose context is already done.
+		return
+	}
+	g.timeout = timeout
+	if g.timer != nil {
+		g.timer.Stop()
+		g.timer = nil
+	}
+	if timeout > 0 {
+		g.timer = time.AfterFunc(timeout, g.fire)
+	}
+}
+
+// kick restarts the silence window from now, which every byte read from the
+// upstream does.
+func (g *silenceGuard) kick() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.stopped || g.fired || g.timer == nil {
+		return
+	}
+	g.timer.Reset(g.timeout)
+}
+
+// pause stops the window while the bytes just read are on their way to the client:
+// a client that reads slowly is not an upstream that has gone quiet.
+func (g *silenceGuard) pause() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.timer != nil {
+		g.timer.Stop()
+	}
+}
+
+// stop retires the guard, so a response that has been fully read is not canceled
+// after the fact.
+func (g *silenceGuard) stop() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.stopped = true
+	if g.timer != nil {
+		g.timer.Stop()
+		g.timer = nil
+	}
+}
+
+// watchedBody is the body of a streamed answer as the gateway reads it: every byte
+// pushes the silence window forward, and the response is released from the guard
+// when it is closed.
+type watchedBody struct {
+	io.ReadCloser
+	guard  *silenceGuard
+	cancel context.CancelFunc
+	idle   time.Duration
+}
+
+func (body *watchedBody) Read(buffer []byte) (int, error) {
+	body.guard.kick()
+	count, err := body.ReadCloser.Read(buffer)
+	body.guard.pause()
+	if err != nil && err != io.EOF && body.guard.expired() {
+		return count, fmt.Errorf("%w: the upstream sent nothing for %s", ErrStreamSilent, body.idle)
+	}
+	return count, err
+}
+
+func (body *watchedBody) Close() error {
+	body.guard.stop()
+	err := body.ReadCloser.Close()
+	body.cancel()
+	return err
 }
 
 // upstreamTarget resolves the path of one downstream request against a channel's

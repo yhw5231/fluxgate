@@ -622,6 +622,13 @@ The answer also carries `retention` — whether records are being kept and how m
 view can say how far back the log reaches rather than implying it holds everything ever
 served. `DELETE /management/requests` empties the log.
 
+A streamed answer is recorded by how it ended, not by the status it started with, because
+a response that has begun cannot change its status: `499 client_canceled` when the caller
+hung up mid-answer, `504 upstream_silent` when the upstream stopped sending, and
+`502 upstream_stream_interrupted` when the upstream cut the stream off some other way. Each
+is a request that looks complete on the wire and was not, which is exactly what the record
+is for.
+
 A proxied response carries `X-Fluxgate-Request-Id`, and a failed one carries the same id
 inside its error body:
 
@@ -703,7 +710,31 @@ inject a response header.
 
 Streaming responses (server-sent events) require proxy buffering to be off. Add
 `proxy_buffering off;` to the locations serving `/v1/chat/completions`,
-`/v1/responses`, or `/v1/messages` when clients send `stream: true`.
+`/v1/responses`, or `/v1/messages` when clients send `stream: true`. The gateway
+writes an SSE comment line (`: keep-alive`) into a stream that goes quiet for
+`FLUXGATE_STREAM_KEEPALIVE` (default `15s`), which is inside nginx's default
+`proxy_read_timeout` of `60s`; raise that timeout as well if you set the heartbeat
+above it.
+
+### How a slow answer is bounded
+
+A request is not held to one clock, because the two ways it can take long are not
+the same failure:
+
+- **A streamed answer is bounded by silence, not by duration.** The upstream has
+  `FLUXGATE_REQUEST_TIMEOUT` (default `5m`) to start answering, and after that may
+  take as long as the answer needs, provided it never goes quiet for longer than
+  `FLUXGATE_STREAM_IDLE_TIMEOUT` (default `2m`). Cutting a stream at a fixed
+  duration would end a healthy long answer halfway through — and the upstream
+  records that as a request the gateway canceled.
+- **A request answered as one body is bounded end to end** by
+  `FLUXGATE_REQUEST_TIMEOUT`, and a generation by `FLUXGATE_MEDIA_REQUEST_TIMEOUT`
+  instead.
+- **A caller that hangs up is named as the cause.** The upstream request is
+  canceled with the caller's, so the upstream sees a canceled request; the
+  gateway's own record says `499 client_canceled` rather than reporting an upstream
+  that failed, which is what keeps a client-side timeout from sending an operator
+  after a fault that is not there.
 
 Authenticated model and proxy endpoints:
 
@@ -736,6 +767,13 @@ Proxy errors use the OpenAI error envelope with a `code` field:
   can serve it. No upstream request is attempted.
 - `502 upstream_unavailable`: every attempt against the selected channels
   failed. The response carries the last upstream status.
+- `504 upstream_timeout`: the attempt took longer than
+  `FLUXGATE_REQUEST_TIMEOUT` before the upstream answered.
+- `504 upstream_silent`: a streamed answer went quiet for longer than
+  `FLUXGATE_STREAM_IDLE_TIMEOUT`, or the upstream never started answering it.
+- `499 client_canceled`: the caller closed the connection while the upstream was
+  still working, and the upstream request was canceled with it. The caller is not
+  there to read this; it is recorded so the console shows what actually happened.
 
 Example model request:
 
@@ -779,8 +817,8 @@ Two things are different for a generation, and both are about time:
 
 - **It is bounded by `FLUXGATE_MEDIA_REQUEST_TIMEOUT` (default `10m`), not by
   `FLUXGATE_REQUEST_TIMEOUT`.** An image or video upstream answers only once it has
-  produced the artifact, which routinely outlives the `60s` a chat completion is
-  given. A generation is also dispatched over a connection that does not apply
+  produced the artifact, which routinely outlives the few minutes a chat completion
+  is given. A generation is also dispatched over a connection that does not apply
   `FLUXGATE_RESPONSE_HEADER_TIMEOUT`, so a slow image is not cut off as if the
   upstream had gone silent. This covers `POST /v1/images/*`, `POST /v1/videos`, and
   the follow-up requests below — including the artifact download, which is a
@@ -1093,16 +1131,35 @@ removes its entry rather than storing one.
 
 ### Network timeout settings
 
-- `FLUXGATE_REQUEST_TIMEOUT`: Default per-channel request timeout. Default: `60s`.
+- `FLUXGATE_REQUEST_TIMEOUT`: End-to-end bound on one upstream attempt for a request
+  that is answered as a single body, and the time an upstream is given to *start*
+  answering a streamed one. Default: `5m`. It bounds how long a model may take to
+  answer, so it is measured in minutes: a reasoning model routinely needs several,
+  and a shorter value turns every long answer into a request the upstream records as
+  canceled while the gateway was still waiting as configured.
+- `FLUXGATE_STREAM_IDLE_TIMEOUT`: How long a streamed answer may go without a byte
+  from the upstream before the attempt is given up. Default: `2m`. A stream is
+  bounded by silence, not by duration: it is not held to the request timeout above,
+  because a long answer would be cut off as if it had failed, while an upstream that
+  has stopped sending is never going to resume. Must be positive.
+- `FLUXGATE_STREAM_KEEPALIVE`: How often a silent event stream is reminded that it is
+  alive, as an SSE comment line (`: keep-alive`). Default: `15s`; `0` switches it
+  off. It has to be shorter than the idle timeout. This is what keeps the caller —
+  or a proxy in front of the gateway, whose own read timeout is commonly `60s` —
+  from deciding a thinking model has stalled and hanging up.
 - `FLUXGATE_MEDIA_REQUEST_TIMEOUT`: Request timeout for a generation endpoint — an
   image or a video — which takes the place of the per-channel timeout above,
   because an upstream that produces an artifact answers far later than one that
-  answers a chat completion. Default: `10m`.
+  answers a chat completion. Default: `10m`. Must be greater than
+  `FLUXGATE_REQUEST_TIMEOUT`.
 - `FLUXGATE_CONNECT_TIMEOUT`: TCP connection timeout. Default: `10s`.
 - `FLUXGATE_TLS_HANDSHAKE_TIMEOUT`: TLS handshake timeout. Default: `10s`.
-- `FLUXGATE_RESPONSE_HEADER_TIMEOUT`: Upstream response-header timeout. Default: `30s`.
-  It does not apply to a generation request, whose upstream legitimately takes
-  longer than this to begin answering.
+- `FLUXGATE_RESPONSE_HEADER_TIMEOUT`: Upstream response-header timeout. Default:
+  `0`, which disables it. The per-attempt request timeout already bounds how long
+  the upstream may take to start answering; a second, shorter bound underneath it
+  cut requests off before that one could apply, and the upstream then recorded a
+  canceled request while the gateway was still waiting. Set it only to impose a
+  bound on the response header alone.
 - `FLUXGATE_IDLE_CONN_TIMEOUT`: Upstream idle connection timeout. Default: `90s`.
 - `FLUXGATE_READ_HEADER_TIMEOUT`: Downstream request-header timeout. Default: `10s`.
 - `FLUXGATE_READ_TIMEOUT`: Downstream request read timeout. Default: `30s`.

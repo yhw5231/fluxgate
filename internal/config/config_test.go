@@ -23,8 +23,21 @@ func TestDefaultProductionSettings(t *testing.T) {
 		t.Fatalf("MediaRequestTimeout = %s, want it above the request timeout %s",
 			cfg.MediaRequestTimeout, cfg.RequestTimeout)
 	}
-	if cfg.ConnectTimeout <= 0 || cfg.TLSHandshakeTimeout <= 0 || cfg.ResponseHeaderTimeout <= 0 || cfg.IdleConnTimeout <= 0 {
+	if cfg.ConnectTimeout <= 0 || cfg.TLSHandshakeTimeout <= 0 || cfg.IdleConnTimeout <= 0 {
 		t.Fatal("default HTTP client timeouts must be positive")
+	}
+	// The upstream is given the per-attempt request timeout to start answering, and
+	// a second bound underneath it would cut requests off before that one applied —
+	// the upstream would record a canceled request while the gateway was still
+	// waiting as configured.
+	if cfg.ResponseHeaderTimeout != 0 {
+		t.Fatalf("ResponseHeaderTimeout = %s, want zero so the request timeout is the only bound", cfg.ResponseHeaderTimeout)
+	}
+	// A stream is bounded by silence, and the heartbeat has to be inside that
+	// silence, or the caller gives up before the gateway ever writes to it.
+	if cfg.StreamIdleTimeout <= 0 || cfg.StreamKeepAlive <= 0 || cfg.StreamKeepAlive >= cfg.StreamIdleTimeout {
+		t.Fatalf("stream bounds = idle %s, keepalive %s, want a positive keepalive below the idle timeout",
+			cfg.StreamIdleTimeout, cfg.StreamKeepAlive)
 	}
 	if cfg.ReadHeaderTimeout <= 0 || cfg.ReadTimeout <= 0 || cfg.IdleTimeout <= 0 || cfg.ShutdownTimeout <= 0 {
 		t.Fatal("default HTTP server lifecycle timeouts must be positive")

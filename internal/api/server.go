@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -81,6 +82,13 @@ type Server struct {
 	// which outlives the per-channel timeout a chat completion is bounded by. When
 	// zero, the gateway's own default is used.
 	MediaRequestTimeout time.Duration
+	// StreamKeepAlive is how long a streamed answer may be silent towards the
+	// client before a comment line is written to it. A reasoning model can think
+	// for a minute or more between events, and a client or an intermediary proxy
+	// that hears nothing for that long hangs up — which cancels the upstream's work
+	// and leaves it recording a request it was asked to cancel. When zero, the
+	// gateway's own default is used; a negative value switches the heartbeat off.
+	StreamKeepAlive     time.Duration
 	Models              []string
 	MaxRequestBodyBytes int64
 	Logger              *slog.Logger
@@ -823,6 +831,7 @@ func (s *Server) handleProxy(endpoint proxyEndpoint) http.HandlerFunc {
 			Model:       model,
 			Policy:      policy,
 			Media:       endpoint.media,
+			Stream:      envelope.Stream,
 			Timeout:     s.mediaTimeout(endpoint),
 			RequestID:   record.RequestID,
 		})
@@ -830,7 +839,7 @@ func (s *Server) handleProxy(endpoint proxyEndpoint) http.HandlerFunc {
 		if err != nil {
 			// A model with no usable route or channel is an availability problem,
 			// not a bad gateway: no upstream request was attempted.
-			failure := classifyDispatchError(err, result.Trace, record.RequestID)
+			failure := classifyDispatchError(err, result.Trace, record.RequestID, r.Context().Err() != nil)
 			refuse(failure.Status, failure.Code, failure.Message, failure.Details)
 			return
 		}
@@ -849,8 +858,23 @@ func (s *Server) handleProxy(endpoint proxyEndpoint) http.HandlerFunc {
 		copyResponseHeaders(w.Header(), result.Response.Header)
 		w.Header().Set("X-Fluxgate-Upstream-Channel", result.Attempt.ChannelID)
 		w.WriteHeader(result.Response.StatusCode)
-		if envelope.Stream || strings.Contains(strings.ToLower(result.Response.Header.Get("Content-Type")), "text/event-stream") {
-			streamResponse(w, result.Response.Body)
+		events := strings.Contains(strings.ToLower(result.Response.Header.Get("Content-Type")), "text/event-stream")
+		if envelope.Stream || events {
+			// Only an event stream can carry a heartbeat: a comment line in a JSON
+			// body would corrupt it, so an answer that is not an event stream — an
+			// upstream error to a streaming request, for instance — is copied as it
+			// is.
+			keepAlive := time.Duration(0)
+			if events {
+				keepAlive = s.streamKeepAliveInterval()
+			}
+			if streamErr := streamResponse(w, result.Response.Body, keepAlive); streamErr != nil {
+				// The answer had already been handed to the client, so the status it
+				// received cannot change. The record is the only place that can say
+				// how the request really ended, and a stream that stopped halfway is
+				// exactly the case an operator needs it for.
+				recordInterruptedStream(r, &record, streamErr)
+			}
 			return
 		}
 		_, _ = io.Copy(w, result.Response.Body)
@@ -898,22 +922,106 @@ func sanitizedHeaders(source http.Header) http.Header {
 	return result
 }
 
-func streamResponse(w http.ResponseWriter, source io.Reader) {
+// defaultStreamKeepAlive is how often a silent event stream is reminded that it is
+// alive. It is well below the sixty seconds a proxy in front of the gateway allows
+// a response to stay quiet by default, which is what makes the heartbeat useful
+// where it matters most.
+const defaultStreamKeepAlive = 15 * time.Second
+
+// streamKeepAliveInterval is the heartbeat this server writes into a silent event
+// stream, or zero when it is switched off.
+func (s *Server) streamKeepAliveInterval() time.Duration {
+	if s.StreamKeepAlive > 0 {
+		return s.StreamKeepAlive
+	}
+	if s.StreamKeepAlive < 0 {
+		return 0
+	}
+	return defaultStreamKeepAlive
+}
+
+// sseHeartbeat is what a silent stream is told while it waits for the next event. It
+// is a comment line, which every server-sent-events parser ignores, so the client
+// sees the connection is alive without receiving an event it would have to make
+// sense of.
+const sseHeartbeat = ": keep-alive\n\n"
+
+// streamResponse relays a server-sent event response to the client as it arrives.
+//
+// While the upstream is quiet — a reasoning model can think for a minute between
+// events — a comment line is written every keepAlive, so neither the client nor a
+// proxy in between decides the request has stalled. That decision is the one that
+// turns a slow answer into a canceled one: the client hangs up, the gateway cancels
+// the upstream request with it, and the upstream records a cancellation nothing on
+// its side caused.
+//
+// It returns nil when the upstream's own end of the stream was relayed in full, and
+// otherwise why the relay stopped. The answer has already been committed to the
+// client by then, so the caller cannot change the status on the wire — but it can
+// record how the request ended, which is the only place that shows.
+func streamResponse(w http.ResponseWriter, source io.Reader, keepAlive time.Duration) error {
 	flusher, canFlush := w.(http.Flusher)
 	reader := bufio.NewReader(source)
 	buffer := make([]byte, 32*1024)
+
+	// The heartbeat is written from its own goroutine, so the two writers are
+	// serialized and each records when the stream last carried real bytes.
+	var writeMu sync.Mutex
+	var lastWrite atomic.Int64
+	lastWrite.Store(time.Now().UnixNano())
+	write := func(payload []byte) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		if _, err := w.Write(payload); err != nil {
+			return err
+		}
+		if canFlush {
+			flusher.Flush()
+		}
+		return nil
+	}
+
+	finished := make(chan struct{})
+	var heartbeats sync.WaitGroup
+	if keepAlive > 0 && canFlush {
+		heartbeats.Add(1)
+		go func() {
+			defer heartbeats.Done()
+			ticker := time.NewTicker(keepAlive)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-finished:
+					return
+				case <-ticker.C:
+					if time.Since(time.Unix(0, lastWrite.Load())) < keepAlive {
+						continue
+					}
+					if err := write([]byte(sseHeartbeat)); err != nil {
+						return
+					}
+				}
+			}
+		}()
+	}
+	defer func() {
+		close(finished)
+		heartbeats.Wait()
+	}()
+
 	for {
 		count, err := reader.Read(buffer)
 		if count > 0 {
-			if _, writeErr := w.Write(buffer[:count]); writeErr != nil {
-				return
+			if writeErr := write(buffer[:count]); writeErr != nil {
+				return fmt.Errorf("relay the answer to the client: %w", writeErr)
 			}
-			if canFlush {
-				flusher.Flush()
-			}
+			lastWrite.Store(time.Now().UnixNano())
 		}
 		if err != nil {
-			return
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
 		}
 	}
 }

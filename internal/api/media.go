@@ -364,7 +364,7 @@ func (s *Server) serveMediaJob(w http.ResponseWriter, r *http.Request, request m
 	})
 	record.Attempts = result.Trace.Attempts
 	if err != nil {
-		failure := classifyDispatchError(err, result.Trace, record.RequestID)
+		failure := classifyDispatchError(err, result.Trace, record.RequestID, r.Context().Err() != nil)
 		return refuse(failure.Status, failure.Code, failure.Message, failure.Details)
 	}
 	defer result.Response.Body.Close()
@@ -374,7 +374,9 @@ func (s *Server) serveMediaJob(w http.ResponseWriter, r *http.Request, request m
 	w.Header().Set("X-Fluxgate-Upstream-Channel", result.Attempt.ChannelID)
 	w.WriteHeader(result.Response.StatusCode)
 	if strings.Contains(strings.ToLower(result.Response.Header.Get("Content-Type")), "text/event-stream") {
-		streamResponse(w, result.Response.Body)
+		if streamErr := streamResponse(w, result.Response.Body, s.streamKeepAliveInterval()); streamErr != nil {
+			recordInterruptedStream(r, &record, streamErr)
+		}
 		return result.Response.StatusCode
 	}
 	_, _ = io.Copy(w, result.Response.Body)

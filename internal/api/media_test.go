@@ -282,9 +282,14 @@ func TestSlowGenerationSurvivesThePerChannelTimeout(t *testing.T) {
 	chatResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(chatResponse, chat)
 
-	if chatResponse.Code != http.StatusBadGateway {
-		t.Fatalf("chat status = %d, want 502 once the per-channel timeout expires; body = %s",
+	// The answer says which bound expired: a timeout of the gateway's own is a 504
+	// the operator can tell apart from an upstream that failed.
+	if chatResponse.Code != http.StatusGatewayTimeout {
+		t.Fatalf("chat status = %d, want 504 once the per-channel timeout expires; body = %s",
 			chatResponse.Code, chatResponse.Body.String())
+	}
+	if !strings.Contains(chatResponse.Body.String(), "upstream_timeout") {
+		t.Fatalf("chat body = %s, want the upstream_timeout code", chatResponse.Body.String())
 	}
 }
 

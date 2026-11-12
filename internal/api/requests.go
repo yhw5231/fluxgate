@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/yhw5231/fluxgate/internal/domain"
+	"github.com/yhw5231/fluxgate/internal/proxy"
 	"github.com/yhw5231/fluxgate/internal/router"
 	"github.com/yhw5231/fluxgate/internal/store"
 )
@@ -203,10 +204,47 @@ type dispatchFailure struct {
 	Details map[string]any
 }
 
+// statusClientClosed is nginx's answer for a request the caller abandoned. The
+// caller is not there to read it; it exists so the record of the request says what
+// happened instead of blaming the upstream.
+const statusClientClosed = 499
+
+// recordInterruptedStream fills in how a streamed answer ended when it did not end
+// with the upstream's own last event.
+//
+// The client has already received the status the answer started with, so the wire
+// cannot say more. The record is where the difference is kept: a stream the caller
+// abandoned, one the gateway gave up on because the upstream went quiet, and one the
+// upstream cut off are three different stories, and without them the console shows a
+// request that looks successful and plainly was not.
+func recordInterruptedStream(r *http.Request, record *domain.RequestRecord, err error) {
+	switch {
+	case r.Context().Err() != nil:
+		record.Status = statusClientClosed
+		record.ErrorCode = "client_canceled"
+		record.ErrorMessage = "the client closed the connection while the answer was streaming; the upstream request was canceled with it"
+	case errors.Is(err, proxy.ErrStreamSilent):
+		record.Status = http.StatusGatewayTimeout
+		record.ErrorCode = "upstream_silent"
+		record.ErrorMessage = "the answer was cut short after the upstream stopped sending: " + err.Error()
+	default:
+		record.Status = http.StatusBadGateway
+		record.ErrorCode = "upstream_stream_interrupted"
+		record.ErrorMessage = "the answer was cut short: " + err.Error()
+	}
+}
+
 // classifyDispatchError turns a dispatch error into the answer the client gets.
 // A model with no usable route or line is an availability problem, not a bad
 // gateway: no upstream request was attempted.
-func classifyDispatchError(err error, trace domain.RequestTrace, requestID string) dispatchFailure {
+//
+// clientGone says the caller closed the connection while the request was being
+// served. That is worth separating from every other failure, because it is the one
+// cause that is neither the gateway's nor the upstream's: the upstream request is
+// canceled with the caller's, and the upstream records a cancellation for work
+// nobody was waiting for any more. Without the distinction the record reads as an
+// upstream that failed, and the operator goes looking for a fault that is not there.
+func classifyDispatchError(err error, trace domain.RequestTrace, requestID string, clientGone bool) dispatchFailure {
 	if errors.Is(err, router.ErrNoChannel) || errors.Is(err, router.ErrModelNotRoutable) {
 		return dispatchFailure{
 			Status:  http.StatusServiceUnavailable,
@@ -233,6 +271,34 @@ func classifyDispatchError(err error, trace domain.RequestTrace, requestID strin
 		}
 		if last.Response != "" {
 			details["upstream_message"] = last.Response
+		}
+	}
+	if clientGone {
+		return dispatchFailure{
+			Status:  statusClientClosed,
+			Code:    "client_canceled",
+			Message: "the client closed the connection before the upstream answered; the upstream request was canceled with it",
+			Details: details,
+		}
+	}
+	// A bound of the gateway's own expired rather than the upstream answering:
+	// either the attempt took longer than the request timeout, or a streamed
+	// answer went quiet for longer than the idle timeout. The two are named
+	// separately because only the second one means the upstream stopped working.
+	if errors.Is(err, proxy.ErrStreamSilent) {
+		return dispatchFailure{
+			Status:  http.StatusGatewayTimeout,
+			Code:    "upstream_silent",
+			Message: message,
+			Details: details,
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return dispatchFailure{
+			Status:  http.StatusGatewayTimeout,
+			Code:    "upstream_timeout",
+			Message: message,
+			Details: details,
 		}
 	}
 	return dispatchFailure{

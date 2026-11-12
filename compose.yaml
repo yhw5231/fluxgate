@@ -42,16 +42,20 @@ services:
       FLUXGATE_INTEGRITY_CHECK: "${FLUXGATE_INTEGRITY_CHECK:-true}"
       # 请求体大小上限（字节），默认 8 MiB
       FLUXGATE_MAX_BODY_BYTES: "${FLUXGATE_MAX_BODY_BYTES:-8388608}"
-      # 上游请求超时
-      FLUXGATE_REQUEST_TIMEOUT: "${FLUXGATE_REQUEST_TIMEOUT:-60s}"
+      # 上游请求超时（非流式请求的端到端上限）
+      FLUXGATE_REQUEST_TIMEOUT: "${FLUXGATE_REQUEST_TIMEOUT:-5m}"
+      # 流式（SSE）回答的静默上限：上游两次输出之间最长停顿，不受上面的端到端超时约束
+      FLUXGATE_STREAM_IDLE_TIMEOUT: "${FLUXGATE_STREAM_IDLE_TIMEOUT:-2m}"
+      # 流式回答静默时写给客户端的心跳间隔，必须小于静默上限；0s 关闭
+      FLUXGATE_STREAM_KEEPALIVE: "${FLUXGATE_STREAM_KEEPALIVE:-15s}"
       # 生成类请求（图片、视频）的超时；上游做出成品才会应答，故长于普通请求超时
       FLUXGATE_MEDIA_REQUEST_TIMEOUT: "${FLUXGATE_MEDIA_REQUEST_TIMEOUT:-10m}"
       # TCP 连接建立超时
       FLUXGATE_CONNECT_TIMEOUT: "${FLUXGATE_CONNECT_TIMEOUT:-10s}"
       # TLS 握手超时
       FLUXGATE_TLS_HANDSHAKE_TIMEOUT: "${FLUXGATE_TLS_HANDSHAKE_TIMEOUT:-10s}"
-      # 等待上游响应头的超时
-      FLUXGATE_RESPONSE_HEADER_TIMEOUT: "${FLUXGATE_RESPONSE_HEADER_TIMEOUT:-30s}"
+      # 等待上游响应头的超时；保持 0s，等待由每请求的上限负责
+      FLUXGATE_RESPONSE_HEADER_TIMEOUT: "${FLUXGATE_RESPONSE_HEADER_TIMEOUT:-0s}"
       # 空闲连接在连接池中的最长保留时间
       FLUXGATE_IDLE_CONN_TIMEOUT: "${FLUXGATE_IDLE_CONN_TIMEOUT:-90s}"
       # 读取请求头的超时（防慢速攻击）
