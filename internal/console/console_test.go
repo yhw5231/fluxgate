@@ -809,3 +809,32 @@ func TestConsoleShowsTheServerDefaultInTheForm(t *testing.T) {
 		}
 	}
 }
+
+// 启用与停用是列表页上最常做的一个动作，所以状态徽标本身就是开关：点它切换，
+// 走的是只带 status 的局部更新，密钥、模型和映射都不必重填一遍。
+func TestConsoleTogglesUpstreamStatusFromTheList(t *testing.T) {
+	script := consoleScript(t)
+
+	for _, wanted := range []string{
+		// 状态列渲染的是可点的按钮，而不是只读徽标。
+		"cell: function (row) { return upstreamStatusToggle(row); }",
+		"function upstreamStatusToggle(",
+		"function toggleUpstreamStatus(",
+		"badge badge-toggle ",
+		// 一次点击只写 status 一个字段，其余字段保持已保存的值。
+		"'/management/configuration/upstreams/' + row.id",
+		"{ status: next }",
+		// 切换之后两张表都重画，并在提示里说清现在的状态。
+		"renderRouting();",
+		"已停用「",
+		"已启用「",
+	} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("the console script is missing %q", wanted)
+		}
+	}
+	// 只读的状态徽标仍被其它资源使用，但上游的状态列不能再退回去用它。
+	if strings.Contains(script, "{ label: '状态', cell: function (row) { return statusBadge(row.status); } }") {
+		t.Error("the upstream status column still renders a read-only badge")
+	}
+}

@@ -540,3 +540,38 @@ func TestManagementUpstreamKeepsTheChannelGroupAsTheUpstreamModel(t *testing.T) 
 		t.Fatalf("loaded models = %v, want the model listed for clients", loaded.Models)
 	}
 }
+
+// The console builds the upstream form from the field order the server declares,
+// so that order is what an operator reads top to bottom. The priority decides who
+// answers and the weight only divides traffic between upstreams of the same
+// priority, which is the order the list uses too, so the form must not lead with
+// the weight.
+func TestUpstreamFormLeadsWithPriority(t *testing.T) {
+	server, _ := managementServer(t)
+
+	read := callManagement(server, http.MethodGet, "/management/configuration", "management-secret", nil)
+	if read.status != http.StatusOK {
+		t.Fatalf("GET /management/configuration status = %d, body = %v", read.status, read.body)
+	}
+	fieldsByResource, _ := read.body["fields"].(map[string]any)
+	described, _ := fieldsByResource["upstreams"].([]any)
+	if len(described) == 0 {
+		t.Fatalf("the configuration carries no upstream fields: %v", read.body)
+	}
+
+	order := make(map[string]int, len(described))
+	for index, field := range described {
+		entry, _ := field.(map[string]any)
+		name, _ := entry["name"].(string)
+		order[name] = index
+	}
+	priority, hasPriority := order["priority"]
+	weight, hasWeight := order["global_weight"]
+	if !hasPriority || !hasWeight {
+		t.Fatalf("upstream fields = %v, want both priority and global_weight", described)
+	}
+	if priority > weight {
+		t.Errorf("global_weight is field %d and priority is field %d, want the priority first", weight, priority)
+	}
+}
+

@@ -476,7 +476,12 @@
         { label: '密钥', cell: function (row) { return upstreamKeysCell(row); } },
         { label: '模型', cell: function (row) { return upstreamModelsCell(row); } },
         { label: '线路状态', cell: function (row) { return lineSummary(upstreamLines(row.id)); } },
-        { label: '状态', cell: function (row) { return statusBadge(row.status); } }
+        // 状态就地切换：停用一个不稳的上游、把一个修好的上游放回来，是最常做
+        // 的事，不该为它走一遍要重填密钥和模型的编辑框。
+        {
+          label: '状态', title: '点状态徽标即可启用或停用这个上游，不必打开编辑框。',
+          cell: function (row) { return upstreamStatusToggle(row); }
+        }
       ],
       actions: ['edit', 'delete'],
       // 一个上游的每个密钥都是一条线路，各有自己的优先级和当前状态。展开的内容
@@ -548,6 +553,54 @@
     var count = tag(String(models.length));
     count.title = models.join('\n');
     return count;
+  }
+
+  /* ===== 上游状态就地切换 =====
+   *
+   * 启用与停用是运营最常做的一个动作：停掉一个不稳的上游，或者把一个修好的上游
+   * 放回来。它是这一行的全部状态，所以点徽标就切换——打开编辑框只为了改这一个值，
+   * 却要重看一遍密钥和模型，那是多余的。
+   *
+   * 切换写的是同一个 PUT 接口，只带 status 一个字段：更新只应用请求里带的字段，
+   * 所以密钥、模型和映射都不会被这次点击动到。 */
+
+  function upstreamStatusToggle(row) {
+    var name = text(row.name, '#' + row.id);
+    var active = text(row.status, 'active') === 'active';
+    var button = element('button', 'badge badge-toggle ' + (active ? 'badge-success' : 'badge-muted'));
+    button.type = 'button';
+    button.appendChild(element('span', '', active ? '已启用' : '已停用'));
+    button.setAttribute('aria-label', (active ? '停用' : '启用') + '上游「' + name + '」');
+    button.title = active
+      ? '点击停用：这个上游的线路立刻不再参与选路。'
+      : '点击启用：这个上游的线路重新参与选路。';
+    button.addEventListener('click', function () { toggleUpstreamStatus(row, button); });
+    return button;
+  }
+
+  function toggleUpstreamStatus(row, button) {
+    var name = text(row.name, '#' + row.id);
+    var disable = text(row.status, 'active') === 'active';
+    var next = disable ? 'disabled' : 'active';
+    button.disabled = true;
+    put('/management/configuration/upstreams/' + row.id, { status: next }).then(function (result) {
+      if (result.ok) {
+        if (result.body && result.body.configuration) { applyConfiguration(result.body.configuration); }
+        renderManagement();
+        renderRouting();
+        showNotice(disable
+          ? '已停用「' + name + '」，它的线路不再参与选路。'
+          : '已启用「' + name + '」，它的线路重新参与选路。');
+        return;
+      }
+      button.disabled = false;
+      if (result.status === 401) { showAuth('登录状态已失效，请重新登录后继续。'); return; }
+      showBanner((disable ? '停用' : '启用') + '未生效',
+        errorMessage(result.body, '网关拒绝了这次修改。'));
+    }).catch(function (err) {
+      button.disabled = false;
+      showBanner('无法连接网关', String(err && err.message ? err.message : err));
+    });
   }
 
   /* ===== 上游优先级与权重 =====
@@ -2741,6 +2794,7 @@
       metadata.columns.forEach(function (column) {
         var th = document.createElement('th');
         th.textContent = column.label;
+        if (column.title) { th.title = column.title; }
         if (column.className) { th.className = column.className; }
         headerRow.appendChild(th);
       });

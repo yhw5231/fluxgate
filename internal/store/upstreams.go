@@ -118,12 +118,16 @@ var upstreamResource = Resource{
 		{Name: "name", Kind: KindText, Required: true, MaxLength: 200},
 		{Name: "url", Kind: KindText, Required: true, MaxLength: 2048, Validate: validateHTTPURL},
 		{Name: "platform", Kind: KindText, MaxLength: 64, DefaultValue: defaultPlatform},
-		{Name: "global_weight", Kind: KindReal, Validate: validatePositive},
 		// Priority is the upstream's own, and the first thing selection compares:
 		// a higher-priority upstream is used before a lower-priority one, and
 		// weight only decides between upstreams of the same priority. It is not a
 		// sites column, so it is a synthetic field stored in the settings table.
+		//
+		// It is declared before the weight because this order is the order the
+		// console form shows the fields in, and the list leads with the priority
+		// for the same reason: what decides who answers comes first.
 		{Name: "priority", Kind: KindInt, Synthetic: true},
+		{Name: "global_weight", Kind: KindReal, Validate: validatePositive},
 		{Name: "custom_headers", Kind: KindJSONObject, MaxLength: 8192, Validate: validateStringMap},
 		{Name: "proxy_url", Kind: KindText, MaxLength: 2048, Validate: validateProxyURL},
 		// An upstream added from the console is enabled: a new upstream nobody
