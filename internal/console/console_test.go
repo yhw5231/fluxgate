@@ -622,6 +622,62 @@ func consoleAsset(t *testing.T, path string) string {
 	return string(body)
 }
 
+// 提示浮在视口角落，不占据文档流：以前它顶在页面上面，出现时会把整页内容往下
+// 推，而操作者正在读的就是被推走的那一屏。固定定位就是这条性质本身，所以这里
+// 断言样式，而不是某个具体坐标。提示也自己消失——它报告的是已经发生的事，没有
+// 需要手动关掉的对话框，否则一个每十秒刷新一次的页面会把同样的失败提示反复弹
+// 出来。
+func TestNoticesFloatAndDismissThemselves(t *testing.T) {
+	page := consoleAsset(t, "/console/")
+	if strings.Contains(page, "banner-holder") {
+		t.Error("提示又被放回了文档流里的容器，出现时会把页面内容推下去")
+	}
+	if !strings.Contains(page, `class="toast-stack"`) {
+		t.Fatal("页面里没有提示容器")
+	}
+	for _, unwanted := range []string{`id="banner-dismiss"`, `id="notice-dismiss"`} {
+		if strings.Contains(page, unwanted) {
+			t.Errorf("提示上还挂着手动关闭的按钮 %q，它应该自己消失", unwanted)
+		}
+	}
+
+	rule := cssRule(consoleAsset(t, "/console/styles.css"), ".toast-stack")
+	if !strings.Contains(rule, "position: fixed") {
+		t.Error("提示容器不是固定定位，出现时仍会把页面内容推下去")
+	}
+	// 模态框里的保存失败也走这条提示，所以要压在遮罩（z-index 40）上面。
+	if !strings.Contains(rule, "z-index: 50") {
+		t.Error("提示容器的层级不够，会被模态框的遮罩盖住")
+	}
+
+	script := consoleScript(t)
+	for _, wanted := range []string{
+		"autoDismiss(els.banner",
+		"autoDismiss(els.notice",
+		"function refreshFailure(",
+	} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("the console script is missing %q", wanted)
+		}
+	}
+}
+
+// cssRule returns the body of the first rule declared with exactly this selector,
+// which is enough to read a property out of a single rule.
+func cssRule(stylesheet, selector string) string {
+	start := strings.Index(stylesheet, selector+" {")
+	if start == -1 {
+		return ""
+	}
+	rest := stylesheet[start:]
+	open := strings.Index(rest, "{")
+	end := strings.Index(rest, "}")
+	if open == -1 || end < open {
+		return ""
+	}
+	return rest[open:end]
+}
+
 // The console carries two colour schemes, and which one it opens with has to be
 // decided before the first paint: a script that ran with the app would draw the
 // other scheme first and then flip. That is why the theme script is a file of

@@ -64,6 +64,9 @@
     // expanded remembers which rows were opened, by view and row id, so an
     // automatic repaint does not fold the detail an operator is reading.
     expanded: { routes: {}, upstreams: {}, requests: {} },
+    // failure is the signature of the failure the refresh loop already reported,
+    // so a gateway that stays down is announced once instead of every tick.
+    failure: null,
     cdTimer: null
   };
 
@@ -139,7 +142,6 @@
     els.bannerRetry = $('banner-retry');
     els.notice = $('notice');
     els.noticeText = els.notice.querySelector('[data-notice]');
-    els.noticeDismiss = $('notice-dismiss');
 
     els.stats = {
       service: document.querySelector('[data-stat="service"]'),
@@ -1352,7 +1354,7 @@
         return;
       }
       // The gateway refuses data to an account that still holds the default
-      // password; show the forced-change screen rather than an error banner.
+      // password; show the forced-change screen rather than a failure toast.
       if (status.status === 403 || snapshot.status === 403) {
         showPasswordRequired();
         return;
@@ -1363,7 +1365,7 @@
         return;
       }
       if (!status.ok || !snapshot.ok) {
-        showBanner('网关请求失败',
+        refreshFailure('网关请求失败',
           errorMessage(!status.ok ? status.body : snapshot.body, '网关返回了预期之外的响应。'));
         return;
       }
@@ -1385,6 +1387,7 @@
       }
 
       hideBanner();
+      state.failure = null;
       state.snapshot = snapshot.body || {};
       render(status.body || {}, state.snapshot);
       renderManagement();
@@ -1392,7 +1395,7 @@
       renderRequests();
       renderPolicy();
     }).catch(function (err) {
-      showBanner('无法连接网关', String(err && err.message ? err.message : err));
+      refreshFailure('无法连接网关', String(err && err.message ? err.message : err));
     }).then(function () {
       state.loading = false;
       els.refresh.classList.remove('spinning');
@@ -1433,7 +1436,7 @@
       els.requestsEmpty.hidden = false;
       setEmptyText(els.requestsEmpty, 'requests', message);
     }
-    showBanner('管理接口不可用', message);
+    refreshFailure('管理接口不可用', message);
   }
 
   /* ===== Rendering ===== */
@@ -4369,23 +4372,70 @@
     }
   }
 
-  /* ===== Feedback helpers ===== */
+  /* ===== Feedback helpers =====
+   * Both helpers fill the floating toasts at the bottom-right corner of the
+   * viewport. They are out of the document flow, so surfacing a message never
+   * shifts the page underneath it, and both dismiss themselves: they report
+   * something that has already happened, so there is nothing to close.
+   */
+
+  /* 失败提示要读完的错误原文通常比成功回执长，所以多留几秒。 */
+  var BANNER_LINGER = 10000;
+  var NOTICE_LINGER = 8000;
+
+  /* autoDismiss takes a toast away after its delay. Hovering or focusing it
+   * holds it on screen, so a long detail can be read and the retry button can be
+   * pressed without the toast vanishing mid-reach. */
+  function autoDismiss(node, delay) {
+    window.clearTimeout(node.dismissTimer);
+    node.dismissTimer = window.setTimeout(function () {
+      node.dismissTimer = null;
+      node.hidden = true;
+    }, delay);
+  }
+
+  function holdToast(node) {
+    window.clearTimeout(node.dismissTimer);
+    node.dismissTimer = null;
+  }
+
+  function lingerWhileEngaged(node, delay) {
+    node.addEventListener('pointerenter', function () { holdToast(node); });
+    node.addEventListener('pointerleave', function () { autoDismiss(node, delay); });
+    node.addEventListener('focusin', function () { holdToast(node); });
+    node.addEventListener('focusout', function () { autoDismiss(node, delay); });
+  }
 
   function showBanner(title, detail) {
+    // 先露出来再写文字：提示是 aria 的 live region，只有在它已经可见时发生的
+    // 内容变化才会被读屏播报。
+    els.banner.hidden = false;
     els.bannerTitle.textContent = title;
     els.bannerDetail.textContent = detail || '';
-    els.banner.hidden = false;
+    autoDismiss(els.banner, BANNER_LINGER);
   }
 
   function hideBanner() {
+    holdToast(els.banner);
     els.banner.hidden = true;
   }
 
+  /* refreshFailure reports a failure of the automatic refresh. Because the toast
+   * dismisses itself and the loop runs every ten seconds, the same failure is
+   * announced once per streak: otherwise a gateway that stays unreachable would
+   * pop the toast back up on every tick and it would never really be gone. */
+  function refreshFailure(title, detail) {
+    var signature = title + '\n' + (detail || '');
+    if (state.failure === signature) { return; }
+    state.failure = signature;
+    showBanner(title, detail);
+  }
+
+  /* showNotice is the receipt for an action that worked. */
   function showNotice(message) {
-    els.noticeText.textContent = message;
     els.notice.hidden = false;
-    window.clearTimeout(showNotice.timer);
-    showNotice.timer = window.setTimeout(function () { els.notice.hidden = true; }, 8000);
+    els.noticeText.textContent = message;
+    autoDismiss(els.notice, NOTICE_LINGER);
   }
 
   function showFeedback(node, message, kind) {
@@ -4662,6 +4712,8 @@
     els.refresh.addEventListener('click', refresh);
     els.signout.addEventListener('click', signOut);
     els.bannerRetry.addEventListener('click', refresh);
+    lingerWhileEngaged(els.banner, BANNER_LINGER);
+    lingerWhileEngaged(els.notice, NOTICE_LINGER);
     if (els.breakersResetAll) {
       els.breakersResetAll.addEventListener('click', resetAllBreakers);
     }
@@ -4711,7 +4763,6 @@
     els.confirmCancel.addEventListener('click', closeConfirm);
     els.secretCopy.addEventListener('click', copySecret);
     els.secretClose.addEventListener('click', closeSecret);
-    els.noticeDismiss.addEventListener('click', function () { els.notice.hidden = true; });
 
     // Escape closes whichever dialog is on top, which is what a keyboard user
     // expects from a modal.

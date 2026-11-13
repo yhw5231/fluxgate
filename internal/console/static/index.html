@@ -114,28 +114,6 @@
       </nav>
     </header>
 
-    <div class="container banner-holder">
-      <div id="error-banner" class="banner banner-error" hidden>
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M12 8v5M12 16.5v.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-          <path d="M12 2.5 22 20H2L12 2.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
-        </svg>
-        <div class="banner-body">
-          <strong data-banner-title>请求失败</strong>
-          <span data-banner-detail></span>
-        </div>
-        <button id="banner-retry" class="btn btn-ghost" type="button"><span class="btn-label">重试</span></button>
-      </div>
-
-      <div id="notice" class="banner banner-success" hidden>
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <path d="m6 12.5 4 4 8-9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-        <div class="banner-body"><span data-notice></span></div>
-        <button id="notice-dismiss" class="btn btn-ghost" type="button">关闭</button>
-      </div>
-    </div>
-
     <!-- ===== 概览：只读的运行时快照 ===== -->
     <main class="container" data-view-panel="overview">
       <section class="stats-grid" aria-label="概览">
@@ -566,6 +544,31 @@
           <p class="settings-hint">密码没有最小长度限制，按你的部署需要设置即可。</p>
         </form>
       </div>
+    </div>
+  </div>
+
+  <!-- 悬浮提示。固定在视口右下角、脱离文档流，所以出现时不会把页面内容推下去。
+       两枚都在几秒后自己消失，不需要手动关掉；失败提示比成功回执多待一会儿，
+       因为它要读完的错误原文通常更长。它们放在应用容器之外，才能盖在模态框
+       上面。 -->
+  <div class="toast-stack">
+    <div id="error-banner" class="toast toast-error" role="alert" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 8v5M12 16.5v.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        <path d="M12 2.5 22 20H2L12 2.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+      </svg>
+      <div class="toast-body">
+        <strong data-banner-title>请求失败</strong>
+        <span data-banner-detail></span>
+      </div>
+      <button id="banner-retry" class="btn btn-ghost btn-small" type="button"><span class="btn-label">重试</span></button>
+    </div>
+
+    <div id="notice" class="toast toast-success" role="status" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="m6 12.5 4 4 8-9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <div class="toast-body"><span data-notice></span></div>
     </div>
   </div>
 
