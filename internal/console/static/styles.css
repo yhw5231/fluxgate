@@ -1331,6 +1331,9 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 
 .picker-toolbar .filter-input { flex: 1; min-width: 140px; }
 
+/* 全选与反选挨在一起，自成一个动作组，与「获取模型」和筛选框分开。 */
+.picker-bulk { display: flex; gap: 6px; }
+
 .picker-status {
   font-size: 11.5px;
   color: var(--text-faint);

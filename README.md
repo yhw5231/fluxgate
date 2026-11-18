@@ -369,7 +369,10 @@ upstreams:
   the list from the answer: a model the upstream now lists under a renamed channel is
   re-pointed at the name it uses now instead of keeping the one it was picked under,
   a name typed by hand is left alone, a model that has just appeared in the listing is
-  selected, and one the upstream no longer lists is kept, marked 上游未列出 and
+  left unchecked — a selection is a route, and a name that merely showed up is not the
+  operator asking for it, so 全选 (select all) and 反选 (invert) are what turn a fresh
+  listing into routes, over the rows the filter shows — and one the upstream no longer
+  lists is kept, marked 上游未列出 and
   deselected — left selected it would be a route that cannot be reached, and dropped
   outright it would be a choice taken away before the operator saw it. A model the
   upstream keeps listing keeps the choice the operator made for it. The

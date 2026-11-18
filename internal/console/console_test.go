@@ -802,8 +802,11 @@ func TestUpstreamAddressIsCompletedInTheForm(t *testing.T) {
 // A channel renames itself upstream, so asking for the model list again has to
 // rebuild it from the answer: an entry the upstream now lists under another name
 // is re-pointed at that name instead of keeping the one it was picked under, a
-// model the upstream has just gained is selected, and one it no longer lists is
-// kept, marked and deselected rather than dropped or left routed to.
+// model the upstream has just gained is left unchecked — a selection is a route,
+// and a name that merely appeared is not the operator asking for it — and one it
+// no longer lists is kept, marked and deselected rather than dropped or left
+// routed to. 全选 and 反选 are there for picking a whole listing at once, and they
+// act on the rows the filter shows.
 func TestConsoleRebuildsTheModelListOnEveryFetch(t *testing.T) {
 	script := consoleScript(t)
 
@@ -813,10 +816,14 @@ func TestConsoleRebuildsTheModelListOnEveryFetch(t *testing.T) {
 		"var listing = applyListing(models)",
 		// 上游现在的写法覆盖旧的，除非「上游模型名」是手写的另一个模型。
 		"canonicalModelName(entry.target) === entry.name",
-		// 新出现的模型勾上，上游不再提供的取消勾选并标出。
-		"addModel(spelling, true, '')",
+		// 上游新增的模型按未勾选处理，上游不再提供的取消勾选并标出。
+		"addModel(spelling, false, '')",
 		"entry.checked = false",
 		"（上游未列出）",
+		// 一次勾完一个渠道的模型，不必逐个点。
+		"'全选'",
+		"'反选'",
+		"visibleRows().forEach",
 	} {
 		if !strings.Contains(script, wanted) {
 			t.Errorf("console script is missing %q", wanted)

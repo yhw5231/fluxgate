@@ -3109,8 +3109,8 @@
       '模型名是 deepseek-v4.1-flash，「上游模型名」自动填 cn:deepseek-v4.1-flash，' +
       '发往上游的就是上游列出的写法；同一个模型由多个分组提供时（cn: 与 global:）' +
       '只留一条，行里标出另一种写法，「上游模型名」可改成想要的那一组。' +
-      '「获取模型」按上游最新的列表重建：新出现的模型自动勾选，上游不再提供的自动取消' +
-      '勾选并标出。'));
+      '「获取模型」按上游最新的列表重建：勾选保持原样，上游新增的模型默认不勾选，' +
+      '用「全选」「反选」或逐个勾选来挑；上游不再提供的自动取消勾选并标出。'));
 
     var rows = [];
     var known = {};
@@ -3134,8 +3134,24 @@
       filter = filterInput.value.trim().toLowerCase();
       paint();
     });
+    // 全选与反选处理的是当前筛出来的那批行：筛选就是 operator 给这批模型划的范围，
+    // 按钮跟着它走，筛选时不会顺手改掉看不见的行。
+    var bulk = element('div', 'picker-bulk');
+    var selectAllButton = busyButton('btn btn-ghost btn-small', '全选');
+    selectAllButton.addEventListener('click', function () {
+      visibleRows().forEach(function (entry) { entry.checked = true; });
+      paint();
+    });
+    var invertButton = busyButton('btn btn-ghost btn-small', '反选');
+    invertButton.addEventListener('click', function () {
+      visibleRows().forEach(function (entry) { entry.checked = !entry.checked; });
+      paint();
+    });
+    bulk.appendChild(selectAllButton);
+    bulk.appendChild(invertButton);
     var status = element('span', 'picker-status', '已选 ' + rows.length + ' 个');
     toolbar.appendChild(fetchButton);
+    toolbar.appendChild(bulk);
     toolbar.appendChild(filterInput);
     toolbar.appendChild(status);
     wrapper.appendChild(toolbar);
@@ -3219,11 +3235,13 @@
     /* applyListing rebuilds the list from a probe. Every model the upstream lists
      * now is filed under its canonical name with the spelling the upstream uses
      * now, so a channel that renamed itself stops being asked for by its old
-     * name. A model that was not in the previous answer is selected, because a
-     * listing that has just gained a model is the operator asking to use it; one
-     * the upstream no longer lists is kept and marked but deselected, because a
-     * selection that is left on is a route that cannot be reached. What the
-     * operator chose for a model the upstream keeps listing is left alone.
+     * name. A model the upstream has just gained stays as it was found, which is
+     * unchecked: a selection is a route, and a name that merely appeared in the
+     * answer is not the operator asking for it — 全选 and 反选 are there for the
+     * times a whole new listing is wanted. One the upstream no longer lists is
+     * kept and marked but deselected, because a selection that is left on is a
+     * route that cannot be reached. What the operator chose for a model the
+     * upstream keeps listing is left alone.
      *
      * Every spelling of one model is remembered, so a model a platform serves
      * from two channel groups says so in its row: one entry carries one name to
@@ -3248,12 +3266,12 @@
         seen[exposed] = [spelling];
         var entry = known[exposed];
         if (!entry) {
-          addModel(spelling, true, '');
+          addModel(spelling, false, '');
           added += 1;
           return;
         }
-        // 上一次没列出、这次又出现的模型按新出现的处理：它当时的取消勾选是探测
-        // 做的，不是 operator 选的。
+        // 上一次没列出、这次又出现的模型恢复勾选：它在原来启用的列表里，当时的取消
+        // 勾选是探测做的，不是 operator 选的。
         var returning = entry.unlisted === true;
         if (refreshEntry(entry, spelling)) { refreshed += 1; }
         if (returning) {
@@ -3335,6 +3353,14 @@
         line.appendChild(target);
         list.appendChild(line);
       });
+      // 全选与反选管的是看得见的那些行，所以标题和可用状态跟着筛选取舍。
+      var scope = filter
+        ? '筛选出的 ' + visible.length + ' 个模型'
+        : '全部 ' + rows.length + ' 个模型';
+      selectAllButton.title = '勾选' + scope;
+      invertButton.title = '把' + scope + '的勾选状态反过来';
+      selectAllButton.disabled = visible.length === 0;
+      invertButton.disabled = visible.length === 0;
       updateStatus();
     }
 
@@ -3375,8 +3401,8 @@
         setSubmitting(button, false, '获取模型');
         if (result.ok) {
           var models = (result.body && result.body.models) || [];
-          // 列表按这次探测重建：新出现的模型自动勾上，上游不再提供的取消勾选并
-          // 标出，勾选与否由 operator 复核。
+          // 列表按这次探测重建：勾选保持原样，上游新增的模型不自动勾上，不再提供的
+          // 取消勾选并标出，勾选与否由 operator 复核。
           var listing = applyListing(models);
           var endpoint = result.body && result.body.endpoint;
           // 选择计数由 picker 自己维护，探测结果放在反馈区：说清楚是从哪个地址
@@ -3388,8 +3414,13 @@
             // 同一个模型由多个渠道分组提供时，记录条数比模型个数多。
             summary += '按渠道分组归并后是 ' + listing.models + ' 个模型。';
           }
-          if (listing.added + listing.returned > 0) {
-            summary += '新出现或重新出现的 ' + (listing.added + listing.returned) + ' 个模型已勾选。';
+          if (listing.added > 0) {
+            // 新增的模型不再默认勾选：不说清楚的话，抓完列表看见勾选数没变会以为
+            // 探测没生效。
+            summary += '上游新增的 ' + listing.added + ' 个模型未勾选，可用「全选」「反选」或逐个勾上。';
+          }
+          if (listing.returned > 0) {
+            summary += '重新出现的 ' + listing.returned + ' 个模型已恢复勾选。';
           }
           if (listing.refreshed > 0) {
             summary += '已按上游现在的写法更新 ' + listing.refreshed + ' 个已有模型。';
