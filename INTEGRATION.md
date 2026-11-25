@@ -121,7 +121,27 @@
     + 换 IP / 释放。
   - `GET /management/pools/leases`、`POST /management/pools/{rotate,release,test}`。
 - [ ] **阶段 5b：按失败自动换 IP**（网络错误 / 指定状态码 / 间隔 / 次数触发）
-- [ ] **阶段 7：文档与部署**（README 重写、Compose/环境变量对齐）
+- [x] **阶段 7：文档与部署**
+  - README 补上整合说明（本仓库 = UniGate 并入 Fluxgate 的结果）、新增能力的完整
+    章节（客户端指纹、用量、账号探测、渠道固定及探测/验证、IPv6 代理池）、端点表、
+    运行策略与环境变量表。
+  - INTEGRATION.md 记录功能映射、数据归属与剩余事项（阶段 5b：按失败自动换 IP）。
+  - 干净数据库端到端验收：健康检查、控制台全部页面、全部管理端点、一条真实转发请求。
+- [ ] **阶段 5b：按失败自动换 IP**（网络错误 / 指定状态码 / 间隔 / 次数触发；已
+      文档化为后续增强，当前为手动「换 IP」+ API）
+
+## 7. 验收记录
+
+（在 README「Merged from UniGate」一节给出能力全表；本文件保留设计取舍。）
+
+- 构建与测试：`go build ./...`、`go vet ./...`、`go test ./...` 全绿。
+- 端点：`/healthz`、`/readyz`、`/console/`、`/management/*`（含
+  status / snapshot / configuration / policy / requests / usage / probes /
+  pins probe+validate / pools leases+rotate+release+test）、`/v1/models` 与
+  `/v1/chat/completions` 均在真实进程上验证。
+- 前端：Chrome DevTools Protocol 对全部 11 个视图、窄屏布局、上游/固定/池子编辑框
+  截图核对。
+- 远程：每一步都推送到 `https://github.com/yhw5231/fluxgate`（`main`）。
 
 ## 5. 管理台信息架构（按功能重做）
 

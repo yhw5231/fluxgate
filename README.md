@@ -1,17 +1,41 @@
-﻿# Fluxgate
+# Fluxgate
 
 Fluxgate is a lightweight, independently deployable Go gateway that reads the existing upstream SQLite configuration and provides OpenAI-compatible proxy endpoints — chat, responses, embeddings, images and video — with bounded server-side retries, priority-then-weight routing, proxy selection, and persistent circuit-breaker state. It ships with an embedded management console that both shows the running state and edits that configuration: upstreams with their priorities, weights, keys and models, the routing the gateway derives from them, client keys, proxy profiles, and the retry, failover, and circuit-breaker policy the gateway applies while it runs.
+
+This repository is where the standalone **UniGate** gateway (formerly `cline2api-go`)
+was merged into Fluxgate. UniGate's account-facing capabilities now live in this
+gateway's own architecture and console rather than beside it:
+
+- **Client fingerprint presets** — 23 built-in sets of real AI-coding-client
+  request headers, selected per upstream.
+- **Usage accounting** — what each served request cost in prompt and completion
+  tokens, summed by model, upstream, and client key.
+- **Account health probes** — a small arithmetic question sent through a line's own
+  credential, on a startup sweep, after an idle interval, and when a line comes back
+  from a cooldown.
+- **Internal-provider pins** — pin one model of one upstream to the providers behind
+  it, with a probe that discovers them and a per-provider validation.
+- **IPv6 proxy pools** — one leased exit address per upstream account, kept stable
+  across restarts.
+- **A console laid out by function** — 监控, 渠道, 访问, 系统 — instead of the flat
+  page lists both projects had.
+
+`INTEGRATION.md` records the merge itself: which capability came from which project,
+how the two data models map onto one SQLite file, and what is deliberately still
+ahead.
 
 ## Requirements
 
 - Go 1.23 or later
 - An existing upstream SQLite database containing the required site, account, token, route, channel, downstream key, proxy profile, and settings tables
+- Optional: an IPv6 proxy pool management endpoint, when upstream accounts need
+  their own outbound addresses
 
 The gateway uses the pure-Go `modernc.org/sqlite` driver, so normal builds do not require CGO.
 
 ## Build
 
-From the `go-gateway` directory:
+From the repository root:
 
 ```powershell
 go mod download
