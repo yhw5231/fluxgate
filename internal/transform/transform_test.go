@@ -119,3 +119,66 @@ func TestApplyJSONRejectsTraversalThroughScalar(t *testing.T) {
 		t.Fatal("ApplyJSON() error = nil, want scalar traversal error")
 	}
 }
+
+func TestApplyHeadersWithProfileReplacesTheCallersFingerprint(t *testing.T) {
+	source := http.Header{
+		"Authorization": []string{"Bearer downstream"},
+		"User-Agent":    []string{"curl/8.0"},
+		"X-Caller":      []string{"kept"},
+	}
+	profile := map[string]string{
+		"User-Agent":  "claude-cli/2.1.100 (external, cli)",
+		"X-App":       "cli",
+		"X-Delete-Me": "preset",
+	}
+	rules := domain.TransformRules{
+		SetHeaders: http.Header{
+			// An empty value retires the preset header rather than sending an
+			// empty one, which is how a form switches off one header of a preset.
+			"X-Delete-Me": nil,
+			"X-App":       []string{"custom"},
+		},
+	}
+
+	result := ApplyHeadersWithProfile(source, profile, rules, "upstream-key", "")
+
+	if got := result.Get("User-Agent"); got != "claude-cli/2.1.100 (external, cli)" {
+		t.Fatalf("User-Agent = %q, want the preset value", got)
+	}
+	if got := result.Get("X-App"); got != "custom" {
+		t.Fatalf("X-App = %q, want the upstream rule to win over the preset", got)
+	}
+	if values, present := result["X-Delete-Me"]; present {
+		t.Fatalf("X-Delete-Me = %#v, want the preset header retired", values)
+	}
+	if got := result.Get("X-Caller"); got != "kept" {
+		t.Fatalf("X-Caller = %q, want the caller header preserved", got)
+	}
+	if got := result.Get("Authorization"); got != "Bearer upstream-key" {
+		t.Fatalf("Authorization = %q, want the upstream credential", got)
+	}
+}
+
+func TestApplyHeadersWithProfileKeepsPlainEmptyRuleBehaviour(t *testing.T) {
+	// A configured header the preset does not supply keeps its old meaning: a
+	// blank value is sent as a blank header, not removed.
+	rules := domain.TransformRules{SetHeaders: http.Header{"X-Empty": []string{""}}}
+	result := ApplyHeadersWithProfile(http.Header{}, map[string]string{"X-App": "cli"}, rules, "", "")
+	if got, present := result["X-Empty"]; !present || len(got) != 1 || got[0] != "" {
+		t.Fatalf("X-Empty = %#v, want one blank header value", got)
+	}
+	if got := result.Get("X-App"); got != "cli" {
+		t.Fatalf("X-App = %q, want the preset value", got)
+	}
+}
+
+func TestApplyHeadersWithoutAProfileIsUnchanged(t *testing.T) {
+	source := http.Header{"User-Agent": []string{"curl/8.0"}}
+	result := ApplyHeaders(source, domain.TransformRules{}, "key", "")
+	if got := result.Get("User-Agent"); got != "curl/8.0" {
+		t.Fatalf("User-Agent = %q, want the caller value", got)
+	}
+	if got := ApplyHeadersWithProfile(source, nil, domain.TransformRules{}, "key", "").Get("User-Agent"); got != "curl/8.0" {
+		t.Fatalf("User-Agent with a nil profile = %q, want the caller value", got)
+	}
+}

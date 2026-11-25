@@ -749,3 +749,55 @@ func TestUpstreamRefusesTwoSpellingsOfOneModel(t *testing.T) {
 		t.Fatalf("error = %v, want it to name the two spellings as one model", err)
 	}
 }
+
+// An upstream's client fingerprint is stored on the site and reaches every line
+// the upstream serves: it is a property of the upstream, not of one key.
+func TestUpstreamStoresTheClientFingerprintPreset(t *testing.T) {
+	store := prepareUpstreamStore(t)
+	ctx := context.Background()
+	row := createUpstream(t, store, map[string]any{
+		"name":           "Example",
+		"url":            "https://api.example.com",
+		"client_profile": "claude-code",
+		"keys":           []any{"key-one", "key-two"},
+		"models":         []any{"gpt-4.1"},
+	})
+	siteID := row["id"].(int64)
+	if row["client_profile"] != "claude-code" {
+		t.Fatalf("client_profile = %v, want claude-code", row["client_profile"])
+	}
+
+	configuration, err := store.LoadConfiguration(ctx)
+	if err != nil {
+		t.Fatalf("LoadConfiguration() error = %v", err)
+	}
+	if len(configuration.Channels) != 2 {
+		t.Fatalf("channel count = %d, want one per key", len(configuration.Channels))
+	}
+	for _, channel := range configuration.Channels {
+		if channel.ClientProfile != "claude-code" {
+			t.Fatalf("channel %s client profile = %q, want claude-code", channel.ID, channel.ClientProfile)
+		}
+	}
+
+	// Clearing the preset returns the upstream to forwarding the caller's own
+	// headers, which is the behaviour every upstream had before presets existed.
+	if _, err := store.UpdateResource(ctx, "upstreams", siteID, map[string]any{"client_profile": nil}); err != nil {
+		t.Fatalf("UpdateResource() error = %v", err)
+	}
+	configuration, err = store.LoadConfiguration(ctx)
+	if err != nil {
+		t.Fatalf("LoadConfiguration() after clearing error = %v", err)
+	}
+	for _, channel := range configuration.Channels {
+		if channel.ClientProfile != "" {
+			t.Fatalf("channel %s client profile = %q, want none", channel.ID, channel.ClientProfile)
+		}
+	}
+
+	// A preset the gateway does not carry is refused rather than stored and
+	// silently ignored at dispatch time.
+	if _, err := store.UpdateResource(ctx, "upstreams", siteID, map[string]any{"client_profile": "no-such-client"}); err == nil {
+		t.Fatal("UpdateResource() accepted an unknown client profile")
+	}
+}

@@ -658,3 +658,62 @@ func TestEngineTracesOnlyTheLinesItAsked(t *testing.T) {
 		})
 	}
 }
+
+// A line that names a client fingerprint reaches its upstream as that client:
+// the preset headers replace the caller's own, and the upstream's configured
+// headers still win over the preset.
+func TestEnginePresentsTheSelectedClientFingerprint(t *testing.T) {
+	var seen http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	selector := router.NewMemorySelector(routeFor(nil, domain.Channel{
+		ID:            "claude",
+		BaseURL:       server.URL,
+		APIKey:        "upstream-key",
+		Enabled:       true,
+		SiteID:        1,
+		Weight:        1,
+		ClientProfile: "claude-code",
+		Transform: domain.TransformRules{
+			SetHeaders: http.Header{"User-Agent": []string{"custom-agent"}, "X-Delete-Me": {""}},
+		},
+	}))
+	engine := Engine{
+		Selector: selector,
+		Observer: &recordingObserver{},
+		Client:   &http.Client{},
+		Policy:   domain.RetryPolicy{MaxAttempts: 1, MaxAttemptsPerChannel: 1},
+	}
+	headers := http.Header{"X-Caller": []string{"kept"}, "User-Agent": []string{"curl/8.0"}}
+	_, err := engine.Forward(context.Background(), domain.Request{
+		Method:      http.MethodPost,
+		Path:        "/v1/chat/completions",
+		Headers:     headers,
+		Body:        []byte(`{"model":"m","messages":[]}`),
+		Model:       "m",
+		ContentType: "application/json",
+	})
+	if err != nil {
+		t.Fatalf("Forward() error = %v", err)
+	}
+	if got := seen.Get("X-Caller"); got != "kept" {
+		t.Fatalf("X-Caller = %q, want the caller header preserved", got)
+	}
+	if got := seen.Get("User-Agent"); got != "custom-agent" {
+		t.Fatalf("User-Agent = %q, want the upstream rule over the preset", got)
+	}
+	if got := seen.Get("X-App"); got != "cli" {
+		t.Fatalf("X-App = %q, want the preset header", got)
+	}
+	if got := seen.Get("X-Claude-Code-Session-Id"); got == "" {
+		t.Fatal("the preset's dynamic session identifier was not sent")
+	}
+	if got := seen.Get("Authorization"); got != "Bearer upstream-key" {
+		t.Fatalf("Authorization = %q, want the upstream credential", got)
+	}
+}

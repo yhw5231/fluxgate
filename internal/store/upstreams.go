@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/yhw5231/fluxgate/internal/clientprofile"
 	"github.com/yhw5231/fluxgate/internal/pattern"
 )
 
@@ -129,6 +130,11 @@ var upstreamResource = Resource{
 		{Name: "priority", Kind: KindInt, Synthetic: true},
 		{Name: "global_weight", Kind: KindReal, Validate: validatePositive},
 		{Name: "custom_headers", Kind: KindJSONObject, MaxLength: 8192, Validate: validateStringMap},
+		// The client fingerprint this upstream is reached as: a preset of request
+		// headers a real coding client sends. An empty value sends the caller's own
+		// headers through unchanged, which is what every upstream did before the
+		// presets existed.
+		{Name: "client_profile", Kind: KindText, MaxLength: 64, Choices: clientprofile.IDs()},
 		{Name: "proxy_url", Kind: KindText, MaxLength: 2048, Validate: validateProxyURL},
 		// An upstream added from the console is enabled: a new upstream nobody
 		// can route to would look broken rather than unconfigured.

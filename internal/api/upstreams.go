@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/yhw5231/fluxgate/internal/clientprofile"
 	"github.com/yhw5231/fluxgate/internal/store"
 	"github.com/yhw5231/fluxgate/internal/upstream"
 )
@@ -47,6 +48,10 @@ type upstreamProbeRequest struct {
 	Key     string            `json:"key"`
 	Proxy   string            `json:"proxy_url"`
 	Headers map[string]string `json:"headers"`
+	// Profile is the client fingerprint preset the form selected. The probe
+	// presents it exactly as a dispatched request would, so a listing obtained
+	// here is the one that upstream really serves that client family.
+	Profile string `json:"client_profile"`
 }
 
 // handleUpstreamModels answers the model list of an upstream.
@@ -131,7 +136,7 @@ func (s *Server) upstreamProbeRequest(w http.ResponseWriter, r *http.Request, bo
 	request := upstream.Request{
 		BaseURL:  strings.TrimSpace(payload.URL),
 		APIKey:   strings.TrimSpace(payload.Key),
-		Headers:  payload.Headers,
+		Headers:  probeHeaders(payload.Profile, payload.Headers),
 		ProxyURL: s.probeProxy(r.Context(), payload.Proxy),
 	}
 	if !store.IsMaskedSecret(request.APIKey) {
@@ -156,6 +161,25 @@ func (s *Server) upstreamProbeRequest(w http.ResponseWriter, r *http.Request, bo
 	}
 	request.APIKey = stored
 	return request, true
+}
+
+// probeHeaders assembles the headers the probe presents: the selected client
+// fingerprint, with the headers typed into the form on top of it. The order is
+// the one a dispatched request uses, so a probe answers for what saving would
+// actually send.
+func probeHeaders(profile string, configured map[string]string) map[string]string {
+	preset := clientprofile.Headers(profile)
+	if len(preset) == 0 {
+		return configured
+	}
+	merged := make(map[string]string, len(preset)+len(configured))
+	for name, value := range preset {
+		merged[name] = value
+	}
+	for name, value := range configured {
+		merged[name] = value
+	}
+	return merged
 }
 
 // probeProxy decides how the probe leaves the gateway: the proxy the form

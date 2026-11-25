@@ -210,6 +210,7 @@ func TestLoadConfigurationModelsChannelPolicyAndProxyPrecedence(t *testing.T) {
 			proxy_url TEXT,
 			use_system_proxy INTEGER DEFAULT 0,
 			custom_headers TEXT,
+			client_profile TEXT,
 			status TEXT NOT NULL DEFAULT 'active',
 			global_weight REAL DEFAULT 1
 		)`,
@@ -253,8 +254,8 @@ func TestLoadConfigurationModelsChannelPolicyAndProxyPrecedence(t *testing.T) {
 			group_route_id INTEGER NOT NULL,
 			source_route_id INTEGER NOT NULL
 		)`,
-		`INSERT INTO sites (id, name, url, platform, proxy_url, use_system_proxy, custom_headers, status, global_weight)
-		 VALUES (1, 'site', 'https://API.Example.com/v1', 'openai', 'http://site-proxy.example:8080', 1, '{}', 'active', 2.5)`,
+		`INSERT INTO sites (id, name, url, platform, proxy_url, use_system_proxy, custom_headers, client_profile, status, global_weight)
+		 VALUES (1, 'site', 'https://API.Example.com/v1', 'openai', 'http://site-proxy.example:8080', 1, '{}', 'claude-code', 'active', 2.5)`,
 		`INSERT INTO accounts (id, site_id, access_token, api_token, extra_config, status)
 		 VALUES (10, 1, 'account-access', 'account-api', '{"proxyUrl":"http://account-proxy.example:8080","useSystemProxy":true}', 'active')`,
 		`INSERT INTO account_tokens (id, account_id, token, proxy_url, use_system_proxy, enabled)
@@ -331,6 +332,9 @@ func TestLoadConfigurationModelsChannelPolicyAndProxyPrecedence(t *testing.T) {
 	}
 	if !channel.SiteUseSystemProxy {
 		t.Fatal("site use_system_proxy was not loaded")
+	}
+	if channel.ClientProfile != "claude-code" {
+		t.Fatalf("channel client profile = %q, want claude-code", channel.ClientProfile)
 	}
 	if channel.SiteID != 1 || channel.AccountID != 10 || channel.TokenID == nil || *channel.TokenID != 20 {
 		t.Fatalf("channel identity = site:%d account:%d token:%v", channel.SiteID, channel.AccountID, channel.TokenID)
@@ -654,6 +658,39 @@ func TestEnsureUpstreamSchemaAddsTheAllowedSiteColumnToAnOlderDatabase(t *testin
 	}
 	if len(rows) != 1 {
 		t.Fatalf("ListResource(keys) returned %d rows, want the legacy key", len(rows))
+	}
+}
+
+// A database created before sites.client_profile existed is brought up to the
+// current shape rather than rejected, and an upstream written by an older
+// application reads as one that presents no client fingerprint at all.
+func TestEnsureUpstreamSchemaAddsTheClientProfileColumnToAnOlderDatabase(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	createUpstreamTables(t, store)
+	if _, err := store.db.Exec(`INSERT INTO sites (name, url, platform) VALUES ('legacy', 'https://legacy.example/v1', 'openai')`); err != nil {
+		t.Fatalf("insert the site written before the column existed: %v", err)
+	}
+	if _, err := store.db.Exec(`ALTER TABLE sites DROP COLUMN client_profile`); err != nil {
+		t.Fatalf("drop client_profile to model an older database: %v", err)
+	}
+
+	// A restart runs the migration again, which must find the column present.
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := store.EnsureUpstreamSchema(ctx); err != nil {
+			t.Fatalf("EnsureUpstreamSchema() attempt %d error = %v", attempt+1, err)
+		}
+	}
+
+	rows, err := store.ListResource(ctx, "sites")
+	if err != nil {
+		t.Fatalf("ListResource(sites) error = %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListResource(sites) returned %d rows, want the legacy site", len(rows))
+	}
+	if value := rows[0]["client_profile"]; value != nil {
+		t.Fatalf("client_profile = %#v, want no preset", value)
 	}
 }
 

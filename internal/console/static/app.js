@@ -346,6 +346,20 @@
     });
   }
 
+  /* 客户端指纹预设是网关给的数据，不是这里写死的清单：名字、可信度都由预设自己
+   * 声明，所以下拉里显示的是预设名与它被核实的程度。 */
+  function clientProfileOptions() {
+    var catalog = (state.configuration && state.configuration.client_profiles) || [];
+    var confidence = { verified: '已核实', partial: '部分核实', unverified: '未核实' };
+    return catalog.map(function (profile) {
+      var label = (profile.starred ? '★ ' : '') + (profile.name || profile.id);
+      if (profile.confidence && confidence[profile.confidence]) {
+        label += '（' + confidence[profile.confidence] + '）';
+      }
+      return { value: profile.id, label: label };
+    });
+  }
+
   var STATUS_OPTIONS = [
     { value: 'active', label: '启用' },
     { value: 'disabled', label: '停用' }
@@ -392,7 +406,11 @@
       },
       global_weight: { label: '权重', type: 'number', step: 'any', placeholder: '1', help: '优先级相同时按权重随机分配：权重越大，被选中的概率越高。' },
       priority: { label: '优先级', type: 'number', step: '1', placeholder: '0', help: '数值越大越先用：只要优先级更高的上游还有可用线路，请求就不会落到优先级更低的上游；优先级相同（默认 0）的按权重随机分配。' },
-      custom_headers: { label: '请求头', type: 'json', placeholder: '{"X-Custom": "value"}', help: 'JSON 对象，会附加到发往这个上游的每个请求上。' },
+      custom_headers: { label: '请求头', type: 'json', placeholder: '{"X-Custom": "value"}', help: 'JSON 对象，会附加到发往这个上游的每个请求上；和预设同名时以这里的值为准，值留空表示去掉预设里的那个头。' },
+      client_profile: {
+        label: '客户端指纹', type: 'select', options: clientProfileOptions,
+        help: '以哪种客户端的身份访问这个上游：预设会带上该客户端的 UA 与协议头，让上游按该客户端处理（版本、鉴权头由网关按密钥注入，预设里没有鉴权头）。留空表示原样转发调用方的请求头。'
+      },
       proxy_url: { label: '代理', placeholder: 'http://127.0.0.1:7890', help: '留空表示直连；填 system 表示使用系统代理。获取模型和转发请求都走这个出口。' },
       status: { label: '状态', type: 'select', options: STATUS_OPTIONS, help: '停用后该上游的线路不再参与选路。' },
       keys: { label: '密钥', help: '一行一个，可以整段粘贴。留空表示保持已保存的密钥不变。' },
@@ -3396,7 +3414,10 @@
         url: url,
         key: firstKeyLine(),
         proxy_url: editorFieldValue('proxy_url'),
-        headers: headers
+        headers: headers,
+        // 探测也带指纹：网关按这个上游实际会用的客户端身份去问模型列表，
+        // 拿到的就是那个客户端能看到的清单。
+        client_profile: editorFieldValue('client_profile') || ''
       }).then(function (result) {
         setSubmitting(button, false, '获取模型');
         if (result.ok) {
@@ -3578,7 +3599,9 @@
     }
 
     if (meta.type === 'select' || (field.choices && field.choices.length > 0)) {
-      var options = meta.options || choiceOptions(field);
+      var options = typeof meta.options === 'function'
+        ? meta.options()
+        : (meta.options || choiceOptions(field));
       var select = document.createElement('select');
       select.id = inputID;
       select.className = 'field-input';

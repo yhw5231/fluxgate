@@ -44,7 +44,8 @@ const channelQuery = `SELECT
 	rc.route_id, rc.id, COALESCE(rc.priority, 0), COALESCE(rc.weight, 10), COALESCE(rc.enabled, 1), rc.source_model, rc.token_id,
 	a.id, a.access_token, a.api_token, a.extra_config, COALESCE(a.status, 'active'),
 	s.id, s.name, s.url, s.platform, s.forced_upstream_endpoint, s.proxy_url,
-	COALESCE(s.use_system_proxy, 0), s.custom_headers, COALESCE(s.status, 'active'), COALESCE(s.global_weight, 1),
+	COALESCE(s.use_system_proxy, 0), s.custom_headers, COALESCE(s.client_profile, ''),
+	COALESCE(s.status, 'active'), COALESCE(s.global_weight, 1),
 	at.token, at.proxy_url, COALESCE(at.use_system_proxy, 0), COALESCE(at.enabled, 1)
 FROM route_channels rc
 JOIN accounts a ON a.id = rc.account_id
@@ -212,6 +213,7 @@ var upstreamSchemaDDL = []string{
 	`CREATE TABLE IF NOT EXISTS sites (
 		id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, platform TEXT NOT NULL,
 		proxy_url TEXT, use_system_proxy INTEGER DEFAULT 0, custom_headers TEXT,
+		client_profile TEXT,
 		status TEXT DEFAULT 'active', global_weight REAL DEFAULT 1, forced_upstream_endpoint TEXT
 	)`,
 	`CREATE TABLE IF NOT EXISTS accounts (
@@ -293,6 +295,12 @@ func (s *SQLiteStore) EnsureUpstreamSchema(ctx context.Context) error {
 	// It is nullable and reads as an absent restriction, so a row written by an
 	// application that does not know the column keeps meaning what it always did.
 	if err := s.addColumnIfMissing(ctx, "downstream_api_keys", "allowed_site_ids", "TEXT"); err != nil {
+		return err
+	}
+	// An upstream's client fingerprint preset is a column the console writes, so
+	// a database created before it existed gains it in place rather than being
+	// rejected. Absent reads as "no preset", which is what those rows meant.
+	if err := s.addColumnIfMissing(ctx, "sites", "client_profile", "TEXT"); err != nil {
 		return err
 	}
 	return nil
@@ -792,6 +800,7 @@ func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route
 			siteName, siteURL, platform, siteStatus   string
 			forcedEndpoint, siteProxy, customHeaders  sql.NullString
 			siteSystemProxy                           int
+			siteClientProfile                         string
 			siteGlobalWeight                          float64
 			accountToken, tokenProxy                  sql.NullString
 			tokenSystemProxy, tokenEnabled            int
@@ -800,7 +809,7 @@ func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route
 			&routeID, &channelID, &priority, &weight, &channelEnabled, &sourceModel, &tokenID,
 			&accountID, &accessToken, &apiToken, &accountExtraConfig, &accountStatus,
 			&siteID, &siteName, &siteURL, &platform, &forcedEndpoint, &siteProxy,
-			&siteSystemProxy, &customHeaders, &siteStatus, &siteGlobalWeight,
+			&siteSystemProxy, &customHeaders, &siteClientProfile, &siteStatus, &siteGlobalWeight,
 			&accountToken, &tokenProxy, &tokenSystemProxy, &tokenEnabled,
 		); err != nil {
 			return nil, fmt.Errorf("scan route channel: %w", err)
@@ -845,6 +854,7 @@ func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route
 			SiteGlobalWeight:   siteGlobalWeight,
 			SitePriority:       sitePriorities[siteID],
 			SourceModel:        resolveSourceModel(sourceModel.String, route.ModelPattern),
+			ClientProfile:      strings.TrimSpace(siteClientProfile),
 		}
 		// The upstream's own cooldown mode decides how a failing key is held out
 		// of rotation: per key, or per key and model. An upstream the console has

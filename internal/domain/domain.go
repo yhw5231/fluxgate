@@ -32,7 +32,12 @@ type Channel struct {
 	SiteProxyURL       string
 	SiteUseSystemProxy bool
 	Transform          TransformRules
-	RequestTimeout     time.Duration
+	// ClientProfile names the client fingerprint preset the line presents to its
+	// upstream, such as a coding agent's own user agent and protocol headers. It
+	// is resolved per attempt, because a preset can carry a value that has to be
+	// generated per request — a session identifier — rather than a constant.
+	ClientProfile  string
+	RequestTimeout time.Duration
 
 	// Routing identity. SiteID, AccountID and TokenID identify the upstream
 	// credential so downstream key exclusions can be applied.

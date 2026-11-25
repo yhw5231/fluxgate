@@ -19,14 +19,39 @@ import (
 // leaves the client's own Content-Type in place, and supplies JSON only when the
 // client named none — which is the shape every proxy endpoint reads.
 func ApplyHeaders(source http.Header, rules domain.TransformRules, apiKey, contentType string) http.Header {
+	return ApplyHeadersWithProfile(source, nil, rules, apiKey, contentType)
+}
+
+// ApplyHeadersWithProfile is ApplyHeaders with a client fingerprint preset.
+//
+// The preset is applied before the upstream's own header rules, and it replaces
+// whatever the downstream caller sent under the same name: the caller's own
+// headers are exactly what a fingerprint exists to hide. The upstream's rules
+// then win over the preset, so an upstream can still correct or retire a header
+// the preset supplies — a configured empty value removes that preset header
+// instead of sending an empty one.
+func ApplyHeadersWithProfile(source http.Header, profile map[string]string, rules domain.TransformRules, apiKey, contentType string) http.Header {
 	result := source.Clone()
 	if result == nil {
 		result = make(http.Header)
+	}
+	for name, value := range profile {
+		result.Set(name, value)
 	}
 	for _, name := range rules.RemoveHeaders {
 		result.Del(strings.TrimSpace(name))
 	}
 	for name, values := range rules.SetHeaders {
+		if len(values) == 0 && profileHas(profile, name) {
+			result.Del(name)
+			continue
+		}
+		if allEmpty(values) && profileHas(profile, name) {
+			// The explicit field list a form submits for a header carries no value:
+			// retiring a preset header is what the operator asked for.
+			result.Del(name)
+			continue
+		}
 		result.Del(name)
 		for _, value := range values {
 			result.Add(name, value)
@@ -48,6 +73,28 @@ func ApplyHeaders(source http.Header, rules domain.TransformRules, apiKey, conte
 		result.Set("Content-Type", "application/json")
 	}
 	return result
+}
+
+// profileHas reports whether a preset sends a header under this name, compared
+// the way HTTP compares header names.
+func profileHas(profile map[string]string, name string) bool {
+	wanted := http.CanonicalHeaderKey(strings.TrimSpace(name))
+	for candidate := range profile {
+		if http.CanonicalHeaderKey(candidate) == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+// allEmpty reports whether every configured value is blank.
+func allEmpty(values []string) bool {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // ApplyJSON mutates a JSON object using JSON Pointer or dotted paths.

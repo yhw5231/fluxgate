@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yhw5231/fluxgate/internal/clientprofile"
 	"github.com/yhw5231/fluxgate/internal/policy"
 	"github.com/yhw5231/fluxgate/internal/store"
 )
@@ -370,6 +371,10 @@ func (s *Server) configurationInventory(ctx context.Context) (map[string]any, er
 		"fields":        fields,
 		"policy":        applied.Values(),
 		"policy_fields": policy.Fields(),
+		// The client fingerprint presets travel with the configuration because an
+		// upstream selects one by id: the console needs the labels, and an operator
+		// deciding which client to present needs the evidence each preset records.
+		"client_profiles": clientprofile.Catalog(),
 	}, nil
 }
 

@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/yhw5231/fluxgate/internal/clientprofile"
 )
 
 // Management writes to the upstream configuration.
@@ -234,6 +236,7 @@ var resources = []Resource{
 			{Name: "proxy_url", Kind: KindText, MaxLength: 2048, Validate: validateProxyURL},
 			{Name: "use_system_proxy", Kind: KindBool},
 			{Name: "custom_headers", Kind: KindJSONObject, MaxLength: 8192, Validate: validateStringMap},
+			{Name: "client_profile", Kind: KindText, MaxLength: 64, Choices: clientprofile.IDs()},
 			{Name: "forced_upstream_endpoint", Kind: KindText, MaxLength: 2048, Validate: validateHTTPURL},
 		},
 		GuardDelete: func(ctx context.Context, tx *sql.Tx, id int64) error {

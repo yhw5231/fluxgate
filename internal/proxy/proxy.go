@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/yhw5231/fluxgate/internal/clientprofile"
 	"github.com/yhw5231/fluxgate/internal/domain"
 	"github.com/yhw5231/fluxgate/internal/transform"
 )
@@ -400,7 +401,7 @@ func buildRequest(ctx context.Context, input domain.Request, channel domain.Chan
 		cancel()
 		return upstreamCall{}, fmt.Errorf("build upstream request: %w", err)
 	}
-	request.Header = transform.ApplyHeaders(input.Headers, channel.Transform, channel.APIKey, body.ContentType)
+	request.Header = transform.ApplyHeadersWithProfile(input.Headers, clientprofile.Headers(channel.ClientProfile), channel.Transform, channel.APIKey, body.ContentType)
 	request.GetBody = func() (io.ReadCloser, error) {
 		return io.NopCloser(bytes.NewReader(body.Raw)), nil
 	}
