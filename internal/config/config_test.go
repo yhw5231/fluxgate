@@ -48,6 +48,11 @@ func TestDefaultProductionSettings(t *testing.T) {
 	if cfg.Breaker.Mode != breaker.ModeCooldown || cfg.Breaker.Threshold <= 0 {
 		t.Fatalf("unexpected breaker defaults: %#v", cfg.Breaker)
 	}
+	// Token accounting is what turns a served request into a cost, so it is on by
+	// default and bounded.
+	if !cfg.Usage.Enabled || cfg.Usage.Keep <= 0 {
+		t.Fatalf("unexpected usage defaults: %#v", cfg.Usage)
+	}
 }
 
 func TestLoadOverridesProductionSettings(t *testing.T) {
@@ -120,5 +125,26 @@ func TestLoadRejectsInconsistentBounds(t *testing.T) {
 	t.Setenv("FLUXGATE_BREAKER_MAX_COOLDOWN", "1m")
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() error = nil, want cooldown-bound validation error")
+	}
+}
+
+// The usage log is a runtime policy value as well as an environment default: the
+// console can switch it off, and the environment decides where it starts.
+func TestUsagePolicyFollowsTheEnvironment(t *testing.T) {
+	t.Setenv("FLUXGATE_USAGE_LOG_ENABLED", "false")
+	t.Setenv("FLUXGATE_USAGE_LOG_KEEP", "250")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Usage.Enabled || cfg.Usage.Keep != 250 {
+		t.Fatalf("cfg.Usage = %#v, want the environment overrides", cfg.Usage)
+	}
+	// The policy the gateway installs has to carry the same value; a config that
+	// keeps it only in its own struct would leave the server recording with the
+	// zero policy.
+	applied := cfg.Policy()
+	if applied.Usage.Enabled || applied.Usage.Keep != 250 {
+		t.Fatalf("Policy().Usage = %#v, want the environment overrides", applied.Usage)
 	}
 }

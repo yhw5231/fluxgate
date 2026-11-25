@@ -1454,3 +1454,25 @@ input[type="password"].field-input { font-family: var(--font-mono); }
     transition-duration: 0.001ms !important;
   }
 }
+
+/* ===== Usage view =====
+ * 三张分组表并排：同一批记录按模型、上游、客户端密钥各给一次答案，窄屏时自动
+ * 堆叠成一列。汇总卡片沿用概览的统计卡样式，只是放在面板内部，所以自己补内边距。 */
+.toolbar-label { font-size: 12px; color: var(--text-muted); }
+.usage-stats { padding: 0 20px 16px; }
+.usage-groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 18px;
+  padding: 0 20px 18px;
+}
+.usage-group { min-width: 0; }
+.usage-group-title {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+.usage-group .table-wrap { max-height: 340px; overflow: auto; }
+#usage-window { flex: 0 0 auto; min-width: 140px; }

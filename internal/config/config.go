@@ -82,6 +82,9 @@ type Config struct {
 	Breaker               breaker.Policy
 	// RequestLog bounds the gateway's record of the requests it served.
 	RequestLog policy.RequestLogPolicy
+	// Usage bounds the gateway's token accounting: whether what each answer cost
+	// is recorded, and how many records the log holds.
+	Usage policy.UsagePolicy
 	// IntegrityCheck verifies the shared SQLite database at startup so a
 	// damaged file fails loudly instead of serving wrong routing data.
 	IntegrityCheck bool
@@ -90,7 +93,13 @@ type Config struct {
 // Policy is the runtime traffic policy these settings produce. A console write
 // overrides individual values of it; the environment supplies the rest.
 func (c Config) Policy() policy.Policy {
-	return policy.Policy{Retry: c.Retry, Failover: c.Failover, Breaker: c.Breaker, RequestLog: c.RequestLog}
+	return policy.Policy{
+		Retry:      c.Retry,
+		Failover:   c.Failover,
+		Breaker:    c.Breaker,
+		RequestLog: c.RequestLog,
+		Usage:      c.Usage,
+	}
 }
 
 // Load reads gateway settings from environment variables and applies bounded,
@@ -189,6 +198,12 @@ func Load() (Config, error) {
 	if cfg.RequestLog.Keep, err = intEnv("FLUXGATE_REQUEST_LOG_KEEP", cfg.RequestLog.Keep, true); err != nil {
 		return Config{}, err
 	}
+	if cfg.Usage.Enabled, err = boolEnv("FLUXGATE_USAGE_LOG_ENABLED", cfg.Usage.Enabled); err != nil {
+		return Config{}, err
+	}
+	if cfg.Usage.Keep, err = intEnv("FLUXGATE_USAGE_LOG_KEEP", cfg.Usage.Keep, true); err != nil {
+		return Config{}, err
+	}
 
 	if value := strings.TrimSpace(os.Getenv("FLUXGATE_BREAKER_MODE")); value != "" {
 		cfg.Breaker.Mode = breaker.Mode(value)
@@ -249,6 +264,7 @@ func Default() Config {
 		Failover:              traffic.Failover,
 		Breaker:               traffic.Breaker,
 		RequestLog:            traffic.RequestLog,
+		Usage:                 traffic.Usage,
 		IntegrityCheck:        defaultIntegrityCheck,
 	}
 }

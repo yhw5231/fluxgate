@@ -26,14 +26,14 @@
 
   /* 管理视图 = 概览之外的视图，它们读取的是可写的配置清单。设置页也读取配置，
    * 因为运行策略和配置一起返回。 */
-  var VIEWS = ['overview', 'upstream', 'routes', 'requests', 'keys', 'settings'];
+  var VIEWS = ['overview', 'usage', 'upstream', 'routes', 'requests', 'keys', 'settings'];
   /* 请求记录页读的是网关自己的日志，不依赖配置清单，所以它不在 MANAGEMENT_VIEWS
    * 里：配置读不出来的时候，记录仍然看得到。 */
   var MANAGEMENT_VIEWS = { upstream: true, routes: true, keys: true, settings: true };
   /* 会自己刷新的视图：概览读取运行时快照，路由页读取每条线路的实时状态，请求
    * 记录页读的是一份还在增长的日志。其余视图是可编辑的配置表，只能在操作者
    * 自己触发时重画。 */
-  var LIVE_VIEWS = { overview: true, routes: true, requests: true };
+  var LIVE_VIEWS = { overview: true, usage: true, routes: true, requests: true };
 
   /* The settings view groups its panels by function and shows one group at a
    * time, so no single page carries the account, the runtime policy and the
@@ -57,6 +57,9 @@
     // requests holds the record of served requests: what the gateway answered,
     // and the filters the operator narrowed the view with.
     requests: { records: [], total: 0, page: 0, retention: null, error: null, failedOnly: false, model: '' },
+    // usage holds the token accounting over the window the operator picked. It is
+    // read on its own so a usage refresh never waits on the configuration.
+    usage: { window: '7d', summary: null, error: null },
     // revealedKeys holds the client keys an operator asked to see, by row id.
     // The listing only ever carries the mask, so a value lives here only after a
     // deliberate read, and it is dropped again on the next configuration read.
@@ -135,6 +138,22 @@
     els.requestsPrev = $('requests-prev');
     els.requestsNext = $('requests-next');
     els.requestsPageNote = document.querySelector('[data-page-note]');
+
+    // The usage view: one window selector, four totals, and one table per way of
+    // grouping the same records (model, upstream, client key).
+    els.usageWindow = $('usage-window');
+    els.usageMeta = document.querySelector('[data-view-panel="usage"] [data-usage-meta]');
+    els.usageRetention = document.querySelector('[data-usage-retention]');
+    els.usageClear = $('usage-clear');
+    els.usageEmpty = document.querySelector('[data-usage-empty]');
+    els.usageStats = {};
+    document.querySelectorAll('[data-usage-stat]').forEach(function (card) {
+      els.usageStats[card.getAttribute('data-usage-stat')] = card;
+    });
+    els.usageTables = {};
+    document.querySelectorAll('[data-usage-table]').forEach(function (table) {
+      els.usageTables[table.getAttribute('data-usage-table')] = table.querySelector('tbody');
+    });
 
     els.banner = $('error-banner');
     els.bannerTitle = els.banner.querySelector('[data-banner-title]');
@@ -1348,6 +1367,7 @@
 
     var wantsConfiguration = MANAGEMENT_VIEWS[state.view] || !state.configuration;
     var wantsRequests = state.view === 'requests';
+    var wantsUsage = state.view === 'usage';
     var calls = [request('/management/status'), request('/management/snapshot')];
     // The index of each optional call is tracked rather than assumed, so a view
     // that needs one of them cannot read another's answer.
@@ -1360,6 +1380,11 @@
     if (wantsRequests) {
       requestsIndex = calls.length;
       calls.push(request(requestsQuery()));
+    }
+    var usageIndex = -1;
+    if (wantsUsage) {
+      usageIndex = calls.length;
+      calls.push(request('/management/usage?window=' + encodeURIComponent(state.usage.window)));
     }
 
     Promise.all(calls).then(function (results) {
@@ -1403,6 +1428,9 @@
       if (requestsIndex !== -1) {
         applyRequestLog(results[requestsIndex]);
       }
+      if (usageIndex !== -1) {
+        applyUsage(results[usageIndex]);
+      }
 
       hideBanner();
       state.failure = null;
@@ -1411,6 +1439,7 @@
       renderManagement();
       renderRouting();
       renderRequests();
+      renderUsage();
       renderPolicy();
     }).catch(function (err) {
       refreshFailure('无法连接网关', String(err && err.message ? err.message : err));
@@ -2412,6 +2441,166 @@
   function emptyRequestsText() {
     if (state.requests.failedOnly) { return '没有失败的请求。'; }
     return '还没有请求记录。经过网关的每个请求都会记在这里。';
+  }
+
+  /* ===== 用量统计 =====
+   *
+   * 用量页只读一份汇总：窗口内每个请求的 token 用量，以及按模型、上游、客户端
+   * 密钥分组后的同一批数字。数字是上游在响应里自报的，网关不估算，所以「请求数」
+   * 与「已计量」的差就是上游没回 usage 的请求——那是未知，不是零。
+   */
+
+  function applyUsage(result) {
+    if (result && result.ok && result.body) {
+      state.usage.summary = result.body;
+      state.usage.error = null;
+      return;
+    }
+    state.usage.summary = null;
+    state.usage.error = result ? errorMessage(result.body, '读取用量统计失败。') : '读取用量统计失败。';
+  }
+
+  /* formatTokens renders a token count with thousands separators, because the
+   * numbers an operator compares are routinely six figures. */
+  function formatTokens(value) {
+    var count = number(value);
+    if (!isFinite(count)) { return '—'; }
+    return count.toLocaleString('zh-CN');
+  }
+
+  function usageRetentionText(summary) {
+    if (!summary) { return ''; }
+    var retention = summary.retention || {};
+    if (retention.enabled === false) {
+      return '用量记录已关闭（设置 → 运行策略）';
+    }
+    var parts = ['保留最近 ' + formatTokens(retention.keep) + ' 条'];
+    if (retention.count) {
+      parts.push('现有 ' + formatTokens(retention.count) + ' 条');
+    }
+    if (retention.oldest) {
+      parts.push('最早 ' + formatTimestamp(retention.oldest));
+    }
+    return parts.join(' · ');
+  }
+
+  function usageStat(name) {
+    var card = els.usageStats[name];
+    if (!card) { return null; }
+    return {
+      value: card.querySelector('[data-value]'),
+      sub: card.querySelector('[data-sub]')
+    };
+  }
+
+  function setUsageStat(name, value, sub) {
+    var nodes = usageStat(name);
+    if (!nodes) { return; }
+    nodes.value.textContent = value;
+    if (sub !== undefined) { nodes.sub.textContent = sub; }
+  }
+
+  /* usageGroupRows draws one grouping of the same records. The three tables share
+   * their shape on purpose: reading "which model cost the most" and "which
+   * upstream cost the most" should not need a different eye. */
+  function usageGroupRows(name, breakdown) {
+    var body = els.usageTables[name];
+    if (!body) { return; }
+    body.textContent = '';
+    var rows = Array.isArray(breakdown) ? breakdown : [];
+    if (rows.length === 0) {
+      var empty = document.createElement('tr');
+      var cellNode = element('td', 'cell-muted', '没有数据');
+      cellNode.colSpan = 5;
+      empty.appendChild(cellNode);
+      body.appendChild(empty);
+      return;
+    }
+    rows.forEach(function (entry) {
+      var row = document.createElement('tr');
+      cell(row, entry.name && entry.name !== 'unknown' ? element('span', 'mono', String(entry.name)) : element('span', 'cell-muted', '未知'));
+      cell(row, formatTokens(entry.requests), 'num');
+      cell(row, formatTokens(entry.prompt_tokens), 'num');
+      cell(row, formatTokens(entry.completion_tokens), 'num');
+      cell(row, formatTokens(entry.total_tokens), 'num');
+      body.appendChild(row);
+    });
+  }
+
+  function setUsageEmptyText(message) {
+    if (!els.usageEmpty) { return; }
+    var paragraph = els.usageEmpty.querySelector('[data-empty-text]');
+    if (paragraph) { paragraph.textContent = message; }
+  }
+
+  function renderUsage() {
+    if (!els.usageWindow) { return; }
+    if (els.usageWindow.value !== state.usage.window) {
+      els.usageWindow.value = state.usage.window;
+    }
+    var summary = state.usage.summary;
+    var tables = document.querySelector('[data-view-panel="usage"] .usage-groups');
+
+    if (!summary) {
+      els.usageMeta.textContent = state.usage.error || '暂无数据';
+      setUsageStat('requests', '—', '成功 / 失败');
+      setUsageStat('prompt', '—', 'prompt');
+      setUsageStat('completion', '—', 'completion');
+      setUsageStat('total', '—', '输入 + 输出');
+      els.usageRetention.textContent = state.usage.error ? '' : usageRetentionText(null);
+      ['models', 'channels', 'keys'].forEach(function (name) { usageGroupRows(name, []); });
+      if (tables) { tables.hidden = true; }
+      els.usageEmpty.hidden = false;
+      setUsageEmptyText(state.usage.error || '还没有用量数据。');
+      return;
+    }
+
+    var requests = number(summary.requests);
+    var measured = number(summary.reported);
+    els.usageMeta.textContent = '共 ' + formatTokens(requests) + ' 个请求 · 已计量 ' + formatTokens(measured) + ' 个';
+    els.usageRetention.textContent = usageRetentionText(summary);
+    setUsageStat('requests', formatTokens(requests),
+      '成功 ' + formatTokens(summary.succeeded) + ' / 失败 ' + formatTokens(summary.failed));
+    setUsageStat('prompt', formatTokens(summary.prompt_tokens), 'prompt');
+    setUsageStat('completion', formatTokens(summary.completion_tokens), 'completion');
+    setUsageStat('total', formatTokens(summary.total_tokens), '输入 + 输出');
+
+    var hasRecords = requests > 0;
+    if (tables) { tables.hidden = !hasRecords; }
+    els.usageEmpty.hidden = hasRecords;
+    if (!hasRecords) {
+      setUsageEmptyText('这个时间范围还没有用量记录。经过网关的每个请求都会记在这里。');
+      ['models', 'channels', 'keys'].forEach(function (name) { usageGroupRows(name, []); });
+      return;
+    }
+    usageGroupRows('models', summary.models);
+    usageGroupRows('channels', summary.channels);
+    usageGroupRows('keys', summary.keys);
+  }
+
+  function clearUsageLog() {
+    openConfirm({
+      title: '清空用量统计',
+      text: '将删除全部 token 用量记录。请求记录与熔断状态不受影响，确认清空？',
+      confirmLabel: '清空',
+      danger: true,
+      run: function () { return remove('/management/usage').then(handleClearedUsage); }
+    });
+  }
+
+  function handleClearedUsage(result) {
+    if (result.ok) {
+      var cleared = result.body && typeof result.body.cleared === 'number' ? result.body.cleared : 0;
+      showNotice(cleared > 0 ? '已清空 ' + cleared + ' 条用量记录。' : '用量记录已经是空的。');
+      state.usage.summary = null;
+      refresh();
+      return null;
+    }
+    if (result.status === 401) {
+      showAuth('登录状态已失效，请重新登录后继续。');
+      return null;
+    }
+    throw new Error(errorMessage(result.body, '清空用量统计失败。'));
   }
 
   /* renderRequestPager says which page is open and how many there are, and offers
@@ -4104,7 +4293,7 @@
    * how long a failing line is held out of rotation. The gateway owns the field
    * list, so a policy value added there shows up here without a change to this
    * file; only the labels and the wording of each section live here. */
-  var POLICY_SECTION_ORDER = ['failover', 'retry', 'breaker', 'request_log'];
+  var POLICY_SECTION_ORDER = ['failover', 'retry', 'breaker', 'request_log', 'usage'];
 
   var POLICY_SECTIONS = {
     failover: {
@@ -4122,6 +4311,10 @@
     request_log: {
       title: '请求记录',
       help: '记录网关服务过的每个请求，包括上游返回的原文。「请求记录」页读的就是它，排查报错靠它；流量大时可以关闭或缩短保留条数。'
+    },
+    usage: {
+      title: '用量统计',
+      help: '记录每个请求的 token 用量（上游在响应里自报的输入与输出），「用量」页读的就是它。关闭后不再记账，已有的记录仍可查看和清空；流量大时保留条数决定这个库能回溯多久。'
     }
   };
 
@@ -4139,7 +4332,9 @@
     'gateway.breaker.max_cooldown_seconds': { label: '冷却时间上限', unit: 's' },
     'gateway.breaker.cooldown_multiplier': { label: '冷却倍数', unit: 'x', help: '每多熔断一次，冷却时间乘以此倍数，直到上限。' },
     'gateway.request_log.enabled': { label: '记录请求', help: '关闭后不再记录任何请求，已有的记录仍然可以在「请求记录」页查看和清空。' },
-    'gateway.request_log.keep': { label: '保留条数', unit: 'count', help: '只保留最近的这么多条，更早的记录在写入新记录时被删除。' }
+    'gateway.request_log.keep': { label: '保留条数', unit: 'count', help: '只保留最近的这么多条，更早的记录在写入新记录时被删除。' },
+    'gateway.usage.enabled': { label: '记录用量', help: '关闭后不再统计 token 用量，已有的记录仍然可以在「用量」页查看和清空。' },
+    'gateway.usage.keep': { label: '保留条数', unit: 'count', help: '只保留最近的这么多条用量记录，更早的在写入新记录时被删除。' }
   };
 
   var POLICY_UNITS = { count: '次', ms: '毫秒', s: '秒', x: '倍' };
@@ -4808,6 +5003,17 @@
     }
     if (els.requestsClear) {
       els.requestsClear.addEventListener('click', clearRequestLog);
+    }
+    if (els.usageWindow) {
+      // The window is a server-side question, so changing it reads the totals for
+      // that window rather than filtering a list the page already holds.
+      els.usageWindow.addEventListener('change', function () {
+        state.usage.window = els.usageWindow.value;
+        refresh();
+      });
+    }
+    if (els.usageClear) {
+      els.usageClear.addEventListener('click', clearUsageLog);
     }
 
     els.editorForm.addEventListener('submit', submitEditor);

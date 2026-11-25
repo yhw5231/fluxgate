@@ -106,6 +106,7 @@
       <!-- 应用内视图切换。每个按钮对应一个 main，只有一个可见。 -->
       <nav class="console-nav" id="console-nav" aria-label="管理台视图">
         <button class="nav-item is-active" type="button" data-view="overview">概览</button>
+        <button class="nav-item" type="button" data-view="usage">用量</button>
         <button class="nav-item" type="button" data-view="upstream">上游</button>
         <button class="nav-item" type="button" data-view="routes">路由</button>
         <button class="nav-item" type="button" data-view="requests">请求记录</button>
@@ -244,6 +245,98 @@
         <span data-footer-loaded>配置加载：&mdash;</span>
         <span class="footer-brand">fluxgate 管理台</span>
       </footer>
+    </main>
+
+    <!-- ===== 用量：每个请求花了多少 token，按模型 / 上游 / 密钥分组 ===== -->
+    <main class="container" data-view-panel="usage" hidden>
+      <section class="panel">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="title-tick" aria-hidden="true"></span>
+            <h2>用量统计</h2>
+            <span class="panel-meta" data-usage-meta></span>
+          </div>
+          <div class="panel-actions">
+            <span class="panel-note">每 10 秒自动刷新 &middot; <span data-next-refresh>&mdash;</span></span>
+          </div>
+        </header>
+        <p class="panel-help">这里统计的是上游在响应里自报的 token 用量：输入（prompt）与输出（completion）。数字由上游给出，网关只负责汇总，所以提供商不回 usage 时，那个请求会被计入「请求数」但不计入 token；<strong>「已计量」与总数的差就是这种请求</strong>。可以按模型、上游、客户端密钥分别看钱花在哪里，切换时间范围不会影响已经记录的数据。</p>
+        <div class="panel-toolbar">
+          <label class="toolbar-label" for="usage-window">时间范围</label>
+          <select id="usage-window" class="filter-input" aria-label="时间范围">
+            <option value="today">今日</option>
+            <option value="24h">最近 24 小时</option>
+            <option value="7d" selected>最近 7 天</option>
+            <option value="30d">最近 30 天</option>
+            <option value="all">全部</option>
+          </select>
+          <span class="panel-note" data-usage-retention></span>
+          <button id="usage-clear" class="btn btn-ghost btn-small" type="button">清空用量</button>
+        </div>
+        <div class="stats-grid usage-stats" data-usage-stats aria-label="用量汇总">
+          <article class="stat-card" data-usage-stat="requests">
+            <div class="stat-body">
+              <span class="stat-label">请求</span>
+              <span class="stat-value" data-value>&mdash;</span>
+              <span class="stat-sub" data-sub>成功 / 失败</span>
+            </div>
+          </article>
+          <article class="stat-card" data-usage-stat="prompt">
+            <div class="stat-body">
+              <span class="stat-label">输入 tokens</span>
+              <span class="stat-value" data-value>&mdash;</span>
+              <span class="stat-sub" data-sub>prompt</span>
+            </div>
+          </article>
+          <article class="stat-card" data-usage-stat="completion">
+            <div class="stat-body">
+              <span class="stat-label">输出 tokens</span>
+              <span class="stat-value" data-value>&mdash;</span>
+              <span class="stat-sub" data-sub>completion</span>
+            </div>
+          </article>
+          <article class="stat-card" data-usage-stat="total">
+            <div class="stat-body">
+              <span class="stat-label">合计 tokens</span>
+              <span class="stat-value" data-value>&mdash;</span>
+              <span class="stat-sub" data-sub>输入 + 输出</span>
+            </div>
+          </article>
+        </div>
+        <div class="usage-groups">
+          <section class="usage-group">
+            <h3 class="usage-group-title">按模型</h3>
+            <div class="table-wrap">
+              <table class="data-table" data-usage-table="models">
+                <thead><tr><th>模型</th><th class="num">请求</th><th class="num">输入</th><th class="num">输出</th><th class="num">合计</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </section>
+          <section class="usage-group">
+            <h3 class="usage-group-title">按上游</h3>
+            <div class="table-wrap">
+              <table class="data-table" data-usage-table="channels">
+                <thead><tr><th>上游</th><th class="num">请求</th><th class="num">输入</th><th class="num">输出</th><th class="num">合计</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </section>
+          <section class="usage-group">
+            <h3 class="usage-group-title">按客户端密钥</h3>
+            <div class="table-wrap">
+              <table class="data-table" data-usage-table="keys">
+                <thead><tr><th>密钥</th><th class="num">请求</th><th class="num">输入</th><th class="num">输出</th><th class="num">合计</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+        <div class="empty-state" data-usage-empty hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          <p data-empty-text>这个时间范围还没有用量记录。经过网关的每个请求都会记在这里。</p>
+        </div>
+      </section>
     </main>
 
     <!-- ===== 上游：一个上游服务就是一条配置 ===== -->

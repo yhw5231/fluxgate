@@ -311,8 +311,10 @@ models is all it takes to route them; the routes appear by themselves. Every
 accepted write reloads the configuration and hands the result to the routing
 engine, so an upstream added in the console serves traffic on the next request.
 
-The views are 概览 (the live dashboard), 上游 (upstreams), 路由 (the routing table
-the gateway derived), 客户端密钥 (client keys), and 设置. The settings view is
+The views are 概览 (the live dashboard), 用量 (what the served requests cost in
+tokens, by model, upstream, and client key), 上游 (upstreams), 路由 (the routing table
+the gateway derived), 请求记录 (the record of served requests), 客户端密钥 (client
+keys), and 设置. The settings view is
 grouped by function and shows one group at a time: 账号 (the administrator
 account), 运行策略 (the runtime policy), and 代理 (proxy profiles).
 
@@ -333,7 +335,7 @@ weight are both edited in place: type a number in the row, press Enter or 保存
 the change is stored and applied for the next request. A 线路状态 column summarizes
 how that upstream's lines currently stand, and expanding a row lists them.
 
-The upstream form is built around the four things that actually vary between
+The upstream form is built around the five things that actually vary between
 upstreams:
 
 - **The address is completed, not corrected later.** A trailing slash is dropped and a
@@ -351,6 +353,18 @@ upstreams:
 - **Key selection has two modes.** 可用优先 (available first) prefers the first key
   and moves to the next one only when it fails or is cooling down; 加权随机
   (weighted random) spreads requests across every key in proportion to its weight.
+- **The client is presented as itself.** An upstream routinely serves a coding client
+  differently from a bare HTTP caller — a different model list, a different error, a
+  different rate limit. 客户端指纹 selects one of 23 built-in presets of the request
+  headers a real AI coding client sends, so every line of that upstream reaches it as
+  that client. Each preset records its evidence and is labelled 已核实 (verified),
+  部分核实 (partial), or 未核实 (unverified), so an operator can see which values
+  were observed and which were filled in from a client family's conventions. A preset
+  never carries a credential: the gateway injects the upstream key, and an
+  Authorization header in a preset would replace it. The upstream's own 请求头 still
+  wins over the preset, and configuring one with an empty value removes that preset
+  header instead of sending an empty one. With no preset the caller's own headers are
+  forwarded unchanged.
 - **Models are picked, not typed.** 获取模型 asks the upstream itself for its model
   list, so the operator selects from what it really serves; a model can also be
   typed in by hand. A listing entry names one model: the name is read from the
@@ -515,6 +529,8 @@ Management endpoints:
 - `POST /management/breakers/reset`
 - `GET /management/requests`
 - `DELETE /management/requests`
+- `GET /management/usage`
+- `DELETE /management/usage`
 - `GET /management/session`
 - `POST /management/login`
 - `POST /management/logout`
@@ -523,7 +539,9 @@ Management endpoints:
 `{resource}` is one of `upstreams`, `sites`, `accounts`, `tokens`, `routes`,
 `channels`, `keys`, or `proxies`. `GET /management/configuration` returns every row of
 each resource with secrets masked, the writable field list of each resource, the models
-the gateway currently routes, and the runtime policy with its field list, so the console
+the gateway currently routes, the runtime policy with its field list, and the built-in
+client fingerprint presets (`client_profiles`, each with its name, confidence, headers,
+and evidence), so the console
 builds its tables and forms from one payload. A successful write answers with the stored
 row and the reloaded payload, so the console repaints from a single round trip; when a
 key value was minted it is returned once as `generated.key`. A create needs the fields
@@ -660,6 +678,49 @@ from that text.
 The record is on by default and keeps the newest 1000 requests; see
 `FLUXGATE_REQUEST_LOG_ENABLED` and `FLUXGATE_REQUEST_LOG_KEEP`, or the 请求记录 section
 of 设置 → 运行策略 in the console.
+
+### Usage records
+
+A request record says what happened to a request; it does not say what the request
+cost. The upstream states that in its answer — `prompt_tokens` and `completion_tokens`
+in a JSON body, or the same object in the final event of a streamed answer — and the
+gateway is the only party that ever sees it. Every served request therefore leaves a
+usage record: the time, the path, the model, the client key by name, the line that
+answered, the status, the duration, and the token counts.
+
+The counts are the upstream's own. A provider that answers without a usage object
+leaves a request counted but uncosted, and the answer says how many requests were
+measured (`reported`), so the difference from `requests` is unknown cost rather than
+zero. Nothing is estimated. A streamed answer is counted from its final event, which
+is where a provider states the usage; an answer cut off before that event leaves a
+record without counts, which is the honest result — the request happened, its cost was
+never stated.
+
+`GET /management/usage` accepts:
+
+| Query | Meaning |
+| --- | --- |
+| `window` | `today` (the operator's local calendar day), `24h`, `7d` (the default), `30d`, or `all`. |
+| `model` | Only one model, compared without case. |
+| `key_id` | Only one client key's requests. |
+| `channel` | Only one upstream, matched by its name or by its line id. |
+
+The answer carries the totals over the window (`requests`, `succeeded`, `failed`,
+`prompt_tokens`, `completion_tokens`, `total_tokens`, `reported`), the same numbers
+grouped by model, by upstream, and by client key, and a `retention` block saying
+whether the log is kept, how many records it holds, and how far back it reaches — so a
+view can say what its numbers cover instead of implying they are complete. The console
+shows it under 用量, with the same window selector; changing the window re-reads the
+totals rather than filtering a list the page already holds.
+
+`DELETE /management/usage` empties the log, which is how an operator starts a fresh
+measurement after a change. It removes the accounting only: the request records that
+explain what happened, and the circuits that decide where requests go, stay where they
+are.
+
+The usage log is on by default and keeps the newest 100000 records; see
+`FLUXGATE_USAGE_LOG_ENABLED` and `FLUXGATE_USAGE_LOG_KEEP`, or the 用量统计 section of
+设置 → 运行策略 in the console.
 
 `/management/session`, `/management/login`, and `/management/logout` manage the console
 session itself and are therefore not themselves protected by one. `/management/password`
@@ -1090,6 +1151,24 @@ The log is a gateway-owned table (`gateway_request_log`), created at startup bes
 a write that fails is reported in the process log as `request_log_write_failed` — it never
 changes what the client was told.
 
+### Usage-log settings
+
+- `FLUXGATE_USAGE_LOG_ENABLED`: Whether the gateway records what each served request
+  cost in tokens, as the upstream reported it. Default: `true`. With it off, nothing new
+  is recorded; existing records stay readable and can be cleared from the console.
+- `FLUXGATE_USAGE_LOG_KEEP`: How many usage records the log holds. Default: `100000`.
+  The newest records are kept and the rest are dropped as new ones are written. It is
+  separate from the request log because the two answer different questions and are kept
+  for different lengths of time.
+
+The log is a gateway-owned table (`gateway_usage_events`), created at startup with
+indexes on its time, model, upstream, and client key. It is written once per served
+request, after the answer has been relayed, and is read by `GET /management/usage`; a
+write that fails is reported as `usage_write_failed` and never changes what the client
+was told. The counts travel from the upstream's answer through a tee that adds no
+buffering to the response: an answer larger than 2 MiB is not scanned, and its usage is
+reported as unknown rather than as zero.
+
 ### Runtime policy
 
 The retry, failover, and circuit-breaker settings above can be changed while the
@@ -1115,6 +1194,8 @@ back; restoring a section's defaults does that for every value in it.
 | `gateway.breaker.cooldown_multiplier` | Growth factor applied per consecutive trip. |
 | `gateway.request_log.enabled` | Whether the gateway records the requests it serves. |
 | `gateway.request_log.keep` | How many records the log holds, newest kept. |
+| `gateway.usage.enabled` | Whether the gateway records what each answer cost in tokens. |
+| `gateway.usage.keep` | How many usage records the log holds, newest kept. |
 
 A policy value is validated twice: on its own against the field's range or choice list,
 and as a whole against the rules that tie two values together — a per-line attempt

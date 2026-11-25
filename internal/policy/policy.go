@@ -46,11 +46,15 @@ const (
 	KeyRequestLogEnabled = "gateway.request_log.enabled"
 	KeyRequestLogKeep    = "gateway.request_log.keep"
 
+	KeyUsageEnabled = "gateway.usage.enabled"
+	KeyUsageKeep    = "gateway.usage.keep"
+
 	maxAttemptsCeiling           = 64
 	maxAttemptsPerChannelCeiling = 64
 	maxBackoffCeilingMS          = int64(10 * 60 * 1000)
 	maxCooldownCeilingSeconds    = int64(7 * 24 * 60 * 60)
 	maxRequestLogKeep            = int64(100000)
+	maxUsageKeep                 = int64(1000000)
 )
 
 // Kind classifies an editable value so a console can pick a widget and the
@@ -71,6 +75,7 @@ const (
 	SectionRetry      = "retry"
 	SectionBreaker    = "breaker"
 	SectionRequestLog = "request_log"
+	SectionUsage      = "usage"
 )
 
 // Field describes one editable policy value.
@@ -111,6 +116,9 @@ func Fields() []Field {
 
 		{Key: KeyRequestLogEnabled, Section: SectionRequestLog, Kind: KindBool},
 		{Key: KeyRequestLogKeep, Section: SectionRequestLog, Kind: KindInt, Unit: "count", Min: number(1), Max: number(float64(maxRequestLogKeep))},
+
+		{Key: KeyUsageEnabled, Section: SectionUsage, Kind: KindBool},
+		{Key: KeyUsageKeep, Section: SectionUsage, Kind: KindInt, Unit: "count", Min: number(1), Max: number(float64(maxUsageKeep))},
 	}
 }
 
@@ -120,6 +128,18 @@ type Policy struct {
 	Failover   domain.FailoverPolicy
 	Breaker    breaker.Policy
 	RequestLog RequestLogPolicy
+	Usage      UsagePolicy
+}
+
+// UsagePolicy bounds the gateway's token accounting: whether the cost of each
+// request is recorded at all, and how many records the log holds. It is separate
+// from the request log because the two answer different questions and are kept
+// for different lengths of time: the request log explains one failure, while the
+// usage log measures what a period cost.
+type UsagePolicy struct {
+	Enabled bool
+	// Keep is how many usage records the log holds. The newest ones are kept.
+	Keep int
 }
 
 // RequestLogPolicy bounds the gateway's record of the requests it serves. What
@@ -157,6 +177,7 @@ func Default() Policy {
 			Multiplier:   defaultCooldownMultiplier,
 		},
 		RequestLog: RequestLogPolicy{Enabled: defaultRequestLogEnabled, Keep: defaultRequestLogKeep},
+		Usage:      UsagePolicy{Enabled: defaultUsageEnabled, Keep: defaultUsageKeep},
 	}
 }
 
@@ -170,6 +191,8 @@ const (
 	defaultCooldownMultiplier    = 2.0
 	defaultRequestLogEnabled     = true
 	defaultRequestLogKeep        = 1000
+	defaultUsageEnabled          = true
+	defaultUsageKeep             = 100000
 )
 
 var (
@@ -200,6 +223,9 @@ func (p Policy) Values() map[string]any {
 
 		KeyRequestLogEnabled: p.RequestLog.Enabled,
 		KeyRequestLogKeep:    int64(p.RequestLog.Keep),
+
+		KeyUsageEnabled: p.Usage.Enabled,
+		KeyUsageKeep:    int64(p.Usage.Keep),
 	}
 }
 
@@ -327,6 +353,8 @@ func Validate(p Policy) error {
 		return ConstraintError{KeyBreakerCooldownMultiplier, "must be at least 1"}
 	case p.RequestLog.Keep < 1 || p.RequestLog.Keep > int(maxRequestLogKeep):
 		return ConstraintError{KeyRequestLogKeep, fmt.Sprintf("must be between 1 and %d", maxRequestLogKeep)}
+	case p.Usage.Keep < 1 || p.Usage.Keep > int(maxUsageKeep):
+		return ConstraintError{KeyUsageKeep, fmt.Sprintf("must be between 1 and %d", maxUsageKeep)}
 	case !validBreakerMode(p.Breaker.Mode):
 		return ConstraintError{KeyBreakerMode, "must be one of " + strings.Join(fieldChoices(KeyBreakerMode), ", ")}
 	}
@@ -544,6 +572,18 @@ func setValue(current Policy, key, text string) (Policy, error) {
 			return current, err
 		}
 		next.RequestLog.Keep = number
+	case KeyUsageEnabled:
+		flag, err := strconv.ParseBool(text)
+		if err != nil {
+			return current, err
+		}
+		next.Usage.Enabled = flag
+	case KeyUsageKeep:
+		number, err := strconv.Atoi(text)
+		if err != nil {
+			return current, err
+		}
+		next.Usage.Keep = number
 	default:
 		return current, fmt.Errorf("unknown policy setting %q", key)
 	}

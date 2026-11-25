@@ -25,6 +25,7 @@ import (
 	"github.com/yhw5231/fluxgate/internal/router"
 	"github.com/yhw5231/fluxgate/internal/store"
 	"github.com/yhw5231/fluxgate/internal/transform"
+	"github.com/yhw5231/fluxgate/internal/usage"
 	"github.com/yhw5231/fluxgate/internal/version"
 )
 
@@ -73,6 +74,10 @@ type Server struct {
 	// what the console's request view reads and what explains a failure after the
 	// fact. When nil, no record is kept and the request endpoints answer 503.
 	RequestLog RequestLog
+	// Usage keeps the token accounting of the requests the gateway served: what
+	// each answer cost, as the upstream reported it. When nil, no usage is
+	// recorded and the usage endpoints answer 503.
+	Usage UsageLog
 	// MediaJobs keeps where each upstream-side generation job was created, which
 	// is what lets a request that names no model reach the line that holds the
 	// work. When nil, a job cannot be recorded and the follow-up endpoints answer
@@ -214,6 +219,10 @@ func (s *Server) Handler() http.Handler {
 	// nowhere else.
 	mux.HandleFunc("GET /management/requests", s.handleRequestLog)
 	mux.HandleFunc("DELETE /management/requests", s.handleRequestLogClear)
+	// What the requests cost in tokens: the usage view sums what each upstream
+	// stated over a window, by model, upstream, and client key.
+	mux.HandleFunc("GET /management/usage", s.handleUsage)
+	mux.HandleFunc("DELETE /management/usage", s.handleUsageClear)
 	// Clearing a recorded circuit, which is the manual half of breaker recovery.
 	mux.HandleFunc("POST /management/breakers/reset", s.handleBreakerReset)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -771,9 +780,14 @@ func (s *Server) handleProxy(endpoint proxyEndpoint) http.HandlerFunc {
 		// The client is told which request this was, so a failure it reports can be
 		// looked up rather than guessed at from a timestamp.
 		w.Header().Set("X-Fluxgate-Request-Id", record.RequestID)
+		// usageTap follows the upstream answer on its way to the client, so the
+		// token counts are read without buffering or delaying the answer. It is
+		// declared here because the deferred recorder below reports what it saw.
+		var usageTap *usage.Tap
 		defer func() {
 			record.DurationMS = time.Since(started).Milliseconds()
 			s.recordProxiedRequest(r, record)
+			s.recordUsage(r, record, usageTap)
 		}()
 
 		limit := s.MaxRequestBodyBytes
@@ -857,8 +871,16 @@ func (s *Server) handleProxy(endpoint proxyEndpoint) http.HandlerFunc {
 		record.Status = result.Response.StatusCode
 		copyResponseHeaders(w.Header(), result.Response.Header)
 		w.Header().Set("X-Fluxgate-Upstream-Channel", result.Attempt.ChannelID)
-		w.WriteHeader(result.Response.StatusCode)
 		events := strings.Contains(strings.ToLower(result.Response.Header.Get("Content-Type")), "text/event-stream")
+		// Usage is read from the answer as it is relayed: the upstream states what
+		// the request cost in the body, or in the final event of a stream, and the
+		// gateway is the only party that ever sees it. The tap is installed after
+		// any job capture, so it observes exactly the bytes the client receives.
+		if s.Usage != nil {
+			usageTap = usage.NewTap(result.Response.Body, envelope.Stream || events)
+			result.Response.Body = usageTap
+		}
+		w.WriteHeader(result.Response.StatusCode)
 		if envelope.Stream || events {
 			// Only an event stream can carry a heartbeat: a comment line in a JSON
 			// body would corrupt it, so an answer that is not an event stream — an

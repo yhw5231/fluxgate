@@ -84,6 +84,13 @@ func run(parent context.Context, logger *slog.Logger) error {
 		return err
 	}
 
+	// The token accounting is written on every served request, so its table and
+	// indexes are created before the first one arrives rather than on the first
+	// write.
+	if err := persistentStore.EnsureUsageSchema(parent); err != nil {
+		return err
+	}
+
 	// A fresh deployment gets a built-in administrator so the console is
 	// reachable without a CLI step. The account is flagged as needing a password
 	// change, and the data endpoints refuse it until that happens, so the
@@ -173,6 +180,7 @@ func run(parent context.Context, logger *slog.Logger) error {
 		BreakerSnapshotter:  breakerStore,
 		BreakerReset:        breakerStore,
 		RequestLog:          persistentStore,
+		Usage:               persistentStore,
 		MediaJobs:           persistentStore,
 		PolicyDefaults:      cfg.Policy(),
 		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,
