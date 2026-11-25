@@ -44,6 +44,9 @@ type Channel struct {
 	SiteID           int64
 	AccountID        int64
 	TokenID          *int64
+	// SitePoolID names the proxy pool the upstream draws its accounts' exit
+	// addresses from; zero means the upstream uses no pool.
+	SitePoolID       int64
 	SiteGlobalWeight float64
 	SourceModel      string
 	// SitePriority is the upstream's own priority, and the only priority

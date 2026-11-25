@@ -17,6 +17,7 @@ type ProxySource string
 
 const (
 	ProxySourceKey     ProxySource = "key"
+	ProxySourcePool    ProxySource = "pool"
 	ProxySourceSite    ProxySource = "site"
 	ProxySourceDefault ProxySource = "default"
 	ProxySourceSystem  ProxySource = "system"
@@ -58,6 +59,13 @@ func (r ResolvedProxy) CacheKey() string {
 type Resolver struct {
 	SystemProxy func(*http.Request) (*url.URL, error)
 
+	// PoolURL supplies the proxy address of an upstream account that draws its
+	// exit from an IPv6 proxy pool. It is consulted after the account's own proxy
+	// and before the upstream's, because a lease is chosen per account and is more
+	// specific than a site-wide decision. The hook is fixed for the life of the
+	// process; the pool configuration behind it is updated in place.
+	PoolURL func(keyID string) (string, error)
+
 	mu     sync.RWMutex
 	Config ProxyConfig
 }
@@ -84,6 +92,15 @@ func (r *Resolver) Resolve(request ProxyRequest) (ResolvedProxy, error) {
 	config := r.config()
 	if value := strings.TrimSpace(config.Keys[request.KeyID]); value != "" {
 		return r.resolveConfiguredProxy(ProxySourceKey, value, request.TargetURL)
+	}
+	if r.PoolURL != nil {
+		value, err := r.PoolURL(request.KeyID)
+		if err != nil {
+			return ResolvedProxy{}, err
+		}
+		if strings.TrimSpace(value) != "" {
+			return parseResolvedProxy(ProxySourcePool, value)
+		}
 	}
 	if request.TargetURL != nil {
 		host := strings.ToLower(request.TargetURL.Hostname())

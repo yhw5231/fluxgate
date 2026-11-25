@@ -107,7 +107,20 @@
     ok / rate_limited / auth_rejected / upstream_error / bad_status / unreachable。
   - 管理台「渠道固定」行内新增「探测」「验证」按钮：探测结果显示管线、实际渠道与发现
     的渠道数；验证结果汇总可用/限流/鉴权失败/不可用，并把失败明细放在提示条里。
-- [ ] **阶段 5：IPv6 代理池**（租约管理、换 IP、共享池）
+- [x] **阶段 5：IPv6 代理池**
+  - 新增 `internal/proxypool`：池子管理端客户端（status / 申请 / 换 IP / 释放）、
+    租约管理器（每账号一个租约；同一上游的账号永不共用，不同上游按「最满载且不含该
+    上游」的规则装填）、SOCKS5 地址渲染（per_ipv6 独立端口 / multiplex 复用端口 +
+    租约名作用户名）。
+  - 新表 `gateway_proxy_pools`（通用资源 `pools`，令牌只写不读）与
+    `gateway_pool_assignments`（分配持久化，重启地址不变）；`sites.pool_id`
+    让上游引用一个池，旧库就地补列。
+  - 代理优先级：账号自身代理 → 池租约 → 上游代理 → 默认代理 → 系统 → 直连；池子
+    不可用时请求失败，而不是悄悄走直连。
+  - 管理台「代理池」页：池子 CRUD + 测试、租约列表（池子/上游/账号/出口/代理地址）
+    + 换 IP / 释放。
+  - `GET /management/pools/leases`、`POST /management/pools/{rotate,release,test}`。
+- [ ] **阶段 5b：按失败自动换 IP**（网络错误 / 指定状态码 / 间隔 / 次数触发）
 - [ ] **阶段 7：文档与部署**（README 重写、Compose/环境变量对齐）
 
 ## 5. 管理台信息架构（按功能重做）

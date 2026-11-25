@@ -211,6 +211,7 @@ func TestLoadConfigurationModelsChannelPolicyAndProxyPrecedence(t *testing.T) {
 			use_system_proxy INTEGER DEFAULT 0,
 			custom_headers TEXT,
 			client_profile TEXT,
+			pool_id INTEGER,
 			status TEXT NOT NULL DEFAULT 'active',
 			global_weight REAL DEFAULT 1
 		)`,

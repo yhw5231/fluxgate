@@ -230,6 +230,8 @@ var resources = []Resource{
 	// machinery carries them: the console gets its list, form and validation from
 	// one description.
 	pinResource,
+	// Proxy pools are gateway-owned too, and configured as one more table.
+	poolResource,
 	{
 		Name: "sites", Table: "sites", OrderBy: "id",
 		Columns: []Column{

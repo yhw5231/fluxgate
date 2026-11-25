@@ -1,4 +1,4 @@
-# Fluxgate
+﻿# Fluxgate
 
 Fluxgate is a lightweight, independently deployable Go gateway that reads the existing upstream SQLite configuration and provides OpenAI-compatible proxy endpoints — chat, responses, embeddings, images and video — with bounded server-side retries, priority-then-weight routing, proxy selection, and persistent circuit-breaker state. It ships with an embedded management console that both shows the running state and edits that configuration: upstreams with their priorities, weights, keys and models, the routing the gateway derives from them, client keys, proxy profiles, and the retry, failover, and circuit-breaker policy the gateway applies while it runs.
 
@@ -312,8 +312,9 @@ accepted write reloads the configuration and hands the result to the routing
 engine, so an upstream added in the console serves traffic on the next request.
 
 The console is laid out by what each page is for. A sidebar carries four groups —
-监控 (概览, 用量, 探测, 请求记录), 渠道 (上游, 路由, 渠道固定), 访问 (客户端密钥, 代理),
-and 系统 (设置) — and the top bar names the group and the page on screen, so a page
+监控 (概览, 用量, 探测, 请求记录), 渠道 (上游, 路由, 渠道固定), 访问 (客户端密钥, 代理,
+代理池), and 系统 (设置) — and the top bar names the group and the page on screen, so a
+page
 is placeable without reading the whole sidebar. On a narrow screen the sidebar
 becomes a wrapping row above the content, so a table keeps the width it needs.
 
@@ -322,7 +323,8 @@ tokens, by model, upstream, and client key), 探测 (whether each account still
 works), 上游 (upstreams), 路由 (the routing table
 the gateway derived), 渠道固定 (the internal providers a model is pinned to),
 请求记录 (the record of served requests), 客户端密钥 (client
-keys), 代理 (proxy profiles), and 设置. The settings view is
+keys), 代理 (proxy profiles), 代理池 (IPv6 proxy pools and the leases the gateway
+holds from them), and 设置. The settings view is
 grouped by function and shows one group at a time: 账号 (the administrator
 account), 运行策略 (the runtime policy), and 客户端指纹 (the built-in client
 fingerprint presets with their evidence).
@@ -476,6 +478,60 @@ Both actions are console actions too: the 渠道固定 table carries 探测 and 
 row, and the notice says what was found (the pipeline, the provider that actually
 served, how many providers were named) or how many answered.
 
+### IPv6 proxy pools
+
+An upstream that rate-limits by address sees every account behind one gateway as
+one client. An IPv6 proxy pool buys the thing the gateway cannot make for itself: a
+different outbound address per account, each reachable over SOCKS5. The gateway
+keeps one lease per upstream account and remembers it, so the address an upstream
+sees does not change with the gateway's uptime.
+
+A pool is configured under 代理池: its management address (`admin_url`), the token
+that authorizes those calls, the SOCKS5 host (empty means the same machine), the
+SOCKS5 layout (`auto`, `per_ipv6`, or `multiplex`), and whether it is enabled.
+测试 reads the pool's own status, which is what tells a wrong address or a wrong
+token apart from an empty pool.
+
+An upstream names one pool (代理池 in the upstream form). Every account of that
+upstream — each key is an account — is given its own lease from it:
+
+- **Two accounts of one upstream never share a lease.** That is the whole point: a
+  pool exists so two keys of the same upstream do not look like one client.
+- **Accounts of different upstreams may share one.** Each upstream only ever sees
+  one address per account, so one lease can carry as many upstreams as it likes;
+  the manager packs a new upstream onto the most loaded lease that does not already
+  carry that upstream.
+- **The lease id is stable**, derived from the pool and the account, so asking again
+  returns the lease the account already had. The assignment is written to
+  `gateway_pool_assignments`, which is why a restart does not reshuffle addresses.
+
+The first request through an account acquires its lease. If the pool cannot answer,
+that request fails: leaving through the gateway's own address instead would send the
+account out from the address the pool exists to avoid, and hide the failure.
+
+The SOCKS5 address is derived from what the pool reports. In `per_ipv6` mode each
+lease has its own port (`socks5h://host:port`); in `multiplex` mode every lease
+shares the pool's port and the lease id is the username
+(`socks5h://user:<lease>:x@host:port`). `auto` decides from the pool's own status.
+A lease's address takes precedence after an account's own configured proxy and
+before the upstream's: a per-account decision is more specific than a site-wide one.
+
+The leases are managed from the 代理池 page, which lists which account holds which
+address (an account is shown as 令牌 #id or 账号 #id, never as a credential), and
+through the management api:
+
+| Endpoint | Meaning |
+| --- | --- |
+| `GET /management/pools/leases` | Every lease the gateway holds, with its address and the pools it came from. |
+| `POST /management/pools/rotate` | `{"pool_id": 1, "owner_key": "t12"}` asks the pool for a new address on that lease. |
+| `POST /management/pools/release` | Gives one account's lease back to the pool; the account acquires a new one on its next request. |
+| `POST /management/pools/test` | `{"pool_id": 1}` reads the pool's status. |
+
+Rotation is an operator's decision (换 IP on the leases table, or the endpoint
+above). The gateway does not rotate on its own yet: doing so automatically on a
+network failure or a 5xx needs the request path to feed failures back to the pool,
+which is a later step.
+
 An upstream added from the console is created enabled, so its lines serve traffic
 as soon as it is saved. Client keys are created enabled too, and their restrictions —
 排除模型 (denied models), 限定路由 (allowed routes), 限定上游 (allowed upstreams), and
@@ -613,13 +669,17 @@ Management endpoints:
 - `DELETE /management/probes`
 - `POST /management/pins/probe`
 - `POST /management/pins/validate`
+- `GET /management/pools/leases`
+- `POST /management/pools/rotate`
+- `POST /management/pools/release`
+- `POST /management/pools/test`
 - `GET /management/session`
 - `POST /management/login`
 - `POST /management/logout`
 - `POST /management/password`
 
-`{resource}` is one of `upstreams`, `pins`, `sites`, `accounts`, `tokens`, `routes`,
-`channels`, `keys`, or `proxies`. `GET /management/configuration` returns every row of
+`{resource}` is one of `upstreams`, `pins`, `pools`, `sites`, `accounts`, `tokens`,
+`routes`, `channels`, `keys`, or `proxies`. `GET /management/configuration` returns every row of
 each resource with secrets masked, the writable field list of each resource, the models
 the gateway currently routes, the runtime policy with its field list, and the built-in
 client fingerprint presets (`client_profiles`, each with its name, confidence, headers,

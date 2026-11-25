@@ -6,6 +6,7 @@ import (
 
 	"github.com/yhw5231/fluxgate/internal/breaker"
 	"github.com/yhw5231/fluxgate/internal/domain"
+	"github.com/yhw5231/fluxgate/internal/proxypool"
 )
 
 // Store provides read-only access to the existing application configuration
@@ -38,8 +39,11 @@ type Configuration struct {
 	Models         []string
 	DownstreamKeys []DownstreamAPIKey
 	ProxyProfiles  []ProxyProfile
-	Settings       map[string]string
-	LoadedAt       time.Time
+	// Pools are the configured IPv6 proxy pools an upstream may draw its accounts'
+	// exit addresses from.
+	Pools    []proxypool.Pool
+	Settings map[string]string
+	LoadedAt time.Time
 }
 
 // DownstreamAPIKey represents an enabled client credential and its routing

@@ -26,10 +26,10 @@
 
   /* 管理视图 = 概览之外的视图，它们读取的是可写的配置清单。设置页也读取配置，
    * 因为运行策略和配置一起返回。 */
-  var VIEWS = ['overview', 'usage', 'probes', 'upstream', 'routes', 'pins', 'requests', 'keys', 'proxies', 'settings'];
+  var VIEWS = ['overview', 'usage', 'probes', 'upstream', 'routes', 'pins', 'requests', 'keys', 'proxies', 'pools', 'settings'];
   /* 请求记录页读的是网关自己的日志，不依赖配置清单，所以它不在 MANAGEMENT_VIEWS
    * 里：配置读不出来的时候，记录仍然看得到。 */
-  var MANAGEMENT_VIEWS = { upstream: true, routes: true, pins: true, keys: true, proxies: true, settings: true };
+  var MANAGEMENT_VIEWS = { upstream: true, routes: true, pins: true, keys: true, proxies: true, pools: true, settings: true };
   /* 会自己刷新的视图：概览读取运行时快照，路由页读取每条线路的实时状态，请求
    * 记录页读的是一份还在增长的日志。其余视图是可编辑的配置表，只能在操作者
    * 自己触发时重画。 */
@@ -53,6 +53,7 @@
     pins: '渠道',
     keys: '访问',
     proxies: '访问',
+    pools: '访问',
     settings: '系统'
   };
 
@@ -66,6 +67,7 @@
     pins: '渠道固定',
     keys: '客户端密钥',
     proxies: '代理',
+    pools: '代理池',
     settings: '设置'
   };
 
@@ -91,6 +93,8 @@
     usage: { window: '7d', summary: null, error: null },
     // probes holds what the account health checks found, newest first.
     probes: { runs: [], total: 0, retention: null, policy: null, error: null, running: false },
+    // poolLeases holds the leases the gateway holds from its pools.
+    poolLeases: { assignments: [], pools: [], sites: {}, error: null },
     // revealedKeys holds the client keys an operator asked to see, by row id.
     // The listing only ever carries the mask, so a value lives here only after a
     // deliberate read, and it is dropped again on the next configuration read.
@@ -203,6 +207,12 @@
     els.profilesMeta = document.querySelector('[data-profiles-meta]');
     els.profilesBody = document.querySelector('[data-profiles-body]');
     els.profilesEmpty = document.querySelector('[data-profiles-empty]');
+
+    // The pool leases: one row per account that holds an address.
+    els.poolLeasesBody = document.querySelector('[data-pool-leases]');
+    els.poolLeasesEmpty = document.querySelector('[data-pool-leases-empty]');
+    els.poolLeasesTable = document.querySelector('[data-pool-leases-table]');
+    els.poolLeasesMeta = document.querySelector('[data-pool-leases-meta]');
 
     els.banner = $('error-banner');
     els.bannerTitle = els.banner.querySelector('[data-banner-title]');
@@ -407,11 +417,15 @@
     protocol: { http: 'HTTP', https: 'HTTPS', socks5: 'SOCKS5', socks5h: 'SOCKS5H' },
     mode: { strict: '严格固定', preferred: '固定优先' },
     sort: { cost: '价格', ttft: '首字延迟', tps: '吞吐' },
-    pipeline: { direct: 'direct 管线', planner: 'planner 管线' }
+    pipeline: { direct: 'direct 管线', planner: 'planner 管线' },
+    pools: { mode: { auto: '自动', per_ipv6: '每租约独立端口', multiplex: '复用端口' } }
   };
 
-  function choiceOptions(field) {
-    var labels = CHOICE_LABELS[field.name] || {};
+  function choiceOptions(field, resource) {
+    // A field name is not unique across resources — a pin's mode and a pool's mode
+    // have different choices — so a resource-scoped table wins over the shared one.
+    var scoped = resource && CHOICE_LABELS[resource] ? CHOICE_LABELS[resource][field.name] : null;
+    var labels = scoped || CHOICE_LABELS[field.name] || {};
     return (field.choices || []).map(function (value) {
       return { value: value, label: labels[value] || value };
     });
@@ -481,6 +495,10 @@
       client_profile: {
         label: '客户端指纹', type: 'select', options: clientProfileOptions,
         help: '以哪种客户端的身份访问这个上游：预设会带上该客户端的 UA 与协议头，让上游按该客户端处理（版本、鉴权头由网关按密钥注入，预设里没有鉴权头）。留空表示原样转发调用方的请求头。'
+      },
+      pool_id: {
+        label: '代理池', type: 'select', options: poolCandidates,
+        help: '这个上游的每个账号从这里申请一个出口租约（一个独立 IP）。同一个上游的账号不会共用出口，不同上游可以共用。'
       },
       proxy_url: { label: '代理', placeholder: 'http://127.0.0.1:7890', help: '留空表示直连；填 system 表示使用系统代理。获取模型和转发请求都走这个出口。' },
       status: { label: '状态', type: 'select', options: STATUS_OPTIONS, help: '停用后该上游的线路不再参与选路。' },
@@ -575,6 +593,23 @@
         label: '最近实际内部渠道',
         help: '由探测写入，只作参考。'
       }
+    },
+    pools: {
+      name: { label: '名称', placeholder: '例如 出口池 A' },
+      admin_url: {
+        label: '管理地址', placeholder: 'http://10.0.0.5:8080',
+        help: '池子的管理端 API 地址（用于申请、换 IP、释放租约）。'
+      },
+      token: { label: '管理令牌', help: '池子要求鉴权时填写；列表里只显示掩码，留空表示保持原值。' },
+      socks_host: {
+        label: 'SOCKS5 地址', placeholder: '10.0.0.5',
+        help: '只填主机（可以带端口）。留空表示 SOCKS5 服务与管理端在同一台机器上。'
+      },
+      mode: {
+        label: 'SOCKS5 模式', type: 'select',
+        help: '自动：按池子自报的模式决定；每租约独立端口；复用同一端口并用租约名作为用户名。'
+      },
+      enabled: { label: '启用' }
     }
   };
 
@@ -652,6 +687,27 @@
         { label: '状态', cell: function (row) { return enabledBadge(row.enabled); } }
       ],
       actions: ['edit', 'delete'],
+      describe: function (row) { return text(row.name, '#' + row.id); }
+    },
+    pools: {
+      title: '代理池',
+      create: '添加代理池',
+      noun: '代理池',
+      columns: [
+        { label: '名称', cell: function (row) { return element('span', 'cell-strong', text(row.name)); } },
+        { label: '管理地址', cell: function (row) { return element('span', 'mono', text(row.admin_url)); } },
+        {
+          label: 'SOCKS5 地址',
+          cell: function (row) {
+            return row.socks_host
+              ? element('span', 'mono', text(row.socks_host))
+              : element('span', 'cell-muted', '与管理端同机');
+          }
+        },
+        { label: '模式', cell: function (row) { return tag(enumLabel('mode', row.mode, 'auto')); } },
+        { label: '状态', cell: function (row) { return enabledBadge(row.enabled); } }
+      ],
+      actions: ['test', 'edit', 'delete'],
       describe: function (row) { return text(row.name, '#' + row.id); }
     },
     pins: {
@@ -947,8 +1003,14 @@
   /* 排除模型、限定路由、限定上游、排除上游这四项都是从一个列表里挑，所以候选来自
    * 网关已经读到的配置，而不是让 operator 手写 JSON。 */
 
-  function upstreamCandidates() {
-    return resourceRows('upstreams').map(function (row) {
+  /* 代理池的候选：上游表单与池子页共用。 */
+  function poolCandidates() {
+    return resourceRows('pools').map(function (row) {
+      return { value: row.id, label: text(row.name, '#' + row.id) };
+    });
+  }
+
+  function upstreamCandidates() {    return resourceRows('upstreams').map(function (row) {
       var models = parseJSON(row.models);
       var count = Array.isArray(models) ? models.length : 0;
       return {
@@ -1607,6 +1669,7 @@
     var wantsRequests = state.view === 'requests';
     var wantsUsage = state.view === 'usage';
     var wantsProbes = state.view === 'probes';
+    var wantsPools = state.view === 'pools';
     var calls = [request('/management/status'), request('/management/snapshot')];
     // The index of each optional call is tracked rather than assumed, so a view
     // that needs one of them cannot read another's answer.
@@ -1629,6 +1692,11 @@
     if (wantsProbes) {
       probesIndex = calls.length;
       calls.push(request('/management/probes?limit=100'));
+    }
+    var poolLeasesIndex = -1;
+    if (wantsPools) {
+      poolLeasesIndex = calls.length;
+      calls.push(request('/management/pools/leases'));
     }
 
     Promise.all(calls).then(function (results) {
@@ -1678,6 +1746,9 @@
       if (probesIndex !== -1) {
         applyProbes(results[probesIndex]);
       }
+      if (poolLeasesIndex !== -1) {
+        applyPoolLeases(results[poolLeasesIndex]);
+      }
 
       hideBanner();
       state.failure = null;
@@ -1688,6 +1759,7 @@
       renderRequests();
       renderUsage();
       renderProbes();
+      renderPoolLeases();
       renderPolicy();
       renderProfiles();
     }).catch(function (err) {
@@ -3156,6 +3228,161 @@
     });
   }
 
+  /* ===== 代理池租约 =====
+   *
+   * 一行一个账号持有的出口：池子、上游、账号、出口 IP 与代理地址。换 IP 向池子
+   * 申请新地址并写回分配表；释放把租约还回去，这个账号下次请求会重新申请。
+   * 账号用「令牌 #id / 账号 #id」表示，界面上不出现凭证。
+   */
+
+  function applyPoolLeases(result) {
+    if (result && result.ok && result.body) {
+      state.poolLeases.assignments = Array.isArray(result.body.assignments) ? result.body.assignments : [];
+      state.poolLeases.pools = Array.isArray(result.body.pools) ? result.body.pools : [];
+      state.poolLeases.sites = result.body.sites || {};
+      state.poolLeases.error = null;
+      return;
+    }
+    state.poolLeases.assignments = [];
+    state.poolLeases.pools = [];
+    state.poolLeases.sites = {};
+    state.poolLeases.error = result ? errorMessage(result.body, '读取租约失败。') : '读取租约失败。';
+  }
+
+  function leaseOwnerLabel(ownerKey) {
+    var value = String(ownerKey || '');
+    if (value.charAt(0) === 't') { return '令牌 #' + value.slice(1); }
+    if (value.charAt(0) === 'a') { return '账号 #' + value.slice(1); }
+    return value || '—';
+  }
+
+  function setPoolLeasesEmptyText(message) {
+    if (!els.poolLeasesEmpty) { return; }
+    var paragraph = els.poolLeasesEmpty.querySelector('[data-empty-text]');
+    if (paragraph) { paragraph.textContent = message; }
+  }
+
+  function renderPoolLeases() {
+    if (!els.poolLeasesBody) { return; }
+    var assignments = state.poolLeases.assignments;
+    var pools = {};
+    state.poolLeases.pools.forEach(function (pool) { pools[pool.id] = pool; });
+    var sites = state.poolLeases.sites || {};
+
+    els.poolLeasesMeta.textContent = assignments.length
+      ? assignments.length + ' 个租约'
+      : '暂无租约';
+    els.poolLeasesBody.textContent = '';
+
+    if (state.poolLeases.error) {
+      if (els.poolLeasesTable) { els.poolLeasesTable.hidden = true; }
+      els.poolLeasesEmpty.hidden = false;
+      setPoolLeasesEmptyText(state.poolLeases.error);
+      return;
+    }
+    if (assignments.length === 0) {
+      if (els.poolLeasesTable) { els.poolLeasesTable.hidden = true; }
+      els.poolLeasesEmpty.hidden = false;
+      setPoolLeasesEmptyText('还没有租约。给某个上游选一个代理池，它的账号在第一次请求时会各自申请一个。');
+      return;
+    }
+    if (els.poolLeasesTable) { els.poolLeasesTable.hidden = false; }
+    els.poolLeasesEmpty.hidden = true;
+
+    assignments.forEach(function (assignment) {
+      var row = document.createElement('tr');
+      var pool = pools[assignment.pool_id];
+      cell(row, element('span', 'cell-strong', pool ? text(pool.name, '#' + assignment.pool_id) : '#' + assignment.pool_id));
+      cell(row, element('span', 'cell-muted', text(sites[String(assignment.site_id)], '#' + assignment.site_id)));
+      cell(row, element('span', 'mono', leaseOwnerLabel(assignment.owner_key)));
+      cell(row, element('span', 'mono', text(assignment.ipv6)));
+      var socks = element('span', 'mono', shorten(assignment.socks_url, 42));
+      socks.title = assignment.socks_url || '';
+      cell(row, socks);
+      cell(row, element('span', 'cell-muted', formatTimestamp(assignment.updated_at)));
+
+      var actions = document.createElement('td');
+      actions.className = 'actions';
+      var buttons = element('div', 'row-actions');
+      var rotate = element('button', 'btn btn-ghost btn-small', '换 IP');
+      rotate.type = 'button';
+      rotate.setAttribute('data-lease-rotate', assignment.pool_id + '|' + assignment.owner_key);
+      buttons.appendChild(rotate);
+      var release = element('button', 'btn btn-ghost btn-small btn-danger-text', '释放');
+      release.type = 'button';
+      release.setAttribute('data-lease-release', assignment.pool_id + '|' + assignment.owner_key);
+      buttons.appendChild(release);
+      actions.appendChild(buttons);
+      row.appendChild(actions);
+      els.poolLeasesBody.appendChild(row);
+    });
+  }
+
+  /* poolLeaseAction parses the pool and account a lease button carries. */
+  function poolLeaseAction(value) {
+    var parts = String(value || '').split('|');
+    if (parts.length !== 2) { return null; }
+    return { pool_id: number(parts[0]), owner_key: parts[1] };
+  }
+
+  function rotatePoolLease(action, button) {
+    setSubmitting(button, true, '换 IP');
+    post('/management/pools/rotate', action).then(function (result) {
+      setSubmitting(button, false, '换 IP');
+      if (result.status === 401) {
+        showAuth('登录状态已失效，请重新登录后继续。');
+        return;
+      }
+      if (result.ok) {
+        var assignment = (result.body && result.body.assignment) || {};
+        showNotice('已换 IP：' + (assignment.ipv6 || '') + '（' + leaseOwnerLabel(action.owner_key) + '）');
+        refresh();
+        return;
+      }
+      refreshFailure('换 IP 失败', errorMessage(result.body, '池子没有给出新地址。'));
+    });
+  }
+
+  function releasePoolLease(action, button) {
+    setSubmitting(button, true, '释放');
+    post('/management/pools/release', action).then(function (result) {
+      setSubmitting(button, false, '释放');
+      if (result.status === 401) {
+        showAuth('登录状态已失效，请重新登录后继续。');
+        return;
+      }
+      if (result.ok) {
+        showNotice('已释放 ' + leaseOwnerLabel(action.owner_key) + ' 的租约。');
+        refresh();
+        return;
+      }
+      refreshFailure('释放租约失败', errorMessage(result.body, '池子没有确认释放。'));
+    });
+  }
+
+  /* testPoolRow reads the pool's own status, which is what tells a wrong address
+   * or a wrong token apart from an empty pool. */
+  function testPoolRow(row, button) {
+    setSubmitting(button, true, '测试');
+    post('/management/pools/test', { pool_id: row.id }).then(function (result) {
+      setSubmitting(button, false, '测试');
+      if (result.status === 401) {
+        showAuth('登录状态已失效，请重新登录后继续。');
+        return;
+      }
+      if (result.ok) {
+        var body = result.body || {};
+        var parts = [text(body.status, '未知')];
+        if (typeof body.lease_count === 'number') { parts.push('租约 ' + body.lease_count); }
+        if (body.socks_mode) { parts.push('模式 ' + body.socks_mode); }
+        if (body.socks_listen) { parts.push('SOCKS5 ' + body.socks_listen); }
+        showNotice('池子可用：' + parts.join(' · '));
+        return;
+      }
+      refreshFailure('池子不可用', errorMessage(result.body, '无法读取池子状态。'));
+    });
+  }
+
   function clearUsageLog() {
     openConfirm({
       title: '清空用量统计',
@@ -3659,6 +3886,13 @@
     td.className = 'actions';
     var group = element('div', 'row-actions');
 
+    if (metadata.actions.indexOf('test') !== -1) {
+      var test = element('button', 'btn btn-ghost btn-small', '测试');
+      test.type = 'button';
+      test.title = '读一次池子的状态，确认管理地址与令牌可用。';
+      test.addEventListener('click', function () { testPoolRow(row, test); });
+      group.appendChild(test);
+    }
     if (metadata.actions.indexOf('probe') !== -1) {
       var probe = element('button', 'btn btn-ghost btn-small', '探测');
       probe.type = 'button';
@@ -4382,7 +4616,7 @@
     if (meta.type === 'select' || (field.choices && field.choices.length > 0)) {
       var options = typeof meta.options === 'function'
         ? meta.options()
-        : (meta.options || choiceOptions(field));
+        : (meta.options || choiceOptions(field, resource));
       var select = document.createElement('select');
       select.id = inputID;
       select.className = 'field-input';
@@ -5634,6 +5868,21 @@
         var button = event.target.closest('[data-probe-channel]');
         if (!button) { return; }
         probeChannelNow(button.getAttribute('data-probe-channel'), button);
+      });
+    }
+    if (els.poolLeasesBody) {
+      els.poolLeasesBody.addEventListener('click', function (event) {
+        var rotate = event.target.closest('[data-lease-rotate]');
+        if (rotate) {
+          var rotateAction = poolLeaseAction(rotate.getAttribute('data-lease-rotate'));
+          if (rotateAction) { rotatePoolLease(rotateAction, rotate); }
+          return;
+        }
+        var release = event.target.closest('[data-lease-release]');
+        if (release) {
+          var releaseAction = poolLeaseAction(release.getAttribute('data-lease-release'));
+          if (releaseAction) { releasePoolLease(releaseAction, release); }
+        }
       });
     }
 

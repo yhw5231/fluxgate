@@ -438,7 +438,7 @@ func TestConsoleGroupsNavigationByFunction(t *testing.T) {
 	for _, view := range []string{
 		"overview", "usage", "probes", "requests",
 		"upstream", "routes", "pins",
-		"keys", "proxies",
+		"keys", "proxies", "pools",
 		"settings",
 	} {
 		for _, wanted := range []string{
@@ -539,7 +539,7 @@ func TestConsoleCarriesTheManagementViewsAndEditor(t *testing.T) {
 	// The upstream is the one form the gateway configures as a whole; the client
 	// keys and the proxies are still plain tables, and the routing table is
 	// derived rather than written, so it carries no create button.
-	for _, resource := range []string{"upstreams", "proxies", "keys"} {
+	for _, resource := range []string{"upstreams", "proxies", "keys", "pools"} {
 		for _, wanted := range []string{
 			`data-management="` + resource + `"`,
 			`data-create="` + resource + `"`,
@@ -568,7 +568,7 @@ func TestConsoleCarriesTheManagementViewsAndEditor(t *testing.T) {
 	}
 	// Each view toggles as a whole, so the container and its navigation entry
 	// have to exist even before the script runs.
-	for _, view := range []string{"overview", "usage", "probes", "upstream", "routes", "pins", "requests", "keys", "proxies", "settings"} {
+	for _, view := range []string{"overview", "usage", "probes", "upstream", "routes", "pins", "requests", "keys", "proxies", "pools", "settings"} {
 		if !strings.Contains(page, `data-view="`+view+`"`) {
 			t.Errorf("console navigation has no %q entry", view)
 		}

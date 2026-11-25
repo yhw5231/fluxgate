@@ -45,6 +45,7 @@ const channelQuery = `SELECT
 	a.id, a.access_token, a.api_token, a.extra_config, COALESCE(a.status, 'active'),
 	s.id, s.name, s.url, s.platform, s.forced_upstream_endpoint, s.proxy_url,
 	COALESCE(s.use_system_proxy, 0), s.custom_headers, COALESCE(s.client_profile, ''),
+	COALESCE(s.pool_id, 0),
 	COALESCE(s.status, 'active'), COALESCE(s.global_weight, 1),
 	at.token, at.proxy_url, COALESCE(at.use_system_proxy, 0), COALESCE(at.enabled, 1)
 FROM route_channels rc
@@ -213,7 +214,7 @@ var upstreamSchemaDDL = []string{
 	`CREATE TABLE IF NOT EXISTS sites (
 		id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, platform TEXT NOT NULL,
 		proxy_url TEXT, use_system_proxy INTEGER DEFAULT 0, custom_headers TEXT,
-		client_profile TEXT,
+		client_profile TEXT, pool_id INTEGER,
 		status TEXT DEFAULT 'active', global_weight REAL DEFAULT 1, forced_upstream_endpoint TEXT
 	)`,
 	`CREATE TABLE IF NOT EXISTS accounts (
@@ -303,10 +304,18 @@ func (s *SQLiteStore) EnsureUpstreamSchema(ctx context.Context) error {
 	if err := s.addColumnIfMissing(ctx, "sites", "client_profile", "TEXT"); err != nil {
 		return err
 	}
+	// Which proxy pool an upstream draws its accounts' exit addresses from is
+	// another column the console writes, and it is added the same way.
+	if err := s.addColumnIfMissing(ctx, "sites", "pool_id", "INTEGER"); err != nil {
+		return err
+	}
 	// The internal-provider pins are the gateway's own table, but they are read
 	// with the configuration and edited from the console, so they are prepared
 	// here with the rest of the configurable surface.
-	return s.EnsureModelPinSchema(ctx)
+	if err := s.EnsureModelPinSchema(ctx); err != nil {
+		return err
+	}
+	return s.EnsurePoolSchema(ctx)
 }
 
 // addColumnIfMissing adds a column to a table when an older database predates
@@ -519,6 +528,11 @@ func (s *SQLiteStore) LoadConfiguration(ctx context.Context) (Configuration, err
 	if err := s.loadDownstreamKeys(ctx, &configuration); err != nil {
 		return Configuration{}, err
 	}
+	pools, err := s.loadPools(ctx)
+	if err != nil {
+		return Configuration{}, err
+	}
+	configuration.Pools = pools
 	if err := s.loadRoutes(ctx, &configuration); err != nil {
 		return Configuration{}, err
 	}
@@ -810,6 +824,7 @@ func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route
 			forcedEndpoint, siteProxy, customHeaders  sql.NullString
 			siteSystemProxy                           int
 			siteClientProfile                         string
+			sitePoolID                                int64
 			siteGlobalWeight                          float64
 			accountToken, tokenProxy                  sql.NullString
 			tokenSystemProxy, tokenEnabled            int
@@ -818,7 +833,7 @@ func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route
 			&routeID, &channelID, &priority, &weight, &channelEnabled, &sourceModel, &tokenID,
 			&accountID, &accessToken, &apiToken, &accountExtraConfig, &accountStatus,
 			&siteID, &siteName, &siteURL, &platform, &forcedEndpoint, &siteProxy,
-			&siteSystemProxy, &customHeaders, &siteClientProfile, &siteStatus, &siteGlobalWeight,
+			&siteSystemProxy, &customHeaders, &siteClientProfile, &sitePoolID, &siteStatus, &siteGlobalWeight,
 			&accountToken, &tokenProxy, &tokenSystemProxy, &tokenEnabled,
 		); err != nil {
 			return nil, fmt.Errorf("scan route channel: %w", err)
@@ -864,6 +879,7 @@ func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route
 			SitePriority:       sitePriorities[siteID],
 			SourceModel:        resolveSourceModel(sourceModel.String, route.ModelPattern),
 			ClientProfile:      strings.TrimSpace(siteClientProfile),
+			SitePoolID:         sitePoolID,
 			Pins:               modelPins[siteID],
 		}
 		// The upstream's own cooldown mode decides how a failing key is held out

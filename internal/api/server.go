@@ -22,6 +22,7 @@ import (
 	"github.com/yhw5231/fluxgate/internal/domain"
 	"github.com/yhw5231/fluxgate/internal/policy"
 	"github.com/yhw5231/fluxgate/internal/proxy"
+	"github.com/yhw5231/fluxgate/internal/proxypool"
 	"github.com/yhw5231/fluxgate/internal/router"
 	"github.com/yhw5231/fluxgate/internal/store"
 	"github.com/yhw5231/fluxgate/internal/transform"
@@ -85,6 +86,9 @@ type Server struct {
 	// and the internal providers it named. When nil, a discovery is answered but
 	// not written back.
 	PinStore PinProbeStore
+	// Pools holds the leases the gateway acquired from its IPv6 proxy pools. When
+	// nil, the gateway has no pools and the lease endpoints answer 503.
+	Pools *proxypool.Manager
 	// MediaJobs keeps where each upstream-side generation job was created, which
 	// is what lets a request that names no model reach the line that holds the
 	// work. When nil, a job cannot be recorded and the follow-up endpoints answer
@@ -238,6 +242,12 @@ func (s *Server) Handler() http.Handler {
 	// them answers.
 	mux.HandleFunc("POST /management/pins/probe", s.handlePinProbe)
 	mux.HandleFunc("POST /management/pins/validate", s.handlePinValidate)
+	// The leases the gateway holds from its proxy pools: which account has which
+	// address, a new address, give one back, and is the pool reachable.
+	mux.HandleFunc("GET /management/pools/leases", s.handlePoolLeases)
+	mux.HandleFunc("POST /management/pools/rotate", s.handlePoolRotate)
+	mux.HandleFunc("POST /management/pools/release", s.handlePoolRelease)
+	mux.HandleFunc("POST /management/pools/test", s.handlePoolTest)
 	// Clearing a recorded circuit, which is the manual half of breaker recovery.
 	mux.HandleFunc("POST /management/breakers/reset", s.handleBreakerReset)
 	mux.HandleFunc("GET /v1/models", s.handleModels)

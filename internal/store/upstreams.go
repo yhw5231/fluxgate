@@ -135,6 +135,9 @@ var upstreamResource = Resource{
 		// headers through unchanged, which is what every upstream did before the
 		// presets existed.
 		{Name: "client_profile", Kind: KindText, MaxLength: 64, Choices: clientprofile.IDs()},
+		// The proxy pool this upstream's accounts take their exit addresses from.
+		// Empty means the upstream uses no pool.
+		{Name: "pool_id", Kind: KindInt, Validate: validatePositive},
 		{Name: "proxy_url", Kind: KindText, MaxLength: 2048, Validate: validateProxyURL},
 		// An upstream added from the console is enabled: a new upstream nobody
 		// can route to would look broken rather than unconfigured.

@@ -22,6 +22,7 @@ import (
 	"github.com/yhw5231/fluxgate/internal/policy"
 	"github.com/yhw5231/fluxgate/internal/probe"
 	"github.com/yhw5231/fluxgate/internal/proxy"
+	"github.com/yhw5231/fluxgate/internal/proxypool"
 	"github.com/yhw5231/fluxgate/internal/router"
 	"github.com/yhw5231/fluxgate/internal/store"
 	"github.com/yhw5231/fluxgate/internal/version"
@@ -156,6 +157,30 @@ func run(parent context.Context, logger *slog.Logger) error {
 	// configuration it started with.
 	selector := router.NewMemorySelectorWithFilter(configuration.Routes, circuitBreaker)
 	proxyResolver := buildProxyResolver(configuration)
+	// A pool hands each account its own exit address. The lease is acquired on the
+	// first request through that account and remembered, so the address an upstream
+	// sees does not change with the gateway's uptime.
+	poolManager := proxypool.NewManager(persistentStore)
+	poolBindings := newPoolBindings()
+	poolBindings.Set(configuration)
+	proxyResolver.PoolURL = func(credential string) (string, error) {
+		binding, bound := poolBindings.Lookup(credential)
+		if !bound {
+			return "", nil
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		address, err := poolManager.Acquire(ctx, binding.Pool, binding.SiteID, binding.OwnerKey)
+		if err != nil {
+			// A pool that cannot hand out a lease is reported rather than silently
+			// bypassed: leaving through the gateway's own address instead would send
+			// the account out from the address the pool exists to avoid.
+			logger.Warn("proxy_pool_lease_failed",
+				"pool", binding.Pool.Name, "site_id", binding.SiteID, "error", err.Error())
+			return "", err
+		}
+		return address, nil
+	}
 	// The account health schedule reads the same lines the gateway routes with. A
 	// console write replaces the snapshot it reads, so a probe follows the
 	// configuration rather than a copy taken at startup.
@@ -227,6 +252,7 @@ func run(parent context.Context, logger *slog.Logger) error {
 		Usage:               persistentStore,
 		Probes:              probeService,
 		PinStore:            persistentStore,
+		Pools:               poolManager,
 		MediaJobs:           persistentStore,
 		PolicyDefaults:      cfg.Policy(),
 		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,
@@ -244,6 +270,7 @@ func run(parent context.Context, logger *slog.Logger) error {
 		selector.SetRoutes(updated.Routes)
 		proxyResolver.SetConfig(proxyConfiguration(updated))
 		lines.Set(updated)
+		poolBindings.Set(updated)
 		applied, ignored := policy.FromSettings(updated.Settings, cfg.Policy())
 		for _, warning := range ignored {
 			logger.Warn("policy_setting_ignored", "detail", warning)
