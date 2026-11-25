@@ -49,12 +49,20 @@ const (
 	KeyUsageEnabled = "gateway.usage.enabled"
 	KeyUsageKeep    = "gateway.usage.keep"
 
+	KeyProbeStartup     = "gateway.probe.startup"
+	KeyProbeIdleSeconds = "gateway.probe.idle_seconds"
+	KeyProbeConcurrency = "gateway.probe.concurrency"
+	KeyProbeKeep        = "gateway.probe.keep"
+
 	maxAttemptsCeiling           = 64
 	maxAttemptsPerChannelCeiling = 64
 	maxBackoffCeilingMS          = int64(10 * 60 * 1000)
 	maxCooldownCeilingSeconds    = int64(7 * 24 * 60 * 60)
 	maxRequestLogKeep            = int64(100000)
 	maxUsageKeep                 = int64(1000000)
+	maxProbeIdleSeconds          = int64(7 * 24 * 60 * 60)
+	maxProbeKeep                 = int64(100000)
+	maxProbeConcurrency          = int64(64)
 )
 
 // Kind classifies an editable value so a console can pick a widget and the
@@ -76,6 +84,7 @@ const (
 	SectionBreaker    = "breaker"
 	SectionRequestLog = "request_log"
 	SectionUsage      = "usage"
+	SectionProbe      = "probe"
 )
 
 // Field describes one editable policy value.
@@ -119,6 +128,11 @@ func Fields() []Field {
 
 		{Key: KeyUsageEnabled, Section: SectionUsage, Kind: KindBool},
 		{Key: KeyUsageKeep, Section: SectionUsage, Kind: KindInt, Unit: "count", Min: number(1), Max: number(float64(maxUsageKeep))},
+
+		{Key: KeyProbeStartup, Section: SectionProbe, Kind: KindBool},
+		{Key: KeyProbeIdleSeconds, Section: SectionProbe, Kind: KindInt, Unit: "s", Min: number(0), Max: number(float64(maxProbeIdleSeconds))},
+		{Key: KeyProbeConcurrency, Section: SectionProbe, Kind: KindInt, Unit: "count", Min: number(1), Max: number(float64(maxProbeConcurrency))},
+		{Key: KeyProbeKeep, Section: SectionProbe, Kind: KindInt, Unit: "count", Min: number(1), Max: number(float64(maxProbeKeep))},
 	}
 }
 
@@ -129,6 +143,23 @@ type Policy struct {
 	Breaker    breaker.Policy
 	RequestLog RequestLogPolicy
 	Usage      UsagePolicy
+	Probe      ProbePolicy
+}
+
+// ProbePolicy says when the gateway checks that an upstream credential still
+// works, and bounds what those checks cost: a startup sweep, an idle check of a
+// line that has carried no traffic, and a check of a line that has just come back
+// from a cooldown.
+type ProbePolicy struct {
+	// Startup probes every eligible line once after the gateway starts.
+	Startup bool
+	// IdleSeconds is how long a line may carry no traffic before it is probed.
+	// Zero switches idle probing off.
+	IdleSeconds int
+	// Concurrency bounds how many probes are in flight at once.
+	Concurrency int
+	// Keep is how many probe records the log holds.
+	Keep int
 }
 
 // UsagePolicy bounds the gateway's token accounting: whether the cost of each
@@ -178,6 +209,12 @@ func Default() Policy {
 		},
 		RequestLog: RequestLogPolicy{Enabled: defaultRequestLogEnabled, Keep: defaultRequestLogKeep},
 		Usage:      UsagePolicy{Enabled: defaultUsageEnabled, Keep: defaultUsageKeep},
+		Probe: ProbePolicy{
+			Startup:     defaultProbeStartup,
+			IdleSeconds: defaultProbeIdleSeconds,
+			Concurrency: defaultProbeConcurrency,
+			Keep:        defaultProbeKeep,
+		},
 	}
 }
 
@@ -193,6 +230,10 @@ const (
 	defaultRequestLogKeep        = 1000
 	defaultUsageEnabled          = true
 	defaultUsageKeep             = 100000
+	defaultProbeStartup          = true
+	defaultProbeIdleSeconds      = 2 * 60 * 60
+	defaultProbeConcurrency      = 4
+	defaultProbeKeep             = 2000
 )
 
 var (
@@ -226,6 +267,11 @@ func (p Policy) Values() map[string]any {
 
 		KeyUsageEnabled: p.Usage.Enabled,
 		KeyUsageKeep:    int64(p.Usage.Keep),
+
+		KeyProbeStartup:     p.Probe.Startup,
+		KeyProbeIdleSeconds: int64(p.Probe.IdleSeconds),
+		KeyProbeConcurrency: int64(p.Probe.Concurrency),
+		KeyProbeKeep:        int64(p.Probe.Keep),
 	}
 }
 
@@ -355,6 +401,12 @@ func Validate(p Policy) error {
 		return ConstraintError{KeyRequestLogKeep, fmt.Sprintf("must be between 1 and %d", maxRequestLogKeep)}
 	case p.Usage.Keep < 1 || p.Usage.Keep > int(maxUsageKeep):
 		return ConstraintError{KeyUsageKeep, fmt.Sprintf("must be between 1 and %d", maxUsageKeep)}
+	case p.Probe.IdleSeconds < 0 || int64(p.Probe.IdleSeconds) > maxProbeIdleSeconds:
+		return ConstraintError{KeyProbeIdleSeconds, fmt.Sprintf("must be between 0 and %d", maxProbeIdleSeconds)}
+	case p.Probe.Concurrency < 1 || int64(p.Probe.Concurrency) > maxProbeConcurrency:
+		return ConstraintError{KeyProbeConcurrency, fmt.Sprintf("must be between 1 and %d", maxProbeConcurrency)}
+	case p.Probe.Keep < 1 || int64(p.Probe.Keep) > maxProbeKeep:
+		return ConstraintError{KeyProbeKeep, fmt.Sprintf("must be between 1 and %d", maxProbeKeep)}
 	case !validBreakerMode(p.Breaker.Mode):
 		return ConstraintError{KeyBreakerMode, "must be one of " + strings.Join(fieldChoices(KeyBreakerMode), ", ")}
 	}
@@ -584,6 +636,25 @@ func setValue(current Policy, key, text string) (Policy, error) {
 			return current, err
 		}
 		next.Usage.Keep = number
+	case KeyProbeStartup:
+		flag, err := strconv.ParseBool(text)
+		if err != nil {
+			return current, err
+		}
+		next.Probe.Startup = flag
+	case KeyProbeIdleSeconds, KeyProbeConcurrency, KeyProbeKeep:
+		number, err := strconv.Atoi(text)
+		if err != nil {
+			return current, err
+		}
+		switch key {
+		case KeyProbeIdleSeconds:
+			next.Probe.IdleSeconds = number
+		case KeyProbeConcurrency:
+			next.Probe.Concurrency = number
+		case KeyProbeKeep:
+			next.Probe.Keep = number
+		}
 	default:
 		return current, fmt.Errorf("unknown policy setting %q", key)
 	}

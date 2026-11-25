@@ -47,6 +47,7 @@ const (
 	defaultWriteTimeout          = 0
 	defaultIdleTimeout           = 120 * time.Second
 	defaultShutdownTimeout       = 15 * time.Second
+	defaultProbeTimeout          = 45 * time.Second
 	defaultIntegrityCheck        = true
 )
 
@@ -85,6 +86,12 @@ type Config struct {
 	// Usage bounds the gateway's token accounting: whether what each answer cost
 	// is recorded, and how many records the log holds.
 	Usage policy.UsagePolicy
+	// Probe says when the gateway checks that an upstream credential still works.
+	Probe policy.ProbePolicy
+	// ProbeTimeout bounds one probe request. A probe is a small question, so a
+	// line that cannot answer it promptly is reported as broken rather than waited
+	// on for the request timeout.
+	ProbeTimeout time.Duration
 	// IntegrityCheck verifies the shared SQLite database at startup so a
 	// damaged file fails loudly instead of serving wrong routing data.
 	IntegrityCheck bool
@@ -99,6 +106,7 @@ func (c Config) Policy() policy.Policy {
 		Breaker:    c.Breaker,
 		RequestLog: c.RequestLog,
 		Usage:      c.Usage,
+		Probe:      c.Probe,
 	}
 }
 
@@ -204,6 +212,21 @@ func Load() (Config, error) {
 	if cfg.Usage.Keep, err = intEnv("FLUXGATE_USAGE_LOG_KEEP", cfg.Usage.Keep, true); err != nil {
 		return Config{}, err
 	}
+	if cfg.Probe.Startup, err = boolEnv("FLUXGATE_PROBE_STARTUP", cfg.Probe.Startup); err != nil {
+		return Config{}, err
+	}
+	if cfg.Probe.IdleSeconds, err = intEnv("FLUXGATE_PROBE_IDLE", cfg.Probe.IdleSeconds, false); err != nil {
+		return Config{}, err
+	}
+	if cfg.Probe.Concurrency, err = intEnv("FLUXGATE_PROBE_CONCURRENCY", cfg.Probe.Concurrency, true); err != nil {
+		return Config{}, err
+	}
+	if cfg.Probe.Keep, err = intEnv("FLUXGATE_PROBE_KEEP", cfg.Probe.Keep, true); err != nil {
+		return Config{}, err
+	}
+	if cfg.ProbeTimeout, err = durationEnv("FLUXGATE_PROBE_TIMEOUT", cfg.ProbeTimeout, true); err != nil {
+		return Config{}, err
+	}
 
 	if value := strings.TrimSpace(os.Getenv("FLUXGATE_BREAKER_MODE")); value != "" {
 		cfg.Breaker.Mode = breaker.Mode(value)
@@ -265,6 +288,8 @@ func Default() Config {
 		Breaker:               traffic.Breaker,
 		RequestLog:            traffic.RequestLog,
 		Usage:                 traffic.Usage,
+		Probe:                 traffic.Probe,
+		ProbeTimeout:          defaultProbeTimeout,
 		IntegrityCheck:        defaultIntegrityCheck,
 	}
 }

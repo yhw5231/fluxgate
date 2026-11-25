@@ -53,6 +53,14 @@ func TestDefaultProductionSettings(t *testing.T) {
 	if !cfg.Usage.Enabled || cfg.Usage.Keep <= 0 {
 		t.Fatalf("unexpected usage defaults: %#v", cfg.Usage)
 	}
+	// Probing is on by default too: a restart is when nobody knows which
+	// credentials still work, so the sweep runs and the bounds are finite.
+	if !cfg.Probe.Startup || cfg.Probe.IdleSeconds <= 0 || cfg.Probe.Concurrency <= 0 || cfg.Probe.Keep <= 0 {
+		t.Fatalf("unexpected probe defaults: %#v", cfg.Probe)
+	}
+	if cfg.ProbeTimeout <= 0 {
+		t.Fatalf("ProbeTimeout = %s, want a positive bound", cfg.ProbeTimeout)
+	}
 }
 
 func TestLoadOverridesProductionSettings(t *testing.T) {
@@ -146,5 +154,29 @@ func TestUsagePolicyFollowsTheEnvironment(t *testing.T) {
 	applied := cfg.Policy()
 	if applied.Usage.Enabled || applied.Usage.Keep != 250 {
 		t.Fatalf("Policy().Usage = %#v, want the environment overrides", applied.Usage)
+	}
+}
+
+// The probe schedule is configured from the environment and carried into the
+// runtime policy, so a gateway started without a console write still probes.
+func TestProbePolicyFollowsTheEnvironment(t *testing.T) {
+	t.Setenv("FLUXGATE_PROBE_STARTUP", "false")
+	t.Setenv("FLUXGATE_PROBE_IDLE", "900")
+	t.Setenv("FLUXGATE_PROBE_CONCURRENCY", "6")
+	t.Setenv("FLUXGATE_PROBE_KEEP", "50")
+	t.Setenv("FLUXGATE_PROBE_TIMEOUT", "20s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Probe.Startup || cfg.Probe.IdleSeconds != 900 || cfg.Probe.Concurrency != 6 || cfg.Probe.Keep != 50 {
+		t.Fatalf("cfg.Probe = %#v, want the environment overrides", cfg.Probe)
+	}
+	if cfg.ProbeTimeout != 20*time.Second {
+		t.Fatalf("ProbeTimeout = %s, want 20s", cfg.ProbeTimeout)
+	}
+	applied := cfg.Policy()
+	if applied.Probe != cfg.Probe {
+		t.Fatalf("Policy().Probe = %#v, want %#v", applied.Probe, cfg.Probe)
 	}
 }

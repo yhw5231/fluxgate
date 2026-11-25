@@ -312,7 +312,8 @@ accepted write reloads the configuration and hands the result to the routing
 engine, so an upstream added in the console serves traffic on the next request.
 
 The views are 概览 (the live dashboard), 用量 (what the served requests cost in
-tokens, by model, upstream, and client key), 上游 (upstreams), 路由 (the routing table
+tokens, by model, upstream, and client key), 探测 (whether each account still
+works), 上游 (upstreams), 路由 (the routing table
 the gateway derived), 请求记录 (the record of served requests), 客户端密钥 (client
 keys), and 设置. The settings view is
 grouped by function and shows one group at a time: 账号 (the administrator
@@ -531,6 +532,9 @@ Management endpoints:
 - `DELETE /management/requests`
 - `GET /management/usage`
 - `DELETE /management/usage`
+- `GET /management/probes`
+- `POST /management/probes/run`
+- `DELETE /management/probes`
 - `GET /management/session`
 - `POST /management/login`
 - `POST /management/logout`
@@ -721,6 +725,67 @@ are.
 The usage log is on by default and keeps the newest 100000 records; see
 `FLUXGATE_USAGE_LOG_ENABLED` and `FLUXGATE_USAGE_LOG_KEEP`, or the 用量统计 section of
 设置 → 运行策略 in the console.
+
+### Account probes
+
+A key can stop working between two requests: a quota expires, an account is
+suspended, a subscription lapses. Until the next request hits that line, nothing
+tells the gateway — which is exactly too late for the caller. The account probe
+answers the question on its own schedule, by using the line the way a client would.
+
+A probe sends one small chat completion through the same credential, client
+fingerprint, configured headers, proxy and timeout the gateway itself would use,
+and asks a random arithmetic question with three five-digit operands. The answer is
+classified rather than trusted:
+
+- **能回答** — the upstream answered a real model request, which is what says the
+  account is reachable at all.
+- **答对** — the reply contains the sum, which is what says the account is working
+  and not merely billing.
+
+A served probe whose reply carries no readable text (a tool call, for instance) is
+left alone rather than reported: the account answered, and inventing a failure from
+a reply that has no answer would be worse than saying nothing.
+
+Three things trigger a probe:
+
+| Trigger | When | Why |
+| --- | --- | --- |
+| 启动 (startup) | Once, shortly after the gateway starts | A restart is exactly when nobody knows which credentials still work. |
+| 空闲 (idle) | A line has carried no traffic for `gateway.probe.idle_seconds` | A credential that quietly stopped working is usually one nobody has used lately. |
+| 冷却恢复 (recovery) | A line that was held out of rotation is no longer held | It answers whether the cooldown was long enough. |
+
+A line that is cooling down or disabled is not probed for idleness: it is out for a
+reason, and probing it would spend the account's quota to learn what the circuit
+already says. It is probed once when it comes back.
+
+**A probe never changes a circuit.** It records evidence, not a decision: bringing
+a line back into service is 恢复 (the console's manual clear) or its cooldown
+expiring. A probe that found the account healthy and silently cleared the circuit
+would hide the failure that caused it.
+
+Results are kept in `gateway_probe_runs`, bounded to the newest records, and shown
+under 探测. `GET /management/probes` answers the record plus the schedule in force:
+
+| Query | Meaning |
+| --- | --- |
+| `limit` | How many results to return, newest first. Default `100`, at most `1000`. |
+
+`POST /management/probes/run` asks for a check now. With `{"channel_id": "12"}` it
+probes that upstream and answers with the results; with no body it starts a sweep of
+every eligible line in the background — a sweep can take long enough that holding
+the request open would look like a hang — and answers `202 accepted`. A sweep
+already running is refused with `409 probe_in_progress` rather than queued, so a
+second click does not spend the operator's quota twice. `DELETE /management/probes`
+empties the record.
+
+The schedule is on by default: a startup sweep, an idle check after 2 hours, at most
+4 probes in flight, keeping the newest 2000 results. See `FLUXGATE_PROBE_STARTUP`,
+`FLUXGATE_PROBE_IDLE`, `FLUXGATE_PROBE_CONCURRENCY`, `FLUXGATE_PROBE_KEEP` and
+`FLUXGATE_PROBE_TIMEOUT`, or the 账号探测 section of 设置 → 运行策略 in the console.
+A probe spends a real (if small) amount of the account's quota, which is why the
+concurrency bound exists: a startup sweep over many lines would otherwise hit every
+account at the same moment.
 
 `/management/session`, `/management/login`, and `/management/logout` manage the console
 session itself and are therefore not themselves protected by one. `/management/password`
@@ -1169,6 +1234,29 @@ was told. The counts travel from the upstream's answer through a tee that adds n
 buffering to the response: an answer larger than 2 MiB is not scanned, and its usage is
 reported as unknown rather than as zero.
 
+### Probe settings
+
+- `FLUXGATE_PROBE_STARTUP`: Whether the account probe sweeps every eligible line once
+  after the gateway starts. Default: `true`. Changing it in the console takes effect
+  at the next restart, because the sweep is a startup event.
+- `FLUXGATE_PROBE_IDLE`: How long a line may carry no traffic before it is probed,
+  in seconds. Default: `7200` (two hours). `0` switches idle probing off; recovery
+  probing is not affected.
+- `FLUXGATE_PROBE_CONCURRENCY`: How many probes may be in flight at once. Default:
+  `4`. A probe spends a small amount of the account's quota, and a startup sweep over
+  many lines would otherwise hit every account at the same moment.
+- `FLUXGATE_PROBE_KEEP`: How many probe records the log holds. Default: `2000`.
+- `FLUXGATE_PROBE_TIMEOUT`: How long one probe request may take. Default: `45s`. A
+  probe is a small question: a line that cannot answer it promptly is reported as
+  broken rather than waited on for the request timeout.
+
+The record is a gateway-owned table (`gateway_probe_runs`), created at startup and
+indexed on its time. Every probe leaves one row — the line, the model, the HTTP
+status, the latency, and a stable reason (`ok`, `unreachable`, `invalid_proxy`,
+`auth_rejected`, `rate_limited`, `upstream_error`, `bad_status`,
+`wrong_answer`) — whether it succeeded or not. A write that fails is reported as
+`probe_record_failed`.
+
 ### Runtime policy
 
 The retry, failover, and circuit-breaker settings above can be changed while the
@@ -1196,6 +1284,10 @@ back; restoring a section's defaults does that for every value in it.
 | `gateway.request_log.keep` | How many records the log holds, newest kept. |
 | `gateway.usage.enabled` | Whether the gateway records what each answer cost in tokens. |
 | `gateway.usage.keep` | How many usage records the log holds, newest kept. |
+| `gateway.probe.startup` | Whether the account probe sweeps every line once after a restart. |
+| `gateway.probe.idle_seconds` | How long a line may carry no traffic before it is probed; `0` switches idle probing off. |
+| `gateway.probe.concurrency` | How many probes may be in flight at once. |
+| `gateway.probe.keep` | How many probe records the log holds, newest kept. |
 
 A policy value is validated twice: on its own against the field's range or choice list,
 and as a whole against the rules that tie two values together — a per-line attempt

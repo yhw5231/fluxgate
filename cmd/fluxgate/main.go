@@ -18,7 +18,9 @@ import (
 	"github.com/yhw5231/fluxgate/internal/api"
 	"github.com/yhw5231/fluxgate/internal/breaker"
 	"github.com/yhw5231/fluxgate/internal/config"
+	"github.com/yhw5231/fluxgate/internal/domain"
 	"github.com/yhw5231/fluxgate/internal/policy"
+	"github.com/yhw5231/fluxgate/internal/probe"
 	"github.com/yhw5231/fluxgate/internal/proxy"
 	"github.com/yhw5231/fluxgate/internal/router"
 	"github.com/yhw5231/fluxgate/internal/store"
@@ -91,6 +93,12 @@ func run(parent context.Context, logger *slog.Logger) error {
 		return err
 	}
 
+	// The record of what the account health probes found, created before the
+	// startup sweep writes its first result.
+	if err := persistentStore.EnsureProbeSchema(parent); err != nil {
+		return err
+	}
+
 	// A fresh deployment gets a built-in administrator so the console is
 	// reachable without a CLI step. The account is flagged as needing a password
 	// change, and the data endpoints refuse it until that happens, so the
@@ -148,9 +156,44 @@ func run(parent context.Context, logger *slog.Logger) error {
 	// configuration it started with.
 	selector := router.NewMemorySelectorWithFilter(configuration.Routes, circuitBreaker)
 	proxyResolver := buildProxyResolver(configuration)
+	// The account health schedule reads the same lines the gateway routes with. A
+	// console write replaces the snapshot it reads, so a probe follows the
+	// configuration rather than a copy taken at startup.
+	lines := &lineSource{}
+	lines.Set(configuration)
+	probeService := probe.NewService()
+	probeService.Prober = &probe.Prober{
+		Resolver: proxyResolver,
+		Pool:     transportPool,
+		Timeout:  cfg.ProbeTimeout,
+	}
+	probeService.Lines = lines.Lines
+	probeService.Circuits = breakerStore.Snapshot
+	probeService.Store = persistentStore
+	probeService.Logger = logger
+	// applyProbeSettings installs the probe policy in force. It is called at
+	// startup and after every console write, so an interval or a concurrency
+	// change applies to the next scan.
+	applyProbeSettings := func(applied policy.Policy) {
+		probeService.SetSettings(probe.Settings{
+			Startup:     applied.Probe.Startup,
+			Idle:        time.Duration(applied.Probe.IdleSeconds) * time.Second,
+			Concurrency: applied.Probe.Concurrency,
+			Keep:        applied.Probe.Keep,
+			BreakerMode: applied.Breaker.Mode,
+		})
+	}
+	// Attempts feed the idle clock: a line that has just served a request is not
+	// one to spend a probe on.
+	observer := observingBreaker{
+		breaker: circuitBreaker,
+		note: func(attempt domain.Attempt) {
+			probeService.NoteCall(attempt.ChannelID, attempt.Model)
+		},
+	}
 	engine := &proxy.Engine{
 		Selector:           selector,
-		Observer:           circuitBreaker,
+		Observer:           observer,
 		Client:             &http.Client{Transport: baseTransport},
 		MediaClient:        &http.Client{Transport: mediaTransport},
 		ProxyResolver:      proxyResolver,
@@ -170,6 +213,7 @@ func run(parent context.Context, logger *slog.Logger) error {
 	}
 	engine.SetPolicy(proxy.DispatchPolicy{Retry: runtime.Retry, Failover: runtime.Failover})
 	circuitBreaker.SetPolicy(runtime.Breaker)
+	applyProbeSettings(runtime)
 
 	gatewayAPI := &api.Server{
 		Engine:              engine,
@@ -181,6 +225,7 @@ func run(parent context.Context, logger *slog.Logger) error {
 		BreakerReset:        breakerStore,
 		RequestLog:          persistentStore,
 		Usage:               persistentStore,
+		Probes:              probeService,
 		MediaJobs:           persistentStore,
 		PolicyDefaults:      cfg.Policy(),
 		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,
@@ -197,14 +242,21 @@ func run(parent context.Context, logger *slog.Logger) error {
 		applyRequestTimeout(&updated, cfg.RequestTimeout)
 		selector.SetRoutes(updated.Routes)
 		proxyResolver.SetConfig(proxyConfiguration(updated))
+		lines.Set(updated)
 		applied, ignored := policy.FromSettings(updated.Settings, cfg.Policy())
 		for _, warning := range ignored {
 			logger.Warn("policy_setting_ignored", "detail", warning)
 		}
 		engine.SetPolicy(proxy.DispatchPolicy{Retry: applied.Retry, Failover: applied.Failover})
 		circuitBreaker.SetPolicy(applied.Breaker)
+		applyProbeSettings(applied)
 	}
 	gatewayAPI.Ready.Store(true)
+	// The schedule starts with the gateway: its startup sweep is what says which
+	// credentials still work after a restart, and its scan is what keeps checking
+	// the lines nobody has used.
+	probeService.Start(parent)
+	defer probeService.Stop()
 
 	httpServer := &http.Server{
 		Addr:              cfg.Address,

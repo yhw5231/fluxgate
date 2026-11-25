@@ -67,10 +67,20 @@
   - 运行策略新增 `gateway.usage.enabled` / `gateway.usage.keep`，环境变量
     `FLUXGATE_USAGE_LOG_ENABLED` / `FLUXGATE_USAGE_LOG_KEEP`。
   - 管理台新增「用量」页：窗口选择、四项汇总、按模型/上游/密钥三张分组表、保留范围说明。
-- [ ] **阶段 3：账号自动探测**（启动/冷却恢复/空闲三类触发）
+- [x] **阶段 3：账号自动探测**（启动/冷却恢复/空闲三类触发）
+  - 新增 `internal/probe`：随机加法题（三个五位数）+ 答案校验（chat / responses /
+    data 信封 / 纯文本），按上游状态与回答分类为稳定 reason（ok / unreachable /
+    invalid_proxy / auth_rejected / rate_limited / upstream_error / bad_status /
+    wrong_answer）。
+  - 触发调度：启动后全量核对、线路空闲超过间隔、线路从熔断中放出；探测走线路自己的
+    密钥、客户端指纹、自定义头、代理与超时；**只记录事实，不改熔断状态**。
+  - 新表 `gateway_probe_runs`（按条数裁剪），`GET /management/probes`、
+    `POST /management/probes/run`（单条同步 / 全量后台）、`DELETE /management/probes`。
+  - 运行策略新增 4 项 `gateway.probe.*`，环境变量 5 个；管理台新增「探测」页
+    （调度说明、结果表、单条「再探测」、全量探测、清空记录）。
 - [ ] **阶段 4：内部渠道固定**（探测 + 逐渠道验证 + 注入）
 - [ ] **阶段 5：IPv6 代理池**（租约管理、换 IP、共享池）
-- [ ] **阶段 6：管理台按功能重做**（四区侧栏 + 新增探测/固定/代理池视图）
+- [ ] **阶段 6：管理台按功能重做**（四区侧栏 + 新增固定/代理池视图）
 - [ ] **阶段 7：文档与部署**（README 重写、Compose/环境变量对齐）
 
 ## 5. 管理台信息架构（按功能重做）

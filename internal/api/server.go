@@ -78,6 +78,9 @@ type Server struct {
 	// each answer cost, as the upstream reported it. When nil, no usage is
 	// recorded and the usage endpoints answer 503.
 	Usage UsageLog
+	// Probes runs the account health schedule and keeps its record. When nil, no
+	// probe runs and the probe endpoints answer 503.
+	Probes ProbeService
 	// MediaJobs keeps where each upstream-side generation job was created, which
 	// is what lets a request that names no model reach the line that holds the
 	// work. When nil, a job cannot be recorded and the follow-up endpoints answer
@@ -223,6 +226,10 @@ func (s *Server) Handler() http.Handler {
 	// stated over a window, by model, upstream, and client key.
 	mux.HandleFunc("GET /management/usage", s.handleUsage)
 	mux.HandleFunc("DELETE /management/usage", s.handleUsageClear)
+	// What the account health probes found, and how to ask for a check now.
+	mux.HandleFunc("GET /management/probes", s.handleProbes)
+	mux.HandleFunc("POST /management/probes/run", s.handleProbeRun)
+	mux.HandleFunc("DELETE /management/probes", s.handleProbeClear)
 	// Clearing a recorded circuit, which is the manual half of breaker recovery.
 	mux.HandleFunc("POST /management/breakers/reset", s.handleBreakerReset)
 	mux.HandleFunc("GET /v1/models", s.handleModels)

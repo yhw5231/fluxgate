@@ -26,14 +26,14 @@
 
   /* 管理视图 = 概览之外的视图，它们读取的是可写的配置清单。设置页也读取配置，
    * 因为运行策略和配置一起返回。 */
-  var VIEWS = ['overview', 'usage', 'upstream', 'routes', 'requests', 'keys', 'settings'];
+  var VIEWS = ['overview', 'usage', 'probes', 'upstream', 'routes', 'requests', 'keys', 'settings'];
   /* 请求记录页读的是网关自己的日志，不依赖配置清单，所以它不在 MANAGEMENT_VIEWS
    * 里：配置读不出来的时候，记录仍然看得到。 */
   var MANAGEMENT_VIEWS = { upstream: true, routes: true, keys: true, settings: true };
   /* 会自己刷新的视图：概览读取运行时快照，路由页读取每条线路的实时状态，请求
    * 记录页读的是一份还在增长的日志。其余视图是可编辑的配置表，只能在操作者
    * 自己触发时重画。 */
-  var LIVE_VIEWS = { overview: true, usage: true, routes: true, requests: true };
+  var LIVE_VIEWS = { overview: true, usage: true, probes: true, routes: true, requests: true };
 
   /* The settings view groups its panels by function and shows one group at a
    * time, so no single page carries the account, the runtime policy and the
@@ -60,6 +60,8 @@
     // usage holds the token accounting over the window the operator picked. It is
     // read on its own so a usage refresh never waits on the configuration.
     usage: { window: '7d', summary: null, error: null },
+    // probes holds what the account health checks found, newest first.
+    probes: { runs: [], total: 0, retention: null, policy: null, error: null, running: false },
     // revealedKeys holds the client keys an operator asked to see, by row id.
     // The listing only ever carries the mask, so a value lives here only after a
     // deliberate read, and it is dropped again on the next configuration read.
@@ -154,6 +156,16 @@
     document.querySelectorAll('[data-usage-table]').forEach(function (table) {
       els.usageTables[table.getAttribute('data-usage-table')] = table.querySelector('tbody');
     });
+
+    // The probe view: the kind of each check, what it found, and the two actions
+    // (a sweep now, and one line again).
+    els.probesMeta = document.querySelector('[data-view-panel="probes"] [data-probes-meta]');
+    els.probesSchedule = document.querySelector('[data-probes-schedule]');
+    els.probesRetention = document.querySelector('[data-probes-retention]');
+    els.probesBody = document.querySelector('[data-probes-body]');
+    els.probesEmpty = document.querySelector('[data-probes-empty]');
+    els.probesRunAll = $('probes-run-all');
+    els.probesClear = $('probes-clear');
 
     els.banner = $('error-banner');
     els.bannerTitle = els.banner.querySelector('[data-banner-title]');
@@ -1368,6 +1380,7 @@
     var wantsConfiguration = MANAGEMENT_VIEWS[state.view] || !state.configuration;
     var wantsRequests = state.view === 'requests';
     var wantsUsage = state.view === 'usage';
+    var wantsProbes = state.view === 'probes';
     var calls = [request('/management/status'), request('/management/snapshot')];
     // The index of each optional call is tracked rather than assumed, so a view
     // that needs one of them cannot read another's answer.
@@ -1385,6 +1398,11 @@
     if (wantsUsage) {
       usageIndex = calls.length;
       calls.push(request('/management/usage?window=' + encodeURIComponent(state.usage.window)));
+    }
+    var probesIndex = -1;
+    if (wantsProbes) {
+      probesIndex = calls.length;
+      calls.push(request('/management/probes?limit=100'));
     }
 
     Promise.all(calls).then(function (results) {
@@ -1431,6 +1449,9 @@
       if (usageIndex !== -1) {
         applyUsage(results[usageIndex]);
       }
+      if (probesIndex !== -1) {
+        applyProbes(results[probesIndex]);
+      }
 
       hideBanner();
       state.failure = null;
@@ -1440,6 +1461,7 @@
       renderRouting();
       renderRequests();
       renderUsage();
+      renderProbes();
       renderPolicy();
     }).catch(function (err) {
       refreshFailure('无法连接网关', String(err && err.message ? err.message : err));
@@ -2576,6 +2598,214 @@
     usageGroupRows('models', summary.models);
     usageGroupRows('channels', summary.channels);
     usageGroupRows('keys', summary.keys);
+  }
+
+  /* ===== 账号探测 =====
+   *
+   * 探测记录回答「这个账号还能用吗」：网关用线路自己的密钥问一道加法题，按上游
+   * 的回答分类。三类触发时机由网关自己安排（启动、空闲、冷却恢复），也可以在这里
+   * 手动触发一次全量或单条线路的探测。探测只记录事实，不改熔断状态。
+   */
+
+  var PROBE_KIND_LABELS = {
+    startup: '启动',
+    idle: '空闲',
+    recovery: '冷却恢复',
+    manual: '手动'
+  };
+
+  var PROBE_REASON_LABELS = {
+    ok: '正常',
+    unreachable: '无法连接',
+    invalid_proxy: '代理不可用',
+    auth_rejected: '鉴权失败',
+    rate_limited: '被限流',
+    upstream_error: '上游错误',
+    bad_status: '状态异常',
+    wrong_answer: '答案不正确'
+  };
+
+  var PROBE_REASON_VARIANTS = {
+    ok: 'success',
+    rate_limited: 'warning',
+    bad_status: 'warning',
+    wrong_answer: 'warning',
+    auth_rejected: 'danger',
+    unreachable: 'danger',
+    invalid_proxy: 'danger',
+    upstream_error: 'danger'
+  };
+
+  function applyProbes(result) {
+    if (result && result.ok && result.body) {
+      state.probes.runs = Array.isArray(result.body.probes) ? result.body.probes : [];
+      state.probes.total = number(result.body.total);
+      state.probes.retention = result.body.retention || null;
+      state.probes.policy = result.body.policy || null;
+      state.probes.error = null;
+      return;
+    }
+    state.probes.runs = [];
+    state.probes.total = 0;
+    state.probes.retention = null;
+    state.probes.policy = null;
+    state.probes.error = result ? errorMessage(result.body, '读取探测记录失败。') : '读取探测记录失败。';
+  }
+
+  function probeBadge(run) {
+    var ok = Boolean(run && run.ok);
+    var label = ok ? '正常' : (PROBE_REASON_LABELS[run && run.reason] || '异常');
+    return badge(label, ok ? 'success' : (PROBE_REASON_VARIANTS[run && run.reason] || 'danger'));
+  }
+
+  /* probeScheduleText says how the gateway schedules its own checks, so the
+   * records below can be read as "the automatic ones did fire" rather than as
+   * "nothing happened". */
+  function probeScheduleText(policy) {
+    if (!policy) { return ''; }
+    var parts = [];
+    parts.push(policy.startup ? '启动后核对全部线路' : '启动探测已关闭');
+    var idle = number(policy.idle_seconds);
+    parts.push(idle > 0 ? '空闲 ' + formatIdle(idle) + ' 后核对' : '空闲探测已关闭');
+    parts.push('并发 ' + number(policy.concurrency));
+    return parts.join(' · ');
+  }
+
+  function formatIdle(seconds) {
+    if (seconds >= 3600) {
+      var hours = seconds / 3600;
+      return (hours === Math.floor(hours) ? hours : hours.toFixed(1)) + ' 小时';
+    }
+    if (seconds >= 60) { return Math.round(seconds / 60) + ' 分钟'; }
+    return seconds + ' 秒';
+  }
+
+  function setProbesEmptyText(message) {
+    if (!els.probesEmpty) { return; }
+    var paragraph = els.probesEmpty.querySelector('[data-empty-text]');
+    if (paragraph) { paragraph.textContent = message; }
+  }
+
+  function renderProbes() {
+    if (!els.probesBody) { return; }
+    var runs = state.probes.runs;
+    els.probesMeta.textContent = state.probes.total === 0
+      ? '暂无记录'
+      : '共 ' + formatTokens(state.probes.total) + ' 条';
+    els.probesSchedule.textContent = probeScheduleText(state.probes.policy);
+    els.probesRetention.textContent = state.probes.retention
+      ? '保留最近 ' + formatTokens(state.probes.retention.keep) + ' 条'
+      : '';
+
+    els.probesBody.textContent = '';
+    if (state.probes.error) {
+      els.probesEmpty.hidden = false;
+      setProbesEmptyText(state.probes.error);
+      return;
+    }
+    if (runs.length === 0) {
+      els.probesEmpty.hidden = false;
+      setProbesEmptyText('还没有探测记录。网关会在启动后、线路空闲时自动核对，也可以点「探测全部线路」立刻检查。');
+      return;
+    }
+    els.probesEmpty.hidden = true;
+
+    runs.forEach(function (run) {
+      var row = document.createElement('tr');
+
+      var timeCell = element('td', 'mono', formatClock(run.at));
+      timeCell.title = formatTimestamp(run.at);
+      row.appendChild(timeCell);
+
+      cell(row, PROBE_KIND_LABELS[run.kind] || text(run.kind));
+      cell(row, run.channel_name ? text(run.channel_name) : element('span', 'cell-muted', '—'));
+      cell(row, run.model ? element('span', 'mono', run.model) : element('span', 'cell-muted', '—'));
+      cell(row, probeBadge(run));
+      cell(row, run.status ? String(run.status) : '—', 'num');
+      cell(row, formatMilliseconds(run.latency_ms), 'num');
+      var detail = element('span', 'cell-muted', text(run.detail, '—'));
+      if (run.detail) { detail.title = run.detail; }
+      cell(row, detail);
+
+      var actions = document.createElement('td');
+      actions.className = 'actions';
+      var button = element('button', 'btn btn-ghost btn-small', '再探测');
+      button.type = 'button';
+      button.setAttribute('data-probe-channel', run.channel_id || '');
+      if (!run.channel_id) { button.disabled = true; }
+      actions.appendChild(button);
+      row.appendChild(actions);
+
+      els.probesBody.appendChild(row);
+    });
+  }
+
+  function runProbeSweep() {
+    if (!els.probesRunAll) { return; }
+    setSubmitting(els.probesRunAll, true, '探测全部线路');
+    post('/management/probes/run', {}).then(function (result) {
+      setSubmitting(els.probesRunAll, false, '探测全部线路');
+      if (result.status === 401) {
+        showAuth('登录状态已失效，请重新登录后继续。');
+        return;
+      }
+      if (result.ok) {
+        // 全量探测在后台跑，结果会陆续出现在下面的表格里。
+        showNotice('已开始探测全部线路，结果会陆续出现在这里。');
+        state.probes.lastSweep = Date.now();
+        refresh();
+        return;
+      }
+      if (result.status === 409) {
+        showNotice('上一次探测还在进行中，请稍候。');
+        return;
+      }
+      refreshFailure('探测失败', errorMessage(result.body, '无法开始探测。'));
+    });
+  }
+
+  function probeChannelNow(channelID, button) {
+    if (!channelID) { return; }
+    setSubmitting(button, true, '再探测');
+    post('/management/probes/run', { channel_id: channelID }).then(function (result) {
+      setSubmitting(button, false, '再探测');
+      if (result.status === 401) {
+        showAuth('登录状态已失效，请重新登录后继续。');
+        return;
+      }
+      if (result.ok) {
+        var probes = (result.body && result.body.probes) || [];
+        var healthy = probes.filter(function (entry) { return entry && entry.ok; }).length;
+        showNotice('探测完成：' + healthy + ' / ' + probes.length + ' 条线路正常。');
+        refresh();
+        return;
+      }
+      refreshFailure('探测失败', errorMessage(result.body, '无法探测这条线路。'));
+    });
+  }
+
+  function clearProbeLog() {
+    openConfirm({
+      title: '清空探测记录',
+      text: '将删除全部账号探测记录。熔断状态与请求记录不受影响，确认清空？',
+      confirmLabel: '清空',
+      danger: true,
+      run: function () { return remove('/management/probes').then(handleClearedProbes); }
+    });
+  }
+
+  function handleClearedProbes(result) {
+    if (result.ok) {
+      var cleared = result.body && typeof result.body.cleared === 'number' ? result.body.cleared : 0;
+      showNotice(cleared > 0 ? '已清空 ' + cleared + ' 条探测记录。' : '探测记录已经是空的。');
+      refresh();
+      return null;
+    }
+    if (result.status === 401) {
+      showAuth('登录状态已失效，请重新登录后继续。');
+      return null;
+    }
+    throw new Error(errorMessage(result.body, '清空探测记录失败。'));
   }
 
   function clearUsageLog() {
@@ -4293,7 +4523,7 @@
    * how long a failing line is held out of rotation. The gateway owns the field
    * list, so a policy value added there shows up here without a change to this
    * file; only the labels and the wording of each section live here. */
-  var POLICY_SECTION_ORDER = ['failover', 'retry', 'breaker', 'request_log', 'usage'];
+  var POLICY_SECTION_ORDER = ['failover', 'retry', 'breaker', 'request_log', 'usage', 'probe'];
 
   var POLICY_SECTIONS = {
     failover: {
@@ -4315,6 +4545,10 @@
     usage: {
       title: '用量统计',
       help: '记录每个请求的 token 用量（上游在响应里自报的输入与输出），「用量」页读的就是它。关闭后不再记账，已有的记录仍可查看和清空；流量大时保留条数决定这个库能回溯多久。'
+    },
+    probe: {
+      title: '账号探测',
+      help: '用线路自己的密钥问一道随机加法题，判断账号还能不能用。「探测」页读的就是这些结果。启动探测在进程启动后核对全部线路；空闲探测在一条线路连续无调用超过间隔时核对它；从冷却中被放出来的线路也会核对一次。探测只记录事实，不会改变熔断状态。'
     }
   };
 
@@ -4334,7 +4568,11 @@
     'gateway.request_log.enabled': { label: '记录请求', help: '关闭后不再记录任何请求，已有的记录仍然可以在「请求记录」页查看和清空。' },
     'gateway.request_log.keep': { label: '保留条数', unit: 'count', help: '只保留最近的这么多条，更早的记录在写入新记录时被删除。' },
     'gateway.usage.enabled': { label: '记录用量', help: '关闭后不再统计 token 用量，已有的记录仍然可以在「用量」页查看和清空。' },
-    'gateway.usage.keep': { label: '保留条数', unit: 'count', help: '只保留最近的这么多条用量记录，更早的在写入新记录时被删除。' }
+    'gateway.usage.keep': { label: '保留条数', unit: 'count', help: '只保留最近的这么多条用量记录，更早的在写入新记录时被删除。' },
+    'gateway.probe.startup': { label: '启动后核对线路', help: '进程启动后核对全部线路的账号状态；关闭后只做空闲与冷却恢复探测。改动在重启后生效。' },
+    'gateway.probe.idle_seconds': { label: '空闲多久后探测', unit: 's', help: '一条线路连续这么久没有被调用（也没有被探测）时核对一次；0 表示关闭空闲探测。' },
+    'gateway.probe.concurrency': { label: '探测并发', unit: 'count', help: '同时进行中的探测请求上限：启动探测会一次核对很多账号，不设上限会瞬间打满上游额度。' },
+    'gateway.probe.keep': { label: '保留条数', unit: 'count', help: '只保留最近的这么多条探测记录，更早的在写入新记录时被删除。' }
   };
 
   var POLICY_UNITS = { count: '次', ms: '毫秒', s: '秒', x: '倍' };
@@ -5014,6 +5252,20 @@
     }
     if (els.usageClear) {
       els.usageClear.addEventListener('click', clearUsageLog);
+    }
+    if (els.probesRunAll) {
+      els.probesRunAll.addEventListener('click', runProbeSweep);
+    }
+    if (els.probesClear) {
+      els.probesClear.addEventListener('click', clearProbeLog);
+    }
+    if (els.probesBody) {
+      // 每条记录都带着它那条线路的 id：想复查某一个账号时不用再去路由页找。
+      els.probesBody.addEventListener('click', function (event) {
+        var button = event.target.closest('[data-probe-channel]');
+        if (!button) { return; }
+        probeChannelNow(button.getAttribute('data-probe-channel'), button);
+      });
     }
 
     els.editorForm.addEventListener('submit', submitEditor);

@@ -107,6 +107,7 @@
       <nav class="console-nav" id="console-nav" aria-label="管理台视图">
         <button class="nav-item is-active" type="button" data-view="overview">概览</button>
         <button class="nav-item" type="button" data-view="usage">用量</button>
+        <button class="nav-item" type="button" data-view="probes">探测</button>
         <button class="nav-item" type="button" data-view="upstream">上游</button>
         <button class="nav-item" type="button" data-view="routes">路由</button>
         <button class="nav-item" type="button" data-view="requests">请求记录</button>
@@ -335,6 +336,51 @@
         <div class="empty-state" data-usage-empty hidden>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
           <p data-empty-text>这个时间范围还没有用量记录。经过网关的每个请求都会记在这里。</p>
+        </div>
+      </section>
+    </main>
+
+    <!-- ===== 探测：账号还能不能用，由网关自己定期核对 ===== -->
+    <main class="container" data-view-panel="probes" hidden>
+      <section class="panel">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="title-tick" aria-hidden="true"></span>
+            <h2>账号探测</h2>
+            <span class="panel-meta" data-probes-meta></span>
+          </div>
+          <div class="panel-actions">
+            <span class="panel-note">每 10 秒自动刷新 &middot; <span data-next-refresh>&mdash;</span></span>
+          </div>
+        </header>
+        <p class="panel-help">网关用线路自己的密钥问一道随机加法题，按上游的回答判断账号还能不能用：<strong>能回答</strong>说明账号可达，<strong>答对</strong>说明账号可用。三类时机：重启后核对全部线路（启动探测）、线路连续无调用超过间隔（空闲探测）、线路从冷却中被放出来（恢复探测）；也可以在下面手动触发。探测只记录事实，不会改变熔断状态——把线路恢复上线的仍然是冷却到期或「概览」页的恢复操作。</p>
+        <div class="panel-toolbar">
+          <button id="probes-run-all" class="btn btn-primary btn-small" type="button"><span class="btn-label">探测全部线路</span></button>
+          <span class="panel-note" data-probes-schedule></span>
+          <span class="panel-note" data-probes-retention></span>
+          <button id="probes-clear" class="btn btn-ghost btn-small" type="button">清空记录</button>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table" data-probes-table>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>触发</th>
+                <th>上游</th>
+                <th>模型</th>
+                <th>结果</th>
+                <th class="num" title="上游返回的 HTTP 状态码；0 表示没有回答。">状态</th>
+                <th class="num">耗时</th>
+                <th>说明</th>
+                <th class="actions"></th>
+              </tr>
+            </thead>
+            <tbody data-probes-body></tbody>
+          </table>
+        </div>
+        <div class="empty-state" data-probes-empty hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M21 3v6h-6M12 7v5l3 2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <p data-empty-text>还没有探测记录。网关会在启动后、线路空闲时自动核对，也可以点「探测全部线路」立刻检查。</p>
         </div>
       </section>
     </main>
