@@ -717,3 +717,115 @@ func TestEnginePresentsTheSelectedClientFingerprint(t *testing.T) {
 		t.Fatalf("Authorization = %q, want the upstream credential", got)
 	}
 }
+
+// A strict pin gives each internal provider its own exclusive attempt: the first
+// attempt asks the first provider and the retry asks the second, so a provider
+// that fails does not take the pin down with it.
+func TestEnginePinsAStrictProviderPerAttempt(t *testing.T) {
+	var bodies []map[string]any
+	var mu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		bodies = append(bodies, body)
+		attempt := len(bodies)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if attempt == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"busy"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	selector := router.NewMemorySelector(routeFor(nil, domain.Channel{
+		ID: "pinned", BaseURL: server.URL, APIKey: "sk", Enabled: true, SiteID: 1, Weight: 1,
+		Pins: []domain.ModelPin{{
+			Model: "gpt-4.1", Mode: domain.PinModeStrict, Providers: []string{"alpha", "beta"},
+		}},
+	}))
+	engine := Engine{
+		Selector: selector,
+		Observer: &recordingObserver{},
+		Client:   &http.Client{},
+		Policy: domain.RetryPolicy{
+			MaxAttempts:           3,
+			MaxAttemptsPerChannel: 3,
+			RetryStatuses:         map[int]struct{}{http.StatusServiceUnavailable: {}},
+		},
+		Sleep: noSleep,
+	}
+	_, err := engine.Forward(context.Background(), domain.Request{
+		Method:      http.MethodPost,
+		Path:        "/v1/chat/completions",
+		Headers:     http.Header{},
+		Body:        []byte(`{"model":"gpt-4.1","messages":[]}`),
+		Model:       "gpt-4.1",
+		ContentType: "application/json",
+	})
+	if err != nil {
+		t.Fatalf("Forward() error = %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("upstream saw %d attempts, want 2", len(bodies))
+	}
+	onlyOf := func(body map[string]any) []any {
+		provider, _ := body["provider"].(map[string]any)
+		only, _ := provider["only"].([]any)
+		return only
+	}
+	if first := onlyOf(bodies[0]); len(first) != 1 || first[0] != "alpha" {
+		t.Fatalf("first attempt provider.only = %#v, want [alpha]", first)
+	}
+	if second := onlyOf(bodies[1]); len(second) != 1 || second[0] != "beta" {
+		t.Fatalf("second attempt provider.only = %#v, want [beta]", second)
+	}
+}
+
+// A preferred pin sends the whole order once and lets the upstream choose inside
+// it, with the sort spelling the direct pipeline reads.
+func TestEnginePinsAPreferredOrder(t *testing.T) {
+	var seen map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&seen)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	selector := router.NewMemorySelector(routeFor(nil, domain.Channel{
+		ID: "pinned", BaseURL: server.URL, APIKey: "sk", Enabled: true, SiteID: 1, Weight: 1,
+		Pins: []domain.ModelPin{{
+			Model: "gpt-4.1", Mode: domain.PinModePreferred, Providers: []string{"alpha", "beta"}, Sort: "ttft",
+		}},
+	}))
+	engine := Engine{
+		Selector: selector,
+		Observer: &recordingObserver{},
+		Client:   &http.Client{},
+		Policy:   domain.RetryPolicy{MaxAttempts: 1, MaxAttemptsPerChannel: 1},
+	}
+	if _, err := engine.Forward(context.Background(), domain.Request{
+		Method:      http.MethodPost,
+		Path:        "/v1/chat/completions",
+		Headers:     http.Header{},
+		Body:        []byte(`{"model":"gpt-4.1","messages":[]}`),
+		Model:       "gpt-4.1",
+		ContentType: "application/json",
+	}); err != nil {
+		t.Fatalf("Forward() error = %v", err)
+	}
+	provider, _ := seen["provider"].(map[string]any)
+	order, _ := provider["order"].([]any)
+	if len(order) != 2 || order[0] != "alpha" || order[1] != "beta" {
+		t.Fatalf("provider.order = %#v", provider["order"])
+	}
+	if provider["sort"] != "latency" {
+		t.Fatalf("provider.sort = %v, want latency", provider["sort"])
+	}
+}

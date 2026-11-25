@@ -312,15 +312,16 @@ accepted write reloads the configuration and hands the result to the routing
 engine, so an upstream added in the console serves traffic on the next request.
 
 The console is laid out by what each page is for. A sidebar carries four groups —
-监控 (概览, 用量, 探测, 请求记录), 渠道 (上游, 路由), 访问 (客户端密钥, 代理), and 系统
-(设置) — and the top bar names the group and the page on screen, so a page is
-placeable without reading the whole sidebar. On a narrow screen the sidebar
+监控 (概览, 用量, 探测, 请求记录), 渠道 (上游, 路由, 渠道固定), 访问 (客户端密钥, 代理),
+and 系统 (设置) — and the top bar names the group and the page on screen, so a page
+is placeable without reading the whole sidebar. On a narrow screen the sidebar
 becomes a wrapping row above the content, so a table keeps the width it needs.
 
 The views are 概览 (the live dashboard), 用量 (what the served requests cost in
 tokens, by model, upstream, and client key), 探测 (whether each account still
 works), 上游 (upstreams), 路由 (the routing table
-the gateway derived), 请求记录 (the record of served requests), 客户端密钥 (client
+the gateway derived), 渠道固定 (the internal providers a model is pinned to),
+请求记录 (the record of served requests), 客户端密钥 (client
 keys), 代理 (proxy profiles), and 设置. The settings view is
 grouped by function and shows one group at a time: 账号 (the administrator
 account), 运行策略 (the runtime policy), and 客户端指纹 (the built-in client
@@ -406,6 +407,42 @@ upstreams:
 - **Routing is derived.** Selecting a model creates its route and one line per key;
   deselecting it removes them once no other upstream serves that model. A route the
   operator wrote by hand through the API is never pruned by a console edit.
+
+### Pinning the internal providers of a model
+
+Some upstream gateways serve one model from several internal providers and choose
+between them per request. An operator who needs one of them — the one that actually
+answers, or the one that is cheaper — pins it under 渠道固定. A pin is one row per
+upstream and model, and the gateway writes it into the chat-completions body:
+
+- **严格固定 (strict)** gives each pinned provider its own exclusive attempt, in the
+  configured order: the first attempt names the first provider, a retry names the
+  next one, and the request never reaches a provider outside the list. Once the list
+  is exhausted the last provider keeps the request, because a further attempt on a
+  provider the operator did not pin would defeat the pin.
+- **固定优先 (preferred)** sends the whole ordered list as a preference order and lets
+  the upstream choose inside it, which keeps the upstream's own failover.
+
+排序 by cost, ttft, or tps asks the upstream to order the providers it may use; an
+empty value leaves its own order alone. 排除 removes a provider from the list — the
+upstream has no exclude field, so an exclusion is expressed by not writing that
+provider at all.
+
+The upstream's pipeline decides where the pin goes: a direct (OpenRouter-shaped)
+gateway reads `provider.only` / `order` / `sort` at the top level, a planner
+(Vercel-AI-gateway-shaped) one reads `providerOptions.gateway.*`. Left blank, both
+shapes are written and each gateway ignores the fields it does not know; setting the
+pipeline to the one the upstream speaks writes only that one. The body is merged
+rather than replaced: provider fields the caller sent stay as they were, and the
+model name, messages and every other field travel unchanged.
+
+A pin applies to `POST /v1/chat/completions` only. Pins are stored in the
+gateway-owned `gateway_model_pins` table and edited through the same configuration
+api as everything else — `POST /management/configuration/pins`,
+`PUT /management/configuration/pins/{id}`, `DELETE /management/configuration/pins/{id}`
+— with `site_id`, `model`, `mode`, `providers` (a JSON array), `exclude`, `sort` and
+`pipeline`. A pin that names no provider and no sort order is refused, because it
+would be stored and never do anything, and deleting an upstream deletes its pins.
 
 An upstream added from the console is created enabled, so its lines serve traffic
 as soon as it is saved. Client keys are created enabled too, and their restrictions —
@@ -547,7 +584,7 @@ Management endpoints:
 - `POST /management/logout`
 - `POST /management/password`
 
-`{resource}` is one of `upstreams`, `sites`, `accounts`, `tokens`, `routes`,
+`{resource}` is one of `upstreams`, `pins`, `sites`, `accounts`, `tokens`, `routes`,
 `channels`, `keys`, or `proxies`. `GET /management/configuration` returns every row of
 each resource with secrets masked, the writable field list of each resource, the models
 the gateway currently routes, the runtime policy with its field list, and the built-in

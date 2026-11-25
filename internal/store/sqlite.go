@@ -303,7 +303,10 @@ func (s *SQLiteStore) EnsureUpstreamSchema(ctx context.Context) error {
 	if err := s.addColumnIfMissing(ctx, "sites", "client_profile", "TEXT"); err != nil {
 		return err
 	}
-	return nil
+	// The internal-provider pins are the gateway's own table, but they are read
+	// with the configuration and edited from the console, so they are prepared
+	// here with the rest of the configurable surface.
+	return s.EnsureModelPinSchema(ctx)
 }
 
 // addColumnIfMissing adds a column to a table when an older database predates
@@ -521,7 +524,6 @@ func (s *SQLiteStore) LoadConfiguration(ctx context.Context) (Configuration, err
 	}
 	return configuration, nil
 }
-
 func (s *SQLiteStore) loadSettings(ctx context.Context, configuration *Configuration) error {
 	rows, err := s.db.QueryContext(ctx, `SELECT key, COALESCE(value, '') FROM settings`)
 	if err != nil {
@@ -731,7 +733,14 @@ func (s *SQLiteStore) loadRoutes(ctx context.Context, configuration *Configurati
 		return err
 	}
 
-	channels, err := s.loadChannelRows(ctx, routes, routeIndex, priorities, cdModes)
+	// The internal-provider pins are attached per upstream, so they are read once
+	// and handed to the lines of whichever upstream they belong to.
+	pins, err := s.loadModelPins(ctx)
+	if err != nil {
+		return err
+	}
+
+	channels, err := s.loadChannelRows(ctx, routes, routeIndex, priorities, cdModes, pins)
 	if err != nil {
 		return err
 	}
@@ -782,7 +791,7 @@ func (s *SQLiteStore) loadRouteRows(ctx context.Context, groupSources map[int64]
 	return routes, rows.Err()
 }
 
-func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route, routeIndex map[int64]int, sitePriorities map[int64]int, siteCDModes map[int64]string) ([]domain.Channel, error) {
+func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route, routeIndex map[int64]int, sitePriorities map[int64]int, siteCDModes map[int64]string, modelPins map[int64][]domain.ModelPin) ([]domain.Channel, error) {
 	rows, err := s.db.QueryContext(ctx, channelQuery)
 	if err != nil {
 		return nil, fmt.Errorf("load route channels: %w", err)
@@ -855,6 +864,7 @@ func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route
 			SitePriority:       sitePriorities[siteID],
 			SourceModel:        resolveSourceModel(sourceModel.String, route.ModelPattern),
 			ClientProfile:      strings.TrimSpace(siteClientProfile),
+			Pins:               modelPins[siteID],
 		}
 		// The upstream's own cooldown mode decides how a failing key is held out
 		// of rotation: per key, or per key and model. An upstream the console has

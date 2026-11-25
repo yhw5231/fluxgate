@@ -1557,3 +1557,9 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 }
 .usage-group .table-wrap { max-height: 340px; overflow: auto; }
 #usage-window { flex: 0 0 auto; min-width: 140px; }
+
+/* 一个被排除的内部渠道：它还在列表里（位置说明尝试顺序），但不会被尝试。 */
+.tag.is-excluded {
+  text-decoration: line-through;
+  opacity: 0.55;
+}

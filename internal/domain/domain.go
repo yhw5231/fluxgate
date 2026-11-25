@@ -54,6 +54,130 @@ type Channel struct {
 	// preferred one, which is what makes priority mean "use this upstream first"
 	// rather than "give it more traffic".
 	SitePriority int
+	// Pins are the internal-provider pins this upstream's model may carry. They
+	// are attached per site rather than per route because an upstream serves its
+	// providers the same way whatever model name a client used to reach it.
+	Pins []ModelPin
+}
+
+// The two ways one model's internal providers can be pinned.
+const (
+	// PinModeStrict tries each pinned provider exclusively, in the configured
+	// order: the request never reaches a provider outside the list.
+	PinModeStrict = "strict"
+	// PinModePreferred sends the whole ordered list and lets the upstream choose
+	// from it, which keeps the upstream's own failover inside the list.
+	PinModePreferred = "preferred"
+)
+
+// The pipelines an upstream that pins providers is known to speak.
+const (
+	// PinPipelineDirect writes provider.only/order/sort at the top level, which is
+	// the OpenRouter-shaped gateway.
+	PinPipelineDirect = "direct"
+	// PinPipelinePlanner writes providerOptions.gateway.only/order/sort, which is
+	// the Vercel-AI-gateway-shaped one.
+	PinPipelinePlanner = "planner"
+)
+
+// ModelPin pins the internal providers one upstream model is served from.
+//
+// An upstream gateway sometimes serves one model from several internal
+// providers, choosing between them at random per request. When an operator needs
+// one of them — the one that actually answers, or the one that is cheaper — the
+// pin says so, and the gateway writes it into the request body.
+type ModelPin struct {
+	// Model is the model the pin applies to, as the upstream knows it or as the
+	// route exposes it; the comparison is by model identity, not by string.
+	Model string
+	Mode  string
+	// Providers is the ordered list of internal providers. In strict mode each one
+	// gets its own attempt; in preferred mode the whole list is sent as a
+	// preference order.
+	Providers []string
+	// Exclude removes providers from the list above. The upstream has no exclude
+	// field, so an exclusion is only expressible as an allow list.
+	Exclude []string
+	// Sort asks the upstream to order the providers it may use: cost, ttft, or
+	// tps.
+	Sort string
+	// Pipeline is the shape the upstream speaks, once known. Empty writes both
+	// shapes, because each pipeline ignores the fields it does not know.
+	Pipeline string
+	// ProbedAt records when the providers were last discovered, and LastProvider
+	// which one actually served the probe. Both are evidence for an operator and
+	// never change dispatch.
+	ProbedAt     time.Time
+	LastProvider string
+}
+
+// ActiveProviders is the provider list the pin actually uses: the configured
+// order with the excluded names removed.
+func (p ModelPin) ActiveProviders() []string {
+	if len(p.Providers) == 0 {
+		return nil
+	}
+	excluded := make(map[string]struct{}, len(p.Exclude))
+	for _, name := range p.Exclude {
+		excluded[name] = struct{}{}
+	}
+	active := make([]string, 0, len(p.Providers))
+	for _, name := range p.Providers {
+		if _, skip := excluded[name]; skip {
+			continue
+		}
+		active = append(active, name)
+	}
+	return active
+}
+
+// Pinned reports whether the pin asks the gateway to write anything at all.
+func (p ModelPin) Pinned() bool {
+	return len(p.ActiveProviders()) > 0
+}
+
+// StrictProviderFor returns the provider one attempt should be pinned to, and
+// whether the pin is a strict one with providers to walk. The attempt is
+// one-based, so the first attempt asks the first provider; once the list is
+// exhausted the last provider keeps the request, because a further attempt on a
+// provider the operator did not pin would defeat the pin.
+func (p ModelPin) StrictProviderFor(attempt int) (string, bool) {
+	if p.Mode != PinModeStrict {
+		return "", false
+	}
+	active := p.ActiveProviders()
+	if len(active) == 0 {
+		return "", false
+	}
+	index := attempt - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(active) {
+		index = len(active) - 1
+	}
+	return active[index], true
+}
+
+// PinFor resolves the pin that applies to a requested model. An exact name wins;
+// otherwise the first pin written for another spelling of the same model
+// answers, because a pin is a property of the model rather than of one string.
+func PinFor(pins []ModelPin, model string) (ModelPin, bool) {
+	trimmed := strings.TrimSpace(model)
+	if trimmed == "" {
+		return ModelPin{}, false
+	}
+	for _, pin := range pins {
+		if strings.EqualFold(strings.TrimSpace(pin.Model), trimmed) {
+			return pin, true
+		}
+	}
+	for _, pin := range pins {
+		if pattern.Equivalent(pin.Model, trimmed) {
+			return pin, true
+		}
+	}
+	return ModelPin{}, false
 }
 
 // ModelMappingEntry is one pattern-to-upstream-model pair.

@@ -1207,6 +1207,13 @@ func cascadeDeleteUpstream(ctx context.Context, tx *sql.Tx, siteID int64) (map[s
 	if err := forgetUpstreamCDMode(ctx, tx, siteID); err != nil {
 		return nil, err
 	}
+	// The pins belong to the upstream, so they go before the early return below:
+	// an upstream whose keys were never written still has pins worth removing.
+	if pins, err := deletePinsForSite(ctx, tx, siteID); err != nil {
+		return nil, err
+	} else if pins > 0 {
+		removed["pins"] = pins
+	}
 	accounts, err := siteAccountIDs(ctx, tx, siteID)
 	if err != nil {
 		return nil, err

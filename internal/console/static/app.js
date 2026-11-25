@@ -26,10 +26,10 @@
 
   /* 管理视图 = 概览之外的视图，它们读取的是可写的配置清单。设置页也读取配置，
    * 因为运行策略和配置一起返回。 */
-  var VIEWS = ['overview', 'usage', 'probes', 'upstream', 'routes', 'requests', 'keys', 'settings'];
+  var VIEWS = ['overview', 'usage', 'probes', 'upstream', 'routes', 'pins', 'requests', 'keys', 'proxies', 'settings'];
   /* 请求记录页读的是网关自己的日志，不依赖配置清单，所以它不在 MANAGEMENT_VIEWS
    * 里：配置读不出来的时候，记录仍然看得到。 */
-  var MANAGEMENT_VIEWS = { upstream: true, routes: true, keys: true, proxies: true, settings: true };
+  var MANAGEMENT_VIEWS = { upstream: true, routes: true, pins: true, keys: true, proxies: true, settings: true };
   /* 会自己刷新的视图：概览读取运行时快照，路由页读取每条线路的实时状态，请求
    * 记录页读的是一份还在增长的日志。其余视图是可编辑的配置表，只能在操作者
    * 自己触发时重画。 */
@@ -50,6 +50,7 @@
     requests: '监控',
     upstream: '渠道',
     routes: '渠道',
+    pins: '渠道',
     keys: '访问',
     proxies: '访问',
     settings: '系统'
@@ -62,6 +63,7 @@
     requests: '请求记录',
     upstream: '上游',
     routes: '路由',
+    pins: '渠道固定',
     keys: '客户端密钥',
     proxies: '代理',
     settings: '设置'
@@ -402,7 +404,10 @@
     routing_strategy: { weighted: '加权随机', round_robin: '加权随机', stable_first: '固定优先' },
     key_mode: { available_first: '可用优先', round_robin: '加权随机' },
     key_cd_mode: { key_cooldown: '按 key 冷却', key_model_cooldown: '按 key + 模型冷却' },
-    protocol: { http: 'HTTP', https: 'HTTPS', socks5: 'SOCKS5', socks5h: 'SOCKS5H' }
+    protocol: { http: 'HTTP', https: 'HTTPS', socks5: 'SOCKS5', socks5h: 'SOCKS5H' },
+    mode: { strict: '严格固定', preferred: '固定优先' },
+    sort: { cost: '价格', ttft: '首字延迟', tps: '吞吐' },
+    pipeline: { direct: 'direct 管线', planner: 'planner 管线' }
   };
 
   function choiceOptions(field) {
@@ -532,6 +537,44 @@
       url: { label: '代理地址', placeholder: 'http://127.0.0.1:7890', help: '支持的协议：http、https、socks5、socks5h。' },
       is_default: { label: '设为默认代理', help: '没有其他代理设置生效时使用它。' },
       enabled: { label: '启用' }
+    },
+    pins: {
+      site_id: {
+        label: '上游', type: 'select', options: upstreamCandidates,
+        help: '这条固定配置属于哪个上游。'
+      },
+      model: {
+        label: '模型', placeholder: '例如 gpt-4.1',
+        help: '要固定的模型。按路由暴露的名字或用上游认识的写法都可以，比较按模型身份进行。'
+      },
+      mode: {
+        label: '固定方式', type: 'select',
+        help: '严格固定：按顺序给每个内部渠道一次独占尝试，请求不会落到列表之外。固定优先：把整个优先序交给上游，由它自己选。'
+      },
+      providers: {
+        label: '内部渠道', type: 'json', placeholder: '["alibaba", "baseten"]',
+        help: 'JSON 数组，按尝试顺序填写上游内部渠道的名字（用上游自己的拼写）。'
+      },
+      exclude: {
+        label: '排除的内部渠道', type: 'json', placeholder: '["google"]',
+        help: 'JSON 数组，从上面的列表里去掉这些内部渠道。'
+      },
+      sort: {
+        label: '排序', type: 'select',
+        help: '让上游在可选范围内按这个指标挑。留空表示不排序。'
+      },
+      pipeline: {
+        label: '管线', type: 'select',
+        help: '上游认的写法。留空时两种都写入，由上游忽略不认识的那种；探测到之后会写入探测结果。'
+      },
+      probed_at: {
+        label: '最近探测时间', type: 'datetime',
+        help: '由探测写入，通常不需要手改。'
+      },
+      last_provider: {
+        label: '最近实际内部渠道',
+        help: '由探测写入，只作参考。'
+      }
     }
   };
 
@@ -610,6 +653,47 @@
       ],
       actions: ['edit', 'delete'],
       describe: function (row) { return text(row.name, '#' + row.id); }
+    },
+    pins: {
+      title: '渠道固定',
+      create: '添加固定',
+      noun: '固定配置',
+      order: function (left, right) {
+        var leftSite = text(left.site_name, '');
+        var rightSite = text(right.site_name, '');
+        if (leftSite !== rightSite) { return leftSite < rightSite ? -1 : 1; }
+        var leftModel = text(left.model, '');
+        var rightModel = text(right.model, '');
+        return leftModel < rightModel ? -1 : (leftModel > rightModel ? 1 : 0);
+      },
+      columns: [
+        { label: '上游', cell: function (row) { return element('span', 'cell-strong', text(row.site_name, '#' + row.site_id)); } },
+        { label: '模型', cell: function (row) { return element('span', 'mono', text(row.model)); } },
+        {
+          label: '固定方式',
+          cell: function (row) {
+            return row.mode === 'preferred'
+              ? badge('固定优先', 'info')
+              : badge('严格固定', 'violet');
+          }
+        },
+        { label: '内部渠道（按尝试顺序）', cell: function (row) { return pinProvidersCell(row); } },
+        { label: '排除', cell: function (row) { return pinExcludeCell(row); } },
+        { label: '排序', cell: function (row) { return row.sort ? tag(enumLabel('sort', row.sort, row.sort)) : '—'; } },
+        { label: '管线', cell: function (row) { return row.pipeline ? tag(enumLabel('pipeline', row.pipeline, row.pipeline)) : element('span', 'cell-muted', '两种都写'); } },
+        {
+          label: '最近探测',
+          title: '由探测写入：上游确认的管线、最近一次真正服务的内部渠道。',
+          cell: function (row) {
+            var parts = [];
+            if (row.probed_at) { parts.push(formatTimestamp(row.probed_at)); }
+            if (row.last_provider) { parts.push('实际：' + row.last_provider); }
+            return parts.length ? element('span', 'cell-muted', parts.join(' · ')) : element('span', 'cell-muted', '—');
+          }
+        }
+      ],
+      actions: ['edit', 'delete'],
+      describe: function (row) { return text(row.site_name, '#' + row.site_id) + ' / ' + text(row.model); }
     }
   };
 
@@ -873,6 +957,37 @@
         detail: '#' + row.id + ' · ' + count + ' 个模型'
       };
     });
+  }
+
+  /* 一个固定配置的「内部渠道」是上游自己的 provider 名字，网关只负责按顺序写进
+   * 请求体，不维护清单：名字写错时由上游报错。排除项在这里划掉，operator 一眼能
+   * 看出哪个渠道不会真的被尝试。 */
+  function providerNames(value) {
+    var parsed = parseJSON(value);
+    if (!Array.isArray(parsed)) { return []; }
+    return parsed.map(function (name) { return String(name); });
+  }
+
+  function pinProvidersCell(row) {
+    var providers = providerNames(row.providers);
+    var excluded = providerNames(row.exclude);
+    if (providers.length === 0) { return element('span', 'cell-muted', '—'); }
+    var wrap = element('span', 'tag-list');
+    providers.forEach(function (name, index) {
+      var node = tag((index + 1) + '. ' + name);
+      if (excluded.indexOf(name) !== -1) {
+        node.classList.add('is-excluded');
+        node.title = '已排除：这个内部渠道不会被尝试';
+      }
+      wrap.appendChild(node);
+    });
+    return wrap;
+  }
+
+  function pinExcludeCell(row) {
+    var excluded = providerNames(row.exclude);
+    if (excluded.length === 0) { return element('span', 'cell-muted', '—'); }
+    return tag(excluded.join(', '));
   }
 
   function routeCandidates() {
@@ -4213,7 +4328,14 @@
         unknown.textContent = current + '（未识别）';
         select.appendChild(unknown);
       }
-      select.value = current;
+      // A required dropdown has no "not set" choice, so an empty current value means
+      // the first choice is what the form is about to save. Assigning '' would leave
+      // the control blank and hide a choice the operator has to make.
+      if (current === '' && field.required && options.length > 0) {
+        select.selectedIndex = 0;
+      } else {
+        select.value = current;
+      }
       return {
         node: select,
         read: function () {

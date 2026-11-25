@@ -138,6 +138,10 @@
             <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="18" cy="6" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="12" cy="18" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M6 8.4v1.2a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V8.4M12 12.6v3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
             <span>路由</span>
           </button>
+          <button class="nav-item" type="button" data-view="pins">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4v6l-4 4h14l-4-4V4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M9 4h6M12 14v6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+            <span>渠道固定</span>
+          </button>
         </nav>
         <nav class="nav-group" aria-label="访问">
           <p class="nav-group-title">访问</p>
@@ -526,6 +530,27 @@
         </div>
         <div class="empty-state" data-empty="keys" hidden>
           <p data-empty-text>还没有客户端密钥。没有密钥时任何客户端都无法调用网关。</p>
+        </div>
+      </section>
+    </main>
+
+    <!-- ===== 渠道固定：把一个上游模型钉到它的内部渠道（provider）===== -->
+    <main class="container" data-view-panel="pins" hidden>
+      <section class="panel" data-management="pins">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="title-tick" aria-hidden="true"></span>
+            <h2>渠道固定</h2>
+            <span class="panel-meta" data-meta></span>
+          </div>
+          <button class="btn btn-primary" type="button" data-create="pins">添加固定</button>
+        </header>
+        <p class="panel-help">有些上游网关的一个模型背后挂着多个内部渠道（provider），请求时由它随机挑一个。这里把某个模型固定到你指定的内部渠道，网关会在请求体里写入固定条件：<strong>严格固定</strong>会按顺序给每个内部渠道一次独占尝试（请求不会落到列表之外），<strong>固定优先</strong>把整个优先序交给上游自己选。排序按价格 / 首字延迟 / 吞吐让上游在可选范围内挑。管线留空时两种写法都写入（各网关会忽略不认识的字段），探测到具体管线后只写那一种。内部渠道名字由上游决定（例如 alibaba、baseten），按上游自己的拼写填写。</p>
+        <div class="table-wrap">
+          <table class="data-table" data-table="pins"><tbody data-body="pins"></tbody></table>
+        </div>
+        <div class="empty-state" data-empty="pins" hidden>
+          <p data-empty-text>还没有固定配置。一个模型只由一个内部渠道提供时不需要固定；需要在多个内部渠道之间指定时再加一条。</p>
         </div>
       </section>
     </main>

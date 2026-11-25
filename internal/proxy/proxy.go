@@ -194,6 +194,22 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 		if err != nil {
 			return Result{Trace: trace}, err
 		}
+		// An upstream that serves one model from several internal providers can be
+		// told which one to use. The pin is written per attempt, because a strict
+		// pin gives each provider its own exclusive try: the first attempt asks the
+		// first provider, and the engine's retries walk the list before the request
+		// moves to another line.
+		if pin, pinned := domain.PinFor(channel.Pins, input.Model); pinned && body.Shape == transform.ShapeJSON {
+			if selected, strict := pin.StrictProviderFor(channelAttempt); strict || pin.Pinned() {
+				updated, pinErr := transform.ApplyModelPin(body.Raw, pin, selected)
+				if pinErr != nil {
+					return Result{Trace: trace}, pinErr
+				}
+				if len(updated) > 0 {
+					body = transform.Body{Raw: updated, ContentType: body.ContentType, Shape: body.Shape}
+				}
+			}
+		}
 		call, err := buildRequest(ctx, input, channel, body, streamIdle)
 		if err != nil {
 			return Result{Trace: trace}, err

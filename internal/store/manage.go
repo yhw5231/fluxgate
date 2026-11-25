@@ -225,6 +225,11 @@ type Resource struct {
 // per-key proxy.
 var resources = []Resource{
 	upstreamResource,
+	// Internal-provider pins are a gateway-owned table rather than an upstream
+	// one, but they are edited like every other table, so the generic resource
+	// machinery carries them: the console gets its list, form and validation from
+	// one description.
+	pinResource,
 	{
 		Name: "sites", Table: "sites", OrderBy: "id",
 		Columns: []Column{

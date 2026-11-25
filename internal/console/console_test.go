@@ -437,7 +437,7 @@ func TestConsoleGroupsNavigationByFunction(t *testing.T) {
 	// script's toggle has something to show for each name it accepts.
 	for _, view := range []string{
 		"overview", "usage", "probes", "requests",
-		"upstream", "routes",
+		"upstream", "routes", "pins",
 		"keys", "proxies",
 		"settings",
 	} {
@@ -465,6 +465,59 @@ func TestConsoleScriptSwitchesSettingsGroups(t *testing.T) {
 	} {
 		if !strings.Contains(script, wanted) {
 			t.Errorf("console script is missing %q", wanted)
+		}
+	}
+}
+
+// The script's list of views is what decides whether a navigation click shows a
+// panel: a view that exists in the markup but not in that list silently falls back
+// to the overview. The two have to name the same set.
+func TestConsoleScriptAcceptsEveryViewItCarries(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/console/", nil)
+	response := httptest.NewRecorder()
+	Handler().ServeHTTP(response, request)
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	page := string(body)
+	script := consoleScript(t)
+
+	start := strings.Index(script, "var VIEWS = [")
+	if start == -1 {
+		t.Fatal("console script has no VIEWS list")
+	}
+	end := strings.Index(script[start:], "]")
+	if end == -1 {
+		t.Fatal("console script's VIEWS list is not closed")
+	}
+	views := script[start : start+end]
+
+	seen := map[string]bool{}
+	marker := `data-view="`
+	for index := 0; index < len(page); {
+		next := strings.Index(page[index:], marker)
+		if next == -1 {
+			break
+		}
+		from := index + next + len(marker)
+		closing := strings.Index(page[from:], `"`)
+		if closing == -1 {
+			break
+		}
+		name := page[from : from+closing]
+		if name != "" && !strings.Contains(name, " ") {
+			seen[name] = true
+		}
+		index = from + closing
+	}
+	if len(seen) == 0 {
+		t.Fatal("the console markup carries no views")
+	}
+	for name := range seen {
+		if !strings.Contains(views, "'"+name+"'") {
+			t.Errorf("the %q view exists in the markup but not in the script's VIEWS list", name)
 		}
 	}
 }
@@ -515,7 +568,7 @@ func TestConsoleCarriesTheManagementViewsAndEditor(t *testing.T) {
 	}
 	// Each view toggles as a whole, so the container and its navigation entry
 	// have to exist even before the script runs.
-	for _, view := range []string{"overview", "usage", "probes", "upstream", "routes", "requests", "keys", "proxies", "settings"} {
+	for _, view := range []string{"overview", "usage", "probes", "upstream", "routes", "pins", "requests", "keys", "proxies", "settings"} {
 		if !strings.Contains(page, `data-view="`+view+`"`) {
 			t.Errorf("console navigation has no %q entry", view)
 		}
