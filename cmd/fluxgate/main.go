@@ -226,6 +226,7 @@ func run(parent context.Context, logger *slog.Logger) error {
 		RequestLog:          persistentStore,
 		Usage:               persistentStore,
 		Probes:              probeService,
+		PinStore:            persistentStore,
 		MediaJobs:           persistentStore,
 		PolicyDefaults:      cfg.Policy(),
 		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,

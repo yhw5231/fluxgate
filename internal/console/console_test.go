@@ -1010,3 +1010,22 @@ func TestConsoleTogglesUpstreamStatusFromTheList(t *testing.T) {
 		t.Error("the upstream status column still renders a read-only badge")
 	}
 }
+
+// A pin names providers the upstream has never been asked about, so the console
+// carries two actions that ask it: a discovery (which providers exist, which
+// pipeline is spoken) and a validation (does each provider answer now).
+func TestConsoleCarriesThePinProbeActions(t *testing.T) {
+	script := consoleScript(t)
+	for _, wanted := range []string{
+		"/management/pins/probe",
+		"/management/pins/validate",
+		"probePinRow",
+		"validatePinRow",
+		"probePinRow(row, probe)",
+		"validatePinRow(row, validate)",
+	} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("console script is missing %q", wanted)
+		}
+	}
+}

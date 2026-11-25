@@ -41,6 +41,11 @@ type ProbeService interface {
 	ListRuns(ctx context.Context, limit int) ([]probe.Result, int64, error)
 	// ClearRuns empties the log.
 	ClearRuns(ctx context.Context) (int64, error)
+	// DiscoverPin asks an upstream model which internal providers it has and which
+	// pipeline it speaks.
+	DiscoverPin(ctx context.Context, line probe.Line) probe.PinDiscovery
+	// ValidatePins asks each named provider, exclusively, whether it answers.
+	ValidatePins(ctx context.Context, line probe.Line, providers []string, pipeline string) []probe.PinValidation
 }
 
 // probeRunsLimit is how many results the console's view reads by default.

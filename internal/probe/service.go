@@ -354,6 +354,22 @@ func (s *Service) heldLines(lines []Line, now time.Time, settings Settings) map[
 	return held
 }
 
+// DiscoverPin asks one upstream model which internal providers it has.
+func (s *Service) DiscoverPin(ctx context.Context, line Line) PinDiscovery {
+	if s == nil || s.Prober == nil {
+		return PinDiscovery{Detail: "this gateway runs no prober"}
+	}
+	return s.Prober.DiscoverPin(ctx, line)
+}
+
+// ValidatePins asks each named provider whether it answers.
+func (s *Service) ValidatePins(ctx context.Context, line Line, providers []string, pipeline string) []PinValidation {
+	if s == nil || s.Prober == nil {
+		return nil
+	}
+	return s.Prober.ValidatePins(ctx, line, providers, pipeline)
+}
+
 // Scan runs one scheduling round: it looks for lines that just came back from a
 // cooldown and lines that have been idle long enough, and probes them. The
 // background ticker calls it; exposing it lets a caller (and a test) drive one

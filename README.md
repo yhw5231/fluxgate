@@ -444,6 +444,38 @@ api as everything else — `POST /management/configuration/pins`,
 `pipeline`. A pin that names no provider and no sort order is refused, because it
 would be stored and never do anything, and deleting an upstream deletes its pins.
 
+#### Asking the upstream which providers exist
+
+The provider names are the upstream's own, and an operator should not have to guess
+them. `POST /management/pins/probe` with `{"site_id": 3, "model": "gpt-4.1"}` asks:
+
+- a small request, which comes back naming the provider that served it — the
+  strongest single piece of evidence, recorded as `last_provider` — and the pipeline
+  the gateway speaks, if its answer carries routing metadata;
+- a second request pinned to a provider that does not exist on purpose. A gateway
+  that cannot route it answers with the list it could have used: a planner spells
+  the list out in the error text, a direct gateway lists it under
+  `error.metadata.available_providers`. That list is merged with whatever the routing
+  metadata mentioned.
+
+The pipeline and the discovered providers are written back onto the pin — the
+discovered list only when the operator has not written an order of their own, so a
+probe can never overwrite a deliberate choice — and the configuration is reloaded,
+so the discovered pipeline applies to the next request. A probe that cannot reach
+the upstream answers `502 pin_probe_failed` with the upstream's own words in
+`detail`, and leaves the pin untouched.
+
+`POST /management/pins/validate` with `{"site_id": 3, "model": "gpt-4.1",
+"providers": ["alibaba", "baseten"]}` asks each named provider, one at a time and
+exclusively, whether it answers now, and answers with one classified result per
+provider (`ok`, `rate_limited`, `auth_rejected`, `upstream_error`, `bad_status`,
+`unreachable`). Validation is a snapshot and is not stored: it costs the account's
+quota, which is why neither action runs on a schedule.
+
+Both actions are console actions too: the 渠道固定 table carries 探测 and 验证 per
+row, and the notice says what was found (the pipeline, the provider that actually
+served, how many providers were named) or how many answered.
+
 An upstream added from the console is created enabled, so its lines serve traffic
 as soon as it is saved. Client keys are created enabled too, and their restrictions —
 排除模型 (denied models), 限定路由 (allowed routes), 限定上游 (allowed upstreams), and
@@ -579,6 +611,8 @@ Management endpoints:
 - `GET /management/probes`
 - `POST /management/probes/run`
 - `DELETE /management/probes`
+- `POST /management/pins/probe`
+- `POST /management/pins/validate`
 - `GET /management/session`
 - `POST /management/login`
 - `POST /management/logout`

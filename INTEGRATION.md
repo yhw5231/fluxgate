@@ -98,7 +98,15 @@
     后停在最后一个（不会落到列表之外的渠道）。
   - 管理台新增「渠道固定」页：上游/模型/固定方式/内部渠道顺序（排除项划掉）/排序/
     管线/最近探测，支持添加、编辑、删除。
-- [ ] **阶段 4b：内部渠道探测与逐渠道验证**（发现管线与可用内部渠道、逐渠道测试）
+- [x] **阶段 4b：内部渠道探测与逐渠道验证**
+  - `POST /management/pins/probe`：正常小请求读 `provider_metadata.gateway.routing`
+    （planner）或顶层 `provider`（direct），再发一次钉到 `__probe__` 的请求收割可用
+    内部渠道清单（planner 错误文本 / direct 错误 JSON）；合并后写回 `pipeline`、
+    `providers`（仅在操作员没有自己写顺序时）、`last_provider`、`probed_at`，并重载配置。
+  - `POST /management/pins/validate`：逐个内部渠道独占发一次请求，分类为
+    ok / rate_limited / auth_rejected / upstream_error / bad_status / unreachable。
+  - 管理台「渠道固定」行内新增「探测」「验证」按钮：探测结果显示管线、实际渠道与发现
+    的渠道数；验证结果汇总可用/限流/鉴权失败/不可用，并把失败明细放在提示条里。
 - [ ] **阶段 5：IPv6 代理池**（租约管理、换 IP、共享池）
 - [ ] **阶段 7：文档与部署**（README 重写、Compose/环境变量对齐）
 

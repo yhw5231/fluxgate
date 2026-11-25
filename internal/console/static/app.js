@@ -692,7 +692,7 @@
           }
         }
       ],
-      actions: ['edit', 'delete'],
+      actions: ['probe', 'validate', 'edit', 'delete'],
       describe: function (row) { return text(row.site_name, '#' + row.site_id) + ' / ' + text(row.model); }
     }
   };
@@ -988,6 +988,78 @@
     var excluded = providerNames(row.exclude);
     if (excluded.length === 0) { return element('span', 'cell-muted', '—'); }
     return tag(excluded.join(', '));
+  }
+
+  /* probePinRow asks the upstream which internal providers a model has. What it
+   * finds is written back onto the row, so the next refresh shows the pipeline it
+   * discovered and the order it named. */
+  function probePinRow(row, button) {
+    setSubmitting(button, true, '探测');
+    post('/management/pins/probe', { site_id: row.site_id, model: row.model }).then(function (result) {
+      setSubmitting(button, false, '探测');
+      if (result.status === 401) {
+        showAuth('登录状态已失效，请重新登录后继续。');
+        return;
+      }
+      if (result.ok) {
+        var body = result.body || {};
+        var providers = Array.isArray(body.providers) ? body.providers : [];
+        var parts = [];
+        parts.push(body.pipeline ? '管线 ' + body.pipeline : '未识别出管线');
+        if (body.last_provider) { parts.push('实际服务 ' + body.last_provider); }
+        parts.push(providers.length
+          ? '发现 ' + providers.length + ' 个内部渠道：' + providers.join('、')
+          : '上游没有点名内部渠道清单');
+        showNotice('探测完成：' + parts.join(' · '));
+        refresh();
+        return;
+      }
+      refreshFailure('探测失败', errorMessage(result.body, '上游没有回答探测请求。'));
+    });
+  }
+
+  /* validatePinRow asks each provider, one at a time and exclusively, whether it
+   * answers right now. The result is not stored: it is a snapshot of this moment. */
+  function validatePinRow(row, button) {
+    var excluded = providerNames(row.exclude);
+    var providers = providerNames(row.providers).filter(function (name) {
+      return excluded.indexOf(name) === -1;
+    });
+    if (providers.length === 0) {
+      showNotice('这一行还没有可验证的内部渠道：先填好顺序，或者点「探测」让上游报一份。');
+      return;
+    }
+    setSubmitting(button, true, '验证');
+    post('/management/pins/validate', {
+      site_id: row.site_id,
+      model: row.model,
+      providers: providers
+    }).then(function (result) {
+      setSubmitting(button, false, '验证');
+      if (result.status === 401) {
+        showAuth('登录状态已失效，请重新登录后继续。');
+        return;
+      }
+      if (!result.ok) {
+        refreshFailure('验证失败', errorMessage(result.body, '无法验证这些内部渠道。'));
+        return;
+      }
+      var results = (result.body && result.body.results) || [];
+      var usable = 0, limited = 0, rejected = 0, broken = 0;
+      var failures = [];
+      results.forEach(function (entry) {
+        if (entry.ok) { usable++; return; }
+        if (entry.reason === 'rate_limited') { limited++; }
+        else if (entry.reason === 'auth_rejected') { rejected++; }
+        else { broken++; }
+        failures.push(entry.provider + '：' + (PROBE_REASON_LABELS[entry.reason] || entry.reason)
+          + (entry.detail ? '（' + shorten(entry.detail, 80) + '）' : ''));
+      });
+      showNotice('验证完成：可用 ' + usable + ' · 限流 ' + limited + ' · 鉴权失败 ' + rejected + ' · 不可用 ' + broken + '。');
+      if (failures.length) {
+        showBanner('部分内部渠道不可用', failures.join('；'));
+      }
+    });
   }
 
   function routeCandidates() {
@@ -3587,6 +3659,19 @@
     td.className = 'actions';
     var group = element('div', 'row-actions');
 
+    if (metadata.actions.indexOf('probe') !== -1) {
+      var probe = element('button', 'btn btn-ghost btn-small', '探测');
+      probe.type = 'button';
+      probe.title = '向上游确认这个模型的内部渠道和管线，结果写回这一行。';
+      probe.addEventListener('click', function () { probePinRow(row, probe); });
+      group.appendChild(probe);
+
+      var validate = element('button', 'btn btn-ghost btn-small', '验证');
+      validate.type = 'button';
+      validate.title = '逐个内部渠道发一次小请求，看看现在哪些还能用。';
+      validate.addEventListener('click', function () { validatePinRow(row, validate); });
+      group.appendChild(validate);
+    }
     if (metadata.actions.indexOf('edit') !== -1) {
       var edit = element('button', 'btn btn-ghost btn-small', '编辑');
       edit.type = 'button';

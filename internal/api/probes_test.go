@@ -25,6 +25,12 @@ type fakeProbes struct {
 	busy    bool
 	cleared int64
 	started bool
+	// pin probing: what the fake answers and what it was asked.
+	discovery          probe.PinDiscovery
+	validations        []probe.PinValidation
+	discoveryLine      probe.Line
+	validatedProviders []string
+	validatedPipeline  string
 }
 
 func (f *fakeProbes) ProbeAll(context.Context) []probe.Result {
@@ -75,6 +81,22 @@ func (f *fakeProbes) ClearRuns(context.Context) (int64, error) {
 	f.runs = nil
 	f.allRuns = 0
 	return f.cleared, nil
+}
+
+func (f *fakeProbes) DiscoverPin(_ context.Context, line probe.Line) probe.PinDiscovery {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.discoveryLine = line
+	return f.discovery
+}
+
+func (f *fakeProbes) ValidatePins(_ context.Context, line probe.Line, providers []string, pipeline string) []probe.PinValidation {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.discoveryLine = line
+	f.validatedProviders = append([]string(nil), providers...)
+	f.validatedPipeline = pipeline
+	return f.validations
 }
 
 // probeServer assembles a gateway that keeps probe records.

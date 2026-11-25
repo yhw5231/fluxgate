@@ -81,6 +81,10 @@ type Server struct {
 	// Probes runs the account health schedule and keeps its record. When nil, no
 	// probe runs and the probe endpoints answer 503.
 	Probes ProbeService
+	// PinStore records what a pin probe discovered: the pipeline an upstream speaks
+	// and the internal providers it named. When nil, a discovery is answered but
+	// not written back.
+	PinStore PinProbeStore
 	// MediaJobs keeps where each upstream-side generation job was created, which
 	// is what lets a request that names no model reach the line that holds the
 	// work. When nil, a job cannot be recorded and the follow-up endpoints answer
@@ -230,6 +234,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /management/probes", s.handleProbes)
 	mux.HandleFunc("POST /management/probes/run", s.handleProbeRun)
 	mux.HandleFunc("DELETE /management/probes", s.handleProbeClear)
+	// Asking an upstream which internal providers a model has, and whether each of
+	// them answers.
+	mux.HandleFunc("POST /management/pins/probe", s.handlePinProbe)
+	mux.HandleFunc("POST /management/pins/validate", s.handlePinValidate)
 	// Clearing a recorded circuit, which is the manual half of breaker recovery.
 	mux.HandleFunc("POST /management/breakers/reset", s.handleBreakerReset)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
