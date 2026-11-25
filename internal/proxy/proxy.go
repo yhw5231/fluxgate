@@ -16,6 +16,7 @@ import (
 
 	"github.com/yhw5231/fluxgate/internal/clientprofile"
 	"github.com/yhw5231/fluxgate/internal/domain"
+	"github.com/yhw5231/fluxgate/internal/protocol"
 	"github.com/yhw5231/fluxgate/internal/transform"
 )
 
@@ -148,6 +149,11 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 	excluded := make(map[string]struct{})
 	attemptsByChannel := make(map[string]int)
 	var lastFailure domain.Failure
+	// conversionFailure remembers a line the request could not be expressed for.
+	// Such a line is skipped rather than blamed — no upstream saw the request —
+	// but when it is the only reason nothing served the request, its message is
+	// what the caller is told.
+	var conversionFailure error
 	// trace is what the request log keeps: every attempt this request made, in
 	// order, whichever way the request ends.
 	var trace domain.RequestTrace
@@ -161,6 +167,9 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 		if err != nil {
 			if lastFailure.Err != nil || lastFailure.StatusCode != 0 {
 				return Result{Trace: trace}, finalError(lastFailure)
+			}
+			if conversionFailure != nil {
+				return Result{Trace: trace}, conversionFailure
 			}
 			return Result{Trace: trace}, err
 		}
@@ -189,7 +198,32 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 			StartedAt:   attempt.StartedAt,
 		}
 
+		// A line may speak a different conversational protocol than the caller
+		// used. The translation is decided per attempt, because two lines of one
+		// model may settle on different protocols, and it happens before the
+		// upstream's own body rules so those rules address the body the upstream
+		// is actually about to receive.
+		conversion := protocol.Resolve(input.Path, channel.UpstreamAPI)
 		body := transform.NewBody(input.ContentType, input.Body)
+		if conversion.Active() {
+			converted, convertErr := protocol.ConvertRequest(conversion, body.Raw)
+			if convertErr != nil {
+				// This line cannot express the request, but another one may. The
+				// line is skipped without a circuit failure — its upstream did
+				// nothing wrong — and the request keeps its bounded number of
+				// attempts.
+				traced.Error = convertErr.Error()
+				traced.DurationMS = now().Sub(attempt.StartedAt).Milliseconds()
+				trace.Attempts = append(trace.Attempts, traced)
+				conversionFailure = convertErr
+				excluded[channel.ID] = struct{}{}
+				if !policy.Failover.Enabled || attemptNumber >= retry.MaxAttempts {
+					return Result{Trace: trace}, convertErr
+				}
+				continue
+			}
+			body = transform.Body{Raw: converted, ContentType: "application/json", Shape: transform.ShapeJSON}
+		}
 		body, err = body.Rewrite(selection.Model, channel.Transform)
 		if err != nil {
 			return Result{Trace: trace}, err
@@ -210,7 +244,7 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 				}
 			}
 		}
-		call, err := buildRequest(ctx, input, channel, body, streamIdle)
+		call, err := buildRequest(ctx, input, channel, body, streamIdle, conversion.UpstreamPath(input.Path))
 		if err != nil {
 			return Result{Trace: trace}, err
 		}
@@ -247,6 +281,9 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 		call.answer(response, streamIdle)
 		traced.DurationMS = now().Sub(attempt.StartedAt).Milliseconds()
 		if dispatchErr == nil && response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
+			// The caller asked in its own protocol, so a line that speaks the
+			// other one has its answer translated before the caller sees it.
+			response = protocol.ConvertResponse(conversion, response)
 			traced.StatusCode = response.StatusCode
 			trace.Attempts = append(trace.Attempts, traced)
 			if e.Observer != nil {
@@ -301,6 +338,9 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 		}
 	}
 
+	if lastFailure.Err == nil && lastFailure.StatusCode == 0 && conversionFailure != nil {
+		return Result{Trace: trace}, conversionFailure
+	}
 	return Result{Trace: trace}, finalError(lastFailure)
 }
 
@@ -380,12 +420,12 @@ func (c upstreamCall) answer(response *http.Response, idle time.Duration) {
 // take as long as the answer needs, provided it does not go quiet for longer than
 // idle. A whole-request deadline on a stream would cut a long answer off and leave
 // the upstream recording a canceled request it had done nothing to deserve.
-func buildRequest(ctx context.Context, input domain.Request, channel domain.Channel, body transform.Body, idle time.Duration) (upstreamCall, error) {
+func buildRequest(ctx context.Context, input domain.Request, channel domain.Channel, body transform.Body, idle time.Duration, path string) (upstreamCall, error) {
 	baseURL, err := url.Parse(strings.TrimRight(channel.BaseURL, "/"))
 	if err != nil {
 		return upstreamCall{}, fmt.Errorf("parse channel base URL: %w", err)
 	}
-	target := upstreamTarget(baseURL, input.Path)
+	target := upstreamTarget(baseURL, path)
 
 	// A generation is bounded by the gateway's media timeout, which is longer than
 	// the per-channel default because producing an image or a video takes longer

@@ -211,6 +211,7 @@ func TestLoadConfigurationModelsChannelPolicyAndProxyPrecedence(t *testing.T) {
 			use_system_proxy INTEGER DEFAULT 0,
 			custom_headers TEXT,
 			client_profile TEXT,
+			upstream_api TEXT,
 			pool_id INTEGER,
 			status TEXT NOT NULL DEFAULT 'active',
 			global_weight REAL DEFAULT 1
@@ -255,8 +256,8 @@ func TestLoadConfigurationModelsChannelPolicyAndProxyPrecedence(t *testing.T) {
 			group_route_id INTEGER NOT NULL,
 			source_route_id INTEGER NOT NULL
 		)`,
-		`INSERT INTO sites (id, name, url, platform, proxy_url, use_system_proxy, custom_headers, client_profile, status, global_weight)
-		 VALUES (1, 'site', 'https://API.Example.com/v1', 'openai', 'http://site-proxy.example:8080', 1, '{}', 'claude-code', 'active', 2.5)`,
+		`INSERT INTO sites (id, name, url, platform, proxy_url, use_system_proxy, custom_headers, client_profile, upstream_api, status, global_weight)
+		 VALUES (1, 'site', 'https://API.Example.com/v1', 'openai', 'http://site-proxy.example:8080', 1, '{}', 'claude-code', 'responses', 'active', 2.5)`,
 		`INSERT INTO accounts (id, site_id, access_token, api_token, extra_config, status)
 		 VALUES (10, 1, 'account-access', 'account-api', '{"proxyUrl":"http://account-proxy.example:8080","useSystemProxy":true}', 'active')`,
 		`INSERT INTO account_tokens (id, account_id, token, proxy_url, use_system_proxy, enabled)
@@ -315,6 +316,9 @@ func TestLoadConfigurationModelsChannelPolicyAndProxyPrecedence(t *testing.T) {
 	channel := globRoute.Channels[0]
 	if channel.RoutingStrategy != "round_robin" {
 		t.Fatalf("routing strategy = %q, want round_robin", channel.RoutingStrategy)
+	}
+	if channel.UpstreamAPI != "responses" {
+		t.Fatalf("upstream API = %q, want the protocol the site stores", channel.UpstreamAPI)
 	}
 	if channel.BreakerMode != string(breaker.ModeKeyModelCooldown) {
 		t.Fatalf("breaker mode = %q, want %q", channel.BreakerMode, breaker.ModeKeyModelCooldown)
@@ -692,6 +696,38 @@ func TestEnsureUpstreamSchemaAddsTheClientProfileColumnToAnOlderDatabase(t *test
 	}
 	if value := rows[0]["client_profile"]; value != nil {
 		t.Fatalf("client_profile = %#v, want no preset", value)
+	}
+}
+
+// A database created before sites.upstream_api existed is brought up to the
+// current shape as well, and every line it holds keeps serving the caller's own
+// protocol, which is what an absent value means.
+func TestEnsureUpstreamSchemaAddsTheUpstreamProtocolColumnToAnOlderDatabase(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	createUpstreamTables(t, store)
+	if _, err := store.db.Exec(`INSERT INTO sites (name, url, platform) VALUES ('legacy', 'https://legacy.example/v1', 'openai')`); err != nil {
+		t.Fatalf("insert the site written before the column existed: %v", err)
+	}
+	if _, err := store.db.Exec(`ALTER TABLE sites DROP COLUMN upstream_api`); err != nil {
+		t.Fatalf("drop upstream_api to model an older database: %v", err)
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := store.EnsureUpstreamSchema(ctx); err != nil {
+			t.Fatalf("EnsureUpstreamSchema() attempt %d error = %v", attempt+1, err)
+		}
+	}
+
+	rows, err := store.ListResource(ctx, "sites")
+	if err != nil {
+		t.Fatalf("ListResource(sites) error = %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListResource(sites) returned %d rows, want the legacy site", len(rows))
+	}
+	if value := rows[0]["upstream_api"]; value != nil {
+		t.Fatalf("upstream_api = %#v, want no choice", value)
 	}
 }
 

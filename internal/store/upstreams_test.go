@@ -801,3 +801,56 @@ func TestUpstreamStoresTheClientFingerprintPreset(t *testing.T) {
 		t.Fatal("UpdateResource() accepted an unknown client profile")
 	}
 }
+
+// The conversational protocol an upstream speaks is stored on the site and
+// reaches every line the upstream serves, because a line's protocol is a
+// property of the upstream rather than of one key.
+func TestUpstreamStoresTheRequestedProtocol(t *testing.T) {
+	store := prepareUpstreamStore(t)
+	ctx := context.Background()
+	row := createUpstream(t, store, map[string]any{
+		"name":         "Example",
+		"url":          "https://api.example.com",
+		"upstream_api": "responses",
+		"keys":         []any{"key-one", "key-two"},
+		"models":       []any{"gpt-4.1"},
+	})
+	siteID := row["id"].(int64)
+	if row["upstream_api"] != "responses" {
+		t.Fatalf("upstream_api = %v, want responses", row["upstream_api"])
+	}
+
+	configuration, err := store.LoadConfiguration(ctx)
+	if err != nil {
+		t.Fatalf("LoadConfiguration() error = %v", err)
+	}
+	if len(configuration.Channels) != 2 {
+		t.Fatalf("channel count = %d, want one per key", len(configuration.Channels))
+	}
+	for _, channel := range configuration.Channels {
+		if channel.UpstreamAPI != "responses" {
+			t.Fatalf("channel %s protocol = %q, want responses", channel.ID, channel.UpstreamAPI)
+		}
+	}
+
+	// Clearing the protocol returns the upstream to the caller's own path, which
+	// is the behavior every upstream had before the setting existed.
+	if _, err := store.UpdateResource(ctx, "upstreams", siteID, map[string]any{"upstream_api": nil}); err != nil {
+		t.Fatalf("UpdateResource() error = %v", err)
+	}
+	configuration, err = store.LoadConfiguration(ctx)
+	if err != nil {
+		t.Fatalf("LoadConfiguration() after clearing error = %v", err)
+	}
+	for _, channel := range configuration.Channels {
+		if channel.UpstreamAPI != "" {
+			t.Fatalf("channel %s protocol = %q, want none", channel.ID, channel.UpstreamAPI)
+		}
+	}
+
+	// A protocol the gateway does not translate is refused rather than stored and
+	// ignored at dispatch time.
+	if _, err := store.UpdateResource(ctx, "upstreams", siteID, map[string]any{"upstream_api": "grpc"}); err == nil {
+		t.Fatal("UpdateResource() accepted an unknown upstream protocol")
+	}
+}

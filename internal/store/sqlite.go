@@ -45,6 +45,7 @@ const channelQuery = `SELECT
 	a.id, a.access_token, a.api_token, a.extra_config, COALESCE(a.status, 'active'),
 	s.id, s.name, s.url, s.platform, s.forced_upstream_endpoint, s.proxy_url,
 	COALESCE(s.use_system_proxy, 0), s.custom_headers, COALESCE(s.client_profile, ''),
+	COALESCE(s.upstream_api, ''),
 	COALESCE(s.pool_id, 0),
 	COALESCE(s.status, 'active'), COALESCE(s.global_weight, 1),
 	at.token, at.proxy_url, COALESCE(at.use_system_proxy, 0), COALESCE(at.enabled, 1)
@@ -214,7 +215,7 @@ var upstreamSchemaDDL = []string{
 	`CREATE TABLE IF NOT EXISTS sites (
 		id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, platform TEXT NOT NULL,
 		proxy_url TEXT, use_system_proxy INTEGER DEFAULT 0, custom_headers TEXT,
-		client_profile TEXT, pool_id INTEGER,
+		client_profile TEXT, upstream_api TEXT, pool_id INTEGER,
 		status TEXT DEFAULT 'active', global_weight REAL DEFAULT 1, forced_upstream_endpoint TEXT
 	)`,
 	`CREATE TABLE IF NOT EXISTS accounts (
@@ -307,6 +308,12 @@ func (s *SQLiteStore) EnsureUpstreamSchema(ctx context.Context) error {
 	// Which proxy pool an upstream draws its accounts' exit addresses from is
 	// another column the console writes, and it is added the same way.
 	if err := s.addColumnIfMissing(ctx, "sites", "pool_id", "INTEGER"); err != nil {
+		return err
+	}
+	// The conversational protocol an upstream speaks is a column of the same
+	// kind. A database created before it existed serves the callers' own protocol
+	// on every line, which is what an empty value says.
+	if err := s.addColumnIfMissing(ctx, "sites", "upstream_api", "TEXT"); err != nil {
 		return err
 	}
 	// The internal-provider pins are the gateway's own table, but they are read
@@ -823,7 +830,7 @@ func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route
 			siteName, siteURL, platform, siteStatus   string
 			forcedEndpoint, siteProxy, customHeaders  sql.NullString
 			siteSystemProxy                           int
-			siteClientProfile                         string
+			siteClientProfile, siteUpstreamAPI        string
 			sitePoolID                                int64
 			siteGlobalWeight                          float64
 			accountToken, tokenProxy                  sql.NullString
@@ -833,7 +840,7 @@ func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route
 			&routeID, &channelID, &priority, &weight, &channelEnabled, &sourceModel, &tokenID,
 			&accountID, &accessToken, &apiToken, &accountExtraConfig, &accountStatus,
 			&siteID, &siteName, &siteURL, &platform, &forcedEndpoint, &siteProxy,
-			&siteSystemProxy, &customHeaders, &siteClientProfile, &sitePoolID, &siteStatus, &siteGlobalWeight,
+			&siteSystemProxy, &customHeaders, &siteClientProfile, &siteUpstreamAPI, &sitePoolID, &siteStatus, &siteGlobalWeight,
 			&accountToken, &tokenProxy, &tokenSystemProxy, &tokenEnabled,
 		); err != nil {
 			return nil, fmt.Errorf("scan route channel: %w", err)
@@ -879,6 +886,7 @@ func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route
 			SitePriority:       sitePriorities[siteID],
 			SourceModel:        resolveSourceModel(sourceModel.String, route.ModelPattern),
 			ClientProfile:      strings.TrimSpace(siteClientProfile),
+			UpstreamAPI:        strings.TrimSpace(siteUpstreamAPI),
 			SitePoolID:         sitePoolID,
 			Pins:               modelPins[siteID],
 		}

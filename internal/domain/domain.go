@@ -32,6 +32,12 @@ type Channel struct {
 	SiteProxyURL       string
 	SiteUseSystemProxy bool
 	Transform          TransformRules
+	// UpstreamAPI names the conversational protocol this line speaks, when the
+	// operator has said so: one of "chat_completions" or "responses". Empty means
+	// the line is called on the caller's own path, which is what every line did
+	// before the setting existed. When the line's protocol differs from the one
+	// the caller used, the gateway translates the request and the answer.
+	UpstreamAPI string
 	// ClientProfile names the client fingerprint preset the line presents to its
 	// upstream, such as a coding agent's own user agent and protocol headers. It
 	// is resolved per attempt, because a preset can carry a value that has to be
@@ -41,9 +47,9 @@ type Channel struct {
 
 	// Routing identity. SiteID, AccountID and TokenID identify the upstream
 	// credential so downstream key exclusions can be applied.
-	SiteID           int64
-	AccountID        int64
-	TokenID          *int64
+	SiteID    int64
+	AccountID int64
+	TokenID   *int64
 	// SitePoolID names the proxy pool the upstream draws its accounts' exit
 	// addresses from; zero means the upstream uses no pool.
 	SitePoolID       int64

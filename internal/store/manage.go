@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/yhw5231/fluxgate/internal/clientprofile"
+	"github.com/yhw5231/fluxgate/internal/protocol"
 )
 
 // Management writes to the upstream configuration.
@@ -238,6 +239,7 @@ var resources = []Resource{
 			{Name: "name", Kind: KindText, Required: true, MaxLength: 200},
 			{Name: "url", Kind: KindText, Required: true, MaxLength: 2048, Validate: validateHTTPURL},
 			{Name: "platform", Kind: KindText, Required: true, MaxLength: 64},
+			{Name: "upstream_api", Kind: KindText, MaxLength: 32, Choices: []string{protocol.APIChatCompletions, protocol.APIResponses}},
 			{Name: "status", Kind: KindText, MaxLength: 32, Validate: validateToken, DefaultValue: "active"},
 			{Name: "global_weight", Kind: KindReal, Validate: validatePositive},
 			{Name: "proxy_url", Kind: KindText, MaxLength: 2048, Validate: validateProxyURL},

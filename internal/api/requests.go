@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/yhw5231/fluxgate/internal/domain"
+	"github.com/yhw5231/fluxgate/internal/protocol"
 	"github.com/yhw5231/fluxgate/internal/proxy"
 	"github.com/yhw5231/fluxgate/internal/router"
 	"github.com/yhw5231/fluxgate/internal/store"
@@ -250,6 +251,18 @@ func classifyDispatchError(err error, trace domain.RequestTrace, requestID strin
 			Status:  http.StatusServiceUnavailable,
 			Code:    "no_available_channel",
 			Message: "no upstream channel can serve the requested model",
+			Details: map[string]any{"request_id": requestID},
+		}
+	}
+	// A request the selected line's protocol could not express was never sent
+	// anywhere, so it is a request error rather than an upstream failure. The
+	// operator chose the line's protocol; the caller can only change the part of
+	// the request that made it unconvertible.
+	if errors.Is(err, protocol.ErrRequestConversion) {
+		return dispatchFailure{
+			Status:  http.StatusBadRequest,
+			Code:    "request_not_convertible",
+			Message: err.Error(),
 			Details: map[string]any{"request_id": requestID},
 		}
 	}

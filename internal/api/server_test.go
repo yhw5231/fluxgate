@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/yhw5231/fluxgate/internal/domain"
+	"github.com/yhw5231/fluxgate/internal/protocol"
 	"github.com/yhw5231/fluxgate/internal/proxy"
 	"github.com/yhw5231/fluxgate/internal/router"
 	"github.com/yhw5231/fluxgate/internal/store"
@@ -87,6 +89,92 @@ func TestOpenAICompatibleForwarding(t *testing.T) {
 	}
 	if got := response.Body.String(); got != `{"id":"chatcmpl-test"}` {
 		t.Fatalf("body = %s, want upstream response", got)
+	}
+}
+
+// A caller that speaks chat completions reaches an upstream that serves only the
+// Responses API: the endpoint translates both ways, and the caller still gets a
+// chat completion.
+func TestProxyTranslatesTheCallersProtocolForTheLine(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != protocol.PathResponses {
+			t.Errorf("upstream path = %q, want %q", r.URL.Path, protocol.PathResponses)
+		}
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), `"messages"`) {
+			t.Errorf("upstream body still carries chat messages: %s", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id": "resp_1", "created_at": 1700000000, "model": "gpt-4.1", "status": "completed",
+			"output": [{"type": "message", "content": [{"type": "output_text", "text": "translated"}]}]
+		}`))
+	}))
+	defer upstream.Close()
+
+	engine := &proxy.Engine{
+		Selector: router.NewMemorySelector(testRoutes(domain.Channel{
+			ID: "channel-one", BaseURL: upstream.URL, Enabled: true, Weight: 1,
+			UpstreamAPI: protocol.APIResponses,
+		})),
+		Policy: domain.RetryPolicy{MaxAttempts: 1, MaxAttemptsPerChannel: 1},
+		Sleep:  func(context.Context, time.Duration) error { return nil },
+	}
+	server := &Server{Engine: engine, Authenticator: allowTestAuthentication()}
+	request := httptest.NewRequest(http.MethodPost, protocol.PathChatCompletions,
+		strings.NewReader(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Authorization", "Bearer test-key")
+	response := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"object":"chat.completion"`) {
+		t.Fatalf("body = %s, want a chat completion", response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"content":"translated"`) {
+		t.Fatalf("body = %s, want the upstream's text", response.Body.String())
+	}
+}
+
+// A request the line's protocol cannot express is answered as a request error:
+// no upstream request was made, and the caller can see why.
+func TestProxyReportsARequestTheLineCannotExpress(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	engine := &proxy.Engine{
+		Selector: router.NewMemorySelector(testRoutes(domain.Channel{
+			ID: "channel-one", BaseURL: upstream.URL, Enabled: true, Weight: 1,
+			UpstreamAPI: protocol.APIResponses,
+		})),
+		Policy: domain.RetryPolicy{MaxAttempts: 1, MaxAttemptsPerChannel: 1},
+		Sleep:  func(context.Context, time.Duration) error { return nil },
+	}
+	server := &Server{Engine: engine, Authenticator: allowTestAuthentication()}
+	// A chat request continued from an assistant turn with no tool result is
+	// still a valid chat body, so the role itself is what cannot be expressed.
+	request := httptest.NewRequest(http.MethodPost, protocol.PathChatCompletions,
+		strings.NewReader(`{"model":"gpt-4.1","messages":[{"role":"unknown-role","content":"hi"}]}`))
+	request.Header.Set("Authorization", "Bearer test-key")
+	response := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"code":"request_not_convertible"`) {
+		t.Fatalf("body = %s, want request_not_convertible", response.Body.String())
+	}
+	if calls != 0 {
+		t.Fatalf("upstream calls = %d, want none", calls)
 	}
 }
 

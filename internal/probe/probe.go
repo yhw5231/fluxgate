@@ -33,6 +33,7 @@ import (
 
 	"github.com/yhw5231/fluxgate/internal/clientprofile"
 	"github.com/yhw5231/fluxgate/internal/domain"
+	"github.com/yhw5231/fluxgate/internal/protocol"
 	"github.com/yhw5231/fluxgate/internal/proxy"
 	"github.com/yhw5231/fluxgate/internal/transform"
 )
@@ -79,7 +80,12 @@ type Line struct {
 	Model         string
 	BreakerMode   string
 	ClientProfile string
-	Transform     domain.TransformRules
+	// UpstreamAPI is the conversational protocol the line speaks, when the
+	// operator has named one. The probe asks its question in that protocol, so a
+	// line that only serves the Responses API is not reported as broken for
+	// answering a chat-completions path with a 404.
+	UpstreamAPI string
+	Transform   domain.TransformRules
 	// ProxyURL and UseSystemProxy are the line's own outbound decision. They are
 	// resolved through the gateway's own resolver, so a probe leaves the way a
 	// real request from that line would.
@@ -259,7 +265,6 @@ func (p *Prober) question(line Line) (question, *url.URL, *http.Request, error) 
 		return question{}, nil, nil, fmt.Errorf("parse the upstream address: %w", err)
 	}
 	target := *base
-	target.Path = strings.TrimRight(base.Path, "/") + "/chat/completions"
 	asked := newQuestion()
 
 	body, err := json.Marshal(map[string]any{
@@ -272,6 +277,22 @@ func (p *Prober) question(line Line) (question, *url.URL, *http.Request, error) 
 	if err != nil {
 		return question{}, nil, nil, fmt.Errorf("encode the probe request: %w", err)
 	}
+	// The question is written as a chat completion and translated when the line
+	// speaks the Responses API, so the probe asks exactly the shape a real request
+	// on that line would.
+	api := protocol.APIChatCompletions
+	if protocol.NormalizeAPI(line.UpstreamAPI) == protocol.APIResponses {
+		converted, convertErr := protocol.ConvertRequest(protocol.Conversion{
+			From: protocol.APIChatCompletions,
+			To:   protocol.APIResponses,
+		}, body)
+		if convertErr != nil {
+			return question{}, nil, nil, fmt.Errorf("encode the probe request: %w", convertErr)
+		}
+		body = converted
+		api = protocol.APIResponses
+	}
+	target.Path = probeTargetPath(base, api)
 	request, err := http.NewRequest(http.MethodPost, target.String(), bytes.NewReader(body))
 	if err != nil {
 		return question{}, nil, nil, fmt.Errorf("build the probe request: %w", err)
@@ -286,6 +307,18 @@ func (p *Prober) question(line Line) (question, *url.URL, *http.Request, error) 
 		"application/json",
 	)
 	return asked, &target, request, nil
+}
+
+// probeTargetPath is the path a probe is sent to, joined the way the proxy joins
+// an upstream address: a base address that carries a path supplies it, and one
+// that carries none keeps the protocol's version segment.
+func probeTargetPath(base *url.URL, api string) string {
+	path := protocol.PathForAPI(api)
+	basePath := strings.TrimRight(base.Path, "/")
+	if basePath == "" {
+		return path
+	}
+	return basePath + strings.TrimPrefix(path, "/v1")
 }
 
 // client resolves the outbound route for one probe.

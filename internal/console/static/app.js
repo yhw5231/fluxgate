@@ -414,6 +414,7 @@
     routing_strategy: { weighted: '加权随机', round_robin: '加权随机', stable_first: '固定优先' },
     key_mode: { available_first: '可用优先', round_robin: '加权随机' },
     key_cd_mode: { key_cooldown: '按 key 冷却', key_model_cooldown: '按 key + 模型冷却' },
+    upstream_api: { chat_completions: 'Chat Completions（/v1/chat/completions）', responses: 'Responses（/v1/responses）' },
     protocol: { http: 'HTTP', https: 'HTTPS', socks5: 'SOCKS5', socks5h: 'SOCKS5H' },
     mode: { strict: '严格固定', preferred: '固定优先' },
     sort: { cost: '价格', ttft: '首字延迟', tps: '吞吐' },
@@ -470,6 +471,14 @@
     return value === 'available_first' ? '可用优先' : '加权随机';
   }
 
+  /* 上游实际调用的对话接口：空值表示跟着调用方走，网关只改请求头和模型，
+   * 不改协议；非空时网关会改用该接口，并在需要时转换请求与回答。 */
+  function upstreamAPILabel(value) {
+    if (value === 'responses') { return 'Responses'; }
+    if (value === 'chat_completions') { return 'Chat'; }
+    return '跟随';
+  }
+
   /* 一条线路（一个上游密钥）的密钥模式，来自它所在路由的策略：可用优先的
    * 上游让第一个密钥保持最高优先级，其余上游的密钥同权随机。 */
   function channelKeyModeLabel(strategy) {
@@ -488,6 +497,10 @@
       url: {
         label: 'API 地址', placeholder: 'https://api.example.com', normalize: normalizeAPIAddress,
         help: '上游服务的根地址。只填到域名时会自动补上 /v1，结尾多余的 / 会去掉；上游挂在子路径下时请把子路径写上（例如 https://example.com/openai）。'
+      },
+      upstream_api: {
+        label: '接口类型', type: 'select', blankLabel: '跟随下游（不转换）', blankIsValue: true,
+        help: '这个上游实际使用的对话接口。跟随下游：按调用方请求的路径原样转发（默认）。选 Chat Completions 或 Responses 后，网关会改用该接口；调用方用的是另一种协议时，请求和回答（含流式事件）会自动转换。只影响 chat completions 与 responses 两个对话接口，其余接口始终原样转发。'
       },
       global_weight: { label: '权重', type: 'number', step: 'any', placeholder: '1', help: '优先级相同时按权重随机分配：权重越大，被选中的概率越高。' },
       priority: { label: '优先级', type: 'number', step: '1', placeholder: '0', help: '数值越大越先用：只要优先级更高的上游还有可用线路，请求就不会落到优先级更低的上游；优先级相同（默认 0）的按权重随机分配。' },
@@ -633,6 +646,16 @@
       columns: [
         { label: '名称', cell: function (row) { return element('span', 'cell-strong', text(row.name)); } },
         { label: 'API 地址', cell: function (row) { return element('span', 'mono', text(row.url)); } },
+        // 接口类型不占一整列也不合适：一眼看出这个上游会不会被转换，能省掉打开
+        // 编辑框确认的一步。
+        {
+          label: '接口', title: '这个上游实际调用的对话接口；「跟随」表示按调用方的协议原样转发。',
+          cell: function (row) {
+            return row.upstream_api
+              ? tag(upstreamAPILabel(row.upstream_api))
+              : element('span', 'cell-muted', '跟随');
+          }
+        },
         // 优先级和权重都就地改：它们是选路时最常调的两个值，改一次就写一次，
         // 不用打开编辑框。
         { label: '优先级', className: 'num field-column', cell: function (row) { return priorityField(row); } },
@@ -4623,7 +4646,9 @@
       if (!field.required) {
         var blank = document.createElement('option');
         blank.value = '';
-        blank.textContent = '（未设置）';
+        // A field whose empty value is a real choice says what it means, instead
+        // of "not set": an upstream's protocol defaults to the caller's own.
+        blank.textContent = meta.blankLabel || '（未设置）';
         select.appendChild(blank);
       }
       options.forEach(function (option) {
@@ -4659,8 +4684,10 @@
         node: select,
         read: function () {
           // "Not set" on an optional dropdown omits the field, so the column
-          // default applies rather than an explicit NULL overwriting it.
-          if (select.value === '' && !field.required) { return undefined; }
+          // default applies rather than an explicit NULL overwriting it. A field
+          // whose empty value is a real choice says so, because omitting it
+          // would keep the stored value instead of clearing it.
+          if (select.value === '' && !field.required && !meta.blankIsValue) { return undefined; }
           return select.value;
         }
       };

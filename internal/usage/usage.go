@@ -330,6 +330,17 @@ func (t *Tap) observeLine(line []byte) {
 	}
 	prompt, completion, ok := parseUsageObject(payload)
 	if !ok {
+		// A Responses API event states the usage inside the response object it
+		// carries, not at the top level, so the same counts are read one level
+		// down rather than left uncounted.
+		var envelope struct {
+			Response json.RawMessage `json:"response"`
+		}
+		if json.Unmarshal(payload, &envelope) == nil && len(envelope.Response) > 0 {
+			prompt, completion, ok = parseUsageObject(envelope.Response)
+		}
+	}
+	if !ok {
 		return
 	}
 	t.prompt, t.completion, t.found = prompt, completion, true

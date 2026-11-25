@@ -83,6 +83,7 @@ func probeLines(configuration store.Configuration) []probe.Line {
 				Model:          model,
 				BreakerMode:    channel.BreakerMode,
 				ClientProfile:  channel.ClientProfile,
+				UpstreamAPI:    channel.UpstreamAPI,
 				Transform:      channel.Transform,
 				ProxyURL:       channel.ProxyURL,
 				UseSystemProxy: channel.UseSystemProxy,

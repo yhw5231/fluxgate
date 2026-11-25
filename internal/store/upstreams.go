@@ -12,6 +12,7 @@ import (
 
 	"github.com/yhw5231/fluxgate/internal/clientprofile"
 	"github.com/yhw5231/fluxgate/internal/pattern"
+	"github.com/yhw5231/fluxgate/internal/protocol"
 )
 
 // The console manages an upstream as one thing: a name, an address, a weight,
@@ -118,6 +119,12 @@ var upstreamResource = Resource{
 	Columns: []Column{
 		{Name: "name", Kind: KindText, Required: true, MaxLength: 200},
 		{Name: "url", Kind: KindText, Required: true, MaxLength: 2048, Validate: validateHTTPURL},
+		// The conversational protocol this upstream speaks. An empty value calls
+		// the line on the caller's own path, which is how every upstream was
+		// reached before the setting existed; naming one lets the gateway call
+		// that protocol on a caller's behalf, translating the request and the
+		// answer when the caller used the other.
+		{Name: "upstream_api", Kind: KindText, MaxLength: 32, Choices: []string{protocol.APIChatCompletions, protocol.APIResponses}},
 		{Name: "platform", Kind: KindText, MaxLength: 64, DefaultValue: defaultPlatform},
 		// Priority is the upstream's own, and the first thing selection compares:
 		// a higher-priority upstream is used before a lower-priority one, and

@@ -1,6 +1,6 @@
 # Fluxgate
 
-Fluxgate is a lightweight, independently deployable Go gateway that reads the existing upstream SQLite configuration and provides OpenAI-compatible proxy endpoints — chat, responses, embeddings, images and video — with bounded server-side retries, priority-then-weight routing, proxy selection, and persistent circuit-breaker state. It ships with an embedded management console that both shows the running state and edits that configuration: upstreams with their priorities, weights, keys and models, the routing the gateway derives from them, client keys, proxy profiles, and the retry, failover, and circuit-breaker policy the gateway applies while it runs.
+Fluxgate is a lightweight, independently deployable Go gateway that reads the existing upstream SQLite configuration and provides OpenAI-compatible proxy endpoints — chat, responses, embeddings, images and video — with bounded server-side retries, priority-then-weight routing, proxy selection, and persistent circuit-breaker state. A line can also state which conversational protocol its upstream really speaks, and the gateway translates between chat completions and the Responses API when a caller used the other one. It ships with an embedded management console that both shows the running state and edits that configuration: upstreams with their priorities, weights, keys and models, the routing the gateway derives from them, client keys, proxy profiles, and the retry, failover, and circuit-breaker policy the gateway applies while it runs.
 
 This repository is where the standalone **UniGate** gateway (formerly `cline2api-go`)
 was merged into Fluxgate. UniGate's account-facing capabilities now live in this
@@ -114,7 +114,7 @@ mkdir -p data
 cp ../data/hub.db data/hub.db
 ```
 
-If no database file exists yet, the gateway creates it together with the full configuration schema and starts healthy with an empty configuration, so a first deployment comes up before any upstream data is placed; copying the management server's `hub.db` brings the real sites, routes, and downstream keys. A database that contains only part of the schema is treated as a wrong or truncated file and refuses to start with the tables it has and the ones it lacks. A database that carries every table but predates a column the console writes — `downstream_api_keys.allowed_site_ids` on a copy taken before 限定上游 existed — is brought up to the current shape in place instead: the column is added as a nullable one, so rows written by the older application keep meaning exactly what they did.
+If no database file exists yet, the gateway creates it together with the full configuration schema and starts healthy with an empty configuration, so a first deployment comes up before any upstream data is placed; copying the management server's `hub.db` brings the real sites, routes, and downstream keys. A database that contains only part of the schema is treated as a wrong or truncated file and refuses to start with the tables it has and the ones it lacks. A database that carries every table but predates a column the console writes — `downstream_api_keys.allowed_site_ids` on a copy taken before 限定上游 existed, or `sites.upstream_api` on one taken before 接口类型 did — is brought up to the current shape in place instead: the column is added as a nullable one, so rows written by the older application keep meaning exactly what they did.
 
 The image fixes the data-directory ownership automatically: the container starts briefly as root with only the `CHOWN`, `SETUID`, and `SETGID` capabilities, the entrypoint hands the mounted directory (and everything inside it) to the runtime user and group ID `10001`, and the gateway then runs unprivileged. No manual `chown` is required, even when Docker created a missing host directory as root. New database files are created with mode `0600` (`umask 077`).
 
@@ -370,7 +370,7 @@ weight are both edited in place: type a number in the row, press Enter or 保存
 the change is stored and applied for the next request. A 线路状态 column summarizes
 how that upstream's lines currently stand, and expanding a row lists them.
 
-The upstream form is built around the five things that actually vary between
+The upstream form is built around the six things that actually vary between
 upstreams:
 
 - **The address is completed, not corrected later.** A trailing slash is dropped and a
@@ -381,6 +381,17 @@ upstreams:
   A path the operator wrote is kept as written, because an upstream may be mounted under
   one (`https://example.com/openai`), and the probe tries both the versioned and the bare
   listing path for whichever address it is given.
+- **The conversational protocol can be stated.** 接口类型 names what an upstream's
+  conversational endpoint really is. 跟随下游 (the default) sends the caller's own path
+  through, which is how every upstream was reached before the setting existed;
+  Chat Completions or Responses makes the gateway call that protocol even when the caller
+  used the other one. The request is translated on the way out and the answer on the way
+  back, including a streamed answer event by event: a chat client can reach an upstream
+  that only serves the Responses API, and a Responses client can reach a chat-only one.
+  The translation carries the conversation, the tool calls, the output format, the token
+  budget, and the usage; only `/v1/chat/completions` and `/v1/responses` are translated,
+  while embeddings, images, videos, and the Anthropic messages route are always forwarded
+  exactly as they arrived.
 - **Keys are pasted in one go.** One key per line, as many as needed. The stored
   keys are shown masked and are matched by position: an untouched line keeps the
   key it stands for, a changed line replaces it, an added line is stored, and a
@@ -1039,6 +1050,15 @@ Authenticated model and proxy endpoints:
 - `POST /v1/images/variations`
 - `POST /v1/videos`, `GET /v1/videos/{id}`, `GET /v1/videos/{id}/content`, `DELETE /v1/videos/{id}`
 
+Each of the two conversational endpoints answers in the protocol the caller used, even
+when the line that serves the request speaks the other one. When the selected line's
+接口类型 differs from the caller's protocol, the gateway translates the request on the
+way out and the answer on the way back, including a streamed answer event by event: a
+chat client can reach a Responses-only upstream, and a Responses client a chat-only one.
+The conversation, its tool calls, the output format, the token budget, and the usage
+travel across; an answer that cannot be translated is forwarded as it arrived rather
+than replaced by an error.
+
 Authenticated endpoints expect an enabled, unexpired downstream API key:
 
 ```http
@@ -1050,6 +1070,10 @@ Proxy errors use the OpenAI error envelope with a `code` field:
 - `401 invalid_api_key`: missing, unknown, expired, or exhausted key.
 - `403 model_not_allowed`: the key's `supported_models` denies the model.
 - `400 missing_model`, `400 invalid_json`, `400 invalid_body`, `413 request_too_large`.
+- `400 request_not_convertible`: the selected line's 接口类型 could not express the
+  request — for example, a Responses request continued with `previous_response_id`
+  reaching a chat-completions line, which cannot continue it. No upstream request
+  was made.
 - `404 video_not_found`: the identifier names no video this gateway created for
   this key.
 - `500 media_jobs_unreadable`, `503 media_jobs_unavailable`: the record video jobs
@@ -1212,6 +1236,14 @@ set, which is how a deployment whose stored address is not the one requests have
 says so. It is not on the console's upstream form; it is written through
 `PUT /management/configuration/sites/{id}`. The console's model probe asks the address in
 the form, not the forced endpoint, so a probe before saving answers for what was typed.
+
+`sites.upstream_api` names the conversational protocol the upstream serves: `responses`
+for an upstream that only has `/v1/responses`, `chat_completions` for one that only has
+`/v1/chat/completions`, and an empty value (跟随下游) to send the caller's own path
+through. When it is set, a conversational request is sent to that protocol's path and
+translated as needed, so the path in the server log is the protocol the upstream speaks
+rather than the one the caller used. The setting says nothing about embeddings, images,
+videos, or `/v1/messages`; those are always forwarded on their own path.
 
 ### Model names
 

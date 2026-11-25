@@ -103,6 +103,52 @@ func TestProbeAcceptsACorrectAnswer(t *testing.T) {
 	}
 }
 
+// A line that only serves the Responses API is asked in that protocol, so a
+// working account is not reported as broken for answering the chat-completions
+// path with a 404.
+func TestProbeAsksInTheProtocolTheLineSpeaks(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Errorf("probe path = %q, want /v1/responses", r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read probe request: %v", err)
+		}
+		var payload struct {
+			Input []struct {
+				Content string `json:"content"`
+			} `json:"input"`
+			Messages []any `json:"messages"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("decode probe request: %v", err)
+		}
+		if len(payload.Messages) > 0 {
+			t.Fatalf("probe body still carries chat messages: %s", body)
+		}
+		if len(payload.Input) == 0 {
+			t.Fatalf("probe body carries no input: %s", body)
+		}
+		matches := questionNumbers.FindAllString(payload.Input[0].Content, -1)
+		total := 0
+		for _, match := range matches {
+			number, _ := strconv.Atoi(match)
+			total += number
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"output":[{"type":"message","content":[{"type":"output_text","text":"The answer is %d."}]}]}`, total)
+	}))
+	defer server.Close()
+
+	line := lineFor(server)
+	line.UpstreamAPI = "responses"
+	result := (&Prober{Client: server.Client()}).Probe(context.Background(), line, KindManual)
+	if !result.OK || result.Reason != ReasonOK {
+		t.Fatalf("result = %#v, want a healthy line asked in its own protocol", result)
+	}
+}
+
 func TestProbeReportsAWrongAnswer(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

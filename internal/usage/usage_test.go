@@ -93,6 +93,23 @@ func TestTapStreamWithoutUsageReportsUnknown(t *testing.T) {
 	}
 }
 
+func TestTapReadsUsageFromAResponsesEvent(t *testing.T) {
+	// A Responses API event states the usage inside the response it carries, and
+	// that is where the tap has to look for it.
+	stream := strings.Join([]string{
+		"event: response.created",
+		`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+		"",
+		"event: response.completed",
+		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":7,"output_tokens":9,"total_tokens":16}}}`,
+		"",
+	}, "\n")
+	prompt, completion, ok := readTap(t, stream, true, 11)
+	if !ok || prompt != 7 || completion != 9 {
+		t.Fatalf("Usage = %d, %d, %v; want the Responses event's counts", prompt, completion, ok)
+	}
+}
+
 func TestTapStreamFallsBackToAJSONAnswer(t *testing.T) {
 	// A streaming request answered with an ordinary body: some providers reject
 	// the request that way, and the error body can still carry usage.
