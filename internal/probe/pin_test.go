@@ -3,6 +3,8 @@ package probe
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -116,8 +118,9 @@ func discoveryUpstream(t *testing.T, pipeline, served, errorBody string, seen *[
 	t.Helper()
 	var mu sync.Mutex
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
 		var body map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = json.Unmarshal(raw, &body)
 		if seen != nil {
 			mu.Lock()
 			*seen = append(*seen, body)
@@ -129,14 +132,19 @@ func discoveryUpstream(t *testing.T, pipeline, served, errorBody string, seen *[
 			_, _ = w.Write([]byte(errorBody))
 			return
 		}
-		var answer string
+		answer := "OK"
+		if computed, ok := questionAnswer(promptOfBody(raw)); ok {
+			answer = fmt.Sprintf("The answer is %d.", computed)
+		}
+		encoded, _ := json.Marshal(answer)
+		var reply string
 		switch pipeline {
 		case "planner":
-			answer = `{"choices":[{"message":{"content":"OK"},"provider_metadata":{"gateway":{"routing":{"finalProvider":"` + served + `","fallbacksAvailable":["alibaba"]}}}}]}`
+			reply = `{"choices":[{"message":{"content":` + string(encoded) + `},"provider_metadata":{"gateway":{"routing":{"finalProvider":"` + served + `","fallbacksAvailable":["alibaba"]}}}}]}`
 		default:
-			answer = `{"provider":"` + served + `","choices":[{"message":{"content":"OK"}}]}`
+			reply = `{"provider":"` + served + `","choices":[{"message":{"content":` + string(encoded) + `}}]}`
 		}
-		_, _ = w.Write([]byte(answer))
+		_, _ = w.Write([]byte(reply))
 	}))
 }
 
@@ -225,8 +233,9 @@ func TestValidatePinsChecksEachProviderExclusively(t *testing.T) {
 	var seen []map[string]any
 	var mu sync.Mutex
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
 		var body map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = json.Unmarshal(raw, &body)
 		mu.Lock()
 		seen = append(seen, body)
 		mu.Unlock()
@@ -234,7 +243,8 @@ func TestValidatePinsChecksEachProviderExclusively(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch provider {
 		case "alibaba":
-			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"OK"}}]}`))
+			answer, _ := questionAnswer(promptOfBody(raw))
+			_, _ = w.Write([]byte(chatAnswer(fmt.Sprintf("The answer is %d.", answer))))
 		case "baseten":
 			w.WriteHeader(http.StatusTooManyRequests)
 			_, _ = w.Write([]byte(`{"error":"rate limited"}`))
@@ -272,6 +282,57 @@ func TestValidatePinsChecksEachProviderExclusively(t *testing.T) {
 	for index, provider := range []string{"alibaba", "baseten", "novita", "groq"} {
 		if pinned := pinnedProbeProvider(seen[index], "direct"); pinned != provider {
 			t.Fatalf("request %d pinned %q, want %q", index, pinned, provider)
+		}
+	}
+}
+
+// A provider that serves the request but states the wrong result is not healthy:
+// the validation asks a question whose answer proves the provider did the work,
+// rather than a hello any relay can hand back.
+func TestValidatePinsReportsAWrongAnswer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		answer, _ := questionAnswer(promptOfBody(raw))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(chatAnswer(fmt.Sprintf("The answer is %d.", answer+7))))
+	}))
+	defer server.Close()
+
+	results := (&Prober{Client: server.Client()}).ValidatePins(context.Background(), Line{
+		BaseURL: server.URL + "/v1", APIKey: "sk", Model: "gpt-4.1",
+	}, []string{"alibaba"}, "direct")
+
+	if len(results) != 1 || results[0].OK || results[0].Reason != ReasonWrongAnswer {
+		t.Fatalf("results = %#v, want the wrong answer reported", results)
+	}
+}
+
+// The pin probe asks with the smallest body too, so a model that spells its output
+// bound differently is not reported as a provider that is down.
+func TestValidatePinsSendsTheSmallestRequestBody(t *testing.T) {
+	var raw []byte
+	var mu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		raw = body
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(chatAnswer("done")))
+	}))
+	defer server.Close()
+
+	(&Prober{Client: server.Client()}).ValidatePins(context.Background(), Line{
+		BaseURL: server.URL + "/v1", APIKey: "sk", Model: "gpt-4.1",
+	}, []string{"alibaba"}, "direct")
+
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode pin probe request: %v", err)
+	}
+	for _, name := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "temperature", "top_p"} {
+		if _, present := payload[name]; present {
+			t.Errorf("pin probe body carries %q; a model that spells it differently would answer 400", name)
 		}
 	}
 }

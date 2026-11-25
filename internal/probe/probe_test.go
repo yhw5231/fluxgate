@@ -12,42 +12,61 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/yhw5231/fluxgate/internal/domain"
 )
 
-var questionNumbers = regexp.MustCompile(`\d+`)
+var questionPattern = regexp.MustCompile(`What is (-?\d+) ([+\-*/]) (-?\d+)\?`)
 
-// sumOfRequest reads the arithmetic out of the question a probe sent, so the stub
-// upstream can answer it the way a working model would.
-func sumOfRequest(t *testing.T, r *http.Request) int {
-	t.Helper()
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		t.Fatalf("read probe request: %v", err)
+// questionAnswer evaluates the arithmetic in a probe prompt, so the stub upstream
+// can answer it the way a working model would.
+func questionAnswer(prompt string) (int64, bool) {
+	match := questionPattern.FindStringSubmatch(prompt)
+	if match == nil {
+		return 0, false
 	}
+	a, errA := strconv.ParseInt(match[1], 10, 64)
+	b, errB := strconv.ParseInt(match[3], 10, 64)
+	if errA != nil || errB != nil {
+		return 0, false
+	}
+	switch match[2] {
+	case "+":
+		return a + b, true
+	case "-":
+		return a - b, true
+	case "*":
+		return a * b, true
+	case "/":
+		if b == 0 {
+			return 0, false
+		}
+		return a / b, true
+	}
+	return 0, false
+}
+
+// promptOfBody reads the question out of a probe request, whichever protocol shape
+// it was written in.
+func promptOfBody(raw []byte) string {
 	var payload struct {
 		Messages []struct {
 			Content string `json:"content"`
 		} `json:"messages"`
+		Input []struct {
+			Content string `json:"content"`
+		} `json:"input"`
 	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		t.Fatalf("decode probe request: %v", err)
+	if json.Unmarshal(raw, &payload) != nil {
+		return ""
 	}
-	if len(payload.Messages) == 0 {
-		t.Fatalf("probe sent no message: %s", body)
+	if len(payload.Messages) > 0 {
+		return payload.Messages[0].Content
 	}
-	matches := questionNumbers.FindAllString(payload.Messages[0].Content, -1)
-	if len(matches) != 3 {
-		t.Fatalf("question %q does not carry three operands", payload.Messages[0].Content)
+	if len(payload.Input) > 0 {
+		return payload.Input[0].Content
 	}
-	total := 0
-	for _, match := range matches {
-		number, err := strconv.Atoi(match)
-		if err != nil {
-			t.Fatalf("operand %q: %v", match, err)
-		}
-		total += number
-	}
-	return total
+	return ""
 }
 
 // chatAnswer renders an OpenAI chat completion whose content is the given text.
@@ -68,9 +87,16 @@ func workingUpstream(t *testing.T, seen *[]http.Header) *httptest.Server {
 			*seen = append(*seen, r.Header.Clone())
 			mu.Unlock()
 		}
-		total := sumOfRequest(t, r)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read probe request: %v", err)
+		}
+		answer, ok := questionAnswer(promptOfBody(body))
+		if !ok {
+			t.Errorf("probe sent no arithmetic question: %s", body)
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(chatAnswer(fmt.Sprintf("The answer is %d.", total))))
+		_, _ = w.Write([]byte(chatAnswer(fmt.Sprintf("The answer is %d.", answer))))
 	}))
 }
 
@@ -130,14 +156,12 @@ func TestProbeAsksInTheProtocolTheLineSpeaks(t *testing.T) {
 		if len(payload.Input) == 0 {
 			t.Fatalf("probe body carries no input: %s", body)
 		}
-		matches := questionNumbers.FindAllString(payload.Input[0].Content, -1)
-		total := 0
-		for _, match := range matches {
-			number, _ := strconv.Atoi(match)
-			total += number
+		answer, ok := questionAnswer(payload.Input[0].Content)
+		if !ok {
+			t.Fatalf("probe sent no arithmetic question: %s", body)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"output":[{"type":"message","content":[{"type":"output_text","text":"The answer is %d."}]}]}`, total)
+		fmt.Fprintf(w, `{"output":[{"type":"message","content":[{"type":"output_text","text":"The answer is %d."}]}]}`, answer)
 	}))
 	defer server.Close()
 
@@ -151,9 +175,11 @@ func TestProbeAsksInTheProtocolTheLineSpeaks(t *testing.T) {
 
 func TestProbeReportsAWrongAnswer(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		answer, _ := questionAnswer(promptOfBody(body))
 		w.Header().Set("Content-Type", "application/json")
-		// A stub that answers the question with a number that is not the sum.
-		_, _ = w.Write([]byte(chatAnswer("The answer is 1.")))
+		// A stub that answers the question with a number that is not the result.
+		_, _ = w.Write([]byte(chatAnswer(fmt.Sprintf("The answer is %d.", answer+1))))
 	}))
 	defer server.Close()
 
@@ -163,6 +189,120 @@ func TestProbeReportsAWrongAnswer(t *testing.T) {
 	}
 	if result.Reason != ReasonWrongAnswer {
 		t.Fatalf("reason = %q, want %q", result.Reason, ReasonWrongAnswer)
+	}
+}
+
+// The question is multi-digit arithmetic in all four operations, so a reply that
+// merely echoes a number out of the prompt is not accepted as an answer and a
+// model that cannot compute is told apart from an account that cannot answer.
+func TestQuestionsAreCheckableArithmetic(t *testing.T) {
+	drawn := make(map[rune]bool)
+	for draw := 0; draw < 500; draw++ {
+		asked := newQuestion()
+		drawn[asked.op] = true
+
+		text := asked.Text()
+		if !questionPattern.MatchString(text) {
+			t.Fatalf("question %q is not a two-operand arithmetic question", text)
+		}
+		if digits(asked.a) < 2 || digits(asked.b) < 2 {
+			t.Fatalf("question %q carries a single-digit operand", text)
+		}
+		if asked.op == '/' && (asked.b == 0 || asked.a%asked.b != 0) {
+			t.Fatalf("division %q is not exact", text)
+		}
+		answer := asked.Answer()
+		if answer == asked.a || answer == asked.b {
+			t.Fatalf("question %q answers with one of its own operands", text)
+		}
+		if parsed, ok := questionAnswer(text); !ok || parsed != answer {
+			t.Fatalf("question %q evaluates to %d, %v; want %d", text, parsed, ok, answer)
+		}
+	}
+	for _, operator := range []rune{'+', '-', '*', '/'} {
+		if !drawn[operator] {
+			t.Errorf("500 questions never drew %q", string(operator))
+		}
+	}
+}
+
+// digits counts the decimal digits of a positive number.
+func digits(value int64) int {
+	count := 1
+	for value >= 10 {
+		value /= 10
+		count++
+	}
+	return count
+}
+
+// The probe asks with the smallest body a chat completion can carry. Naming an
+// output bound or a temperature is what makes a newer model reject the probe — a
+// 400 about the probe's own request — and a working account would then be reported
+// broken over a parameter the gateway chose.
+func TestProbeSendsTheSmallestRequestBody(t *testing.T) {
+	var raw []byte
+	var mu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		raw = body
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(chatAnswer("done")))
+	}))
+	defer server.Close()
+
+	(&Prober{Client: server.Client()}).Probe(context.Background(), lineFor(server), KindManual)
+
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode probe request: %v", err)
+	}
+	for _, name := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "temperature", "top_p"} {
+		if _, present := payload[name]; present {
+			t.Errorf("probe body carries %q; a model that spells or defaults it differently would answer 400", name)
+		}
+	}
+	if payload["model"] != "gpt-4.1" {
+		t.Errorf("model = %v, want the line's model", payload["model"])
+	}
+	if stream, present := payload["stream"]; !present || stream != false {
+		t.Errorf("stream = %v, present = %v; want an explicit false", stream, present)
+	}
+}
+
+// A channel that rewrites its request body needs those rules applied to the probe
+// too: a probe that skipped them would be rejected for whatever the rule supplies,
+// and a working account would be reported broken.
+func TestProbeCarriesTheLinesBodyRules(t *testing.T) {
+	var raw []byte
+	var mu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		raw = body
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(chatAnswer("done")))
+	}))
+	defer server.Close()
+
+	line := lineFor(server)
+	line.Transform = domain.TransformRules{
+		OverrideJSON: map[string]any{"service_tier": "flex"},
+	}
+	result := (&Prober{Client: server.Client()}).Probe(context.Background(), line, KindManual)
+	if !result.OK {
+		t.Fatalf("result = %#v, want the served probe to be healthy", result)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode probe request: %v", err)
+	}
+	if payload["service_tier"] != "flex" {
+		t.Fatalf("probe body = %s, want the line's own override applied", raw)
 	}
 }
 
@@ -303,7 +443,7 @@ func TestExtractAnswerReadsTheShapesUpstreamsUse(t *testing.T) {
 
 func TestNumbersInToleratesProseAndSeparators(t *testing.T) {
 	numbers := numbersIn("Sure — 12,345 + 67 = 12,412.")
-	want := []int{12345, 67, 12412}
+	want := []int64{12345, 67, 12412}
 	if len(numbers) != len(want) {
 		t.Fatalf("numbers = %v, want %v", numbers, want)
 	}

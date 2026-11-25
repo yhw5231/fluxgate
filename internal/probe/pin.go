@@ -34,15 +34,9 @@ import (
 // with whatever the routing metadata mentioned, is the discovery result.
 //
 // The second question is a loop: one small request per provider, pinned to it
-// exclusively, classified by what the upstream answered.
-
-const (
-	probeHarvestTokens = 8
-	pinAskTokens       = 16
-	// pinnedProbeWord is what a validation asks for: cheap, and enough to make the
-	// upstream route the request for real.
-	pinnedProbeWord = "Reply with the word OK"
-)
+// exclusively, classified by what the upstream answered. Both questions ask the
+// same arithmetic the account health probe asks, so a provider is verified by an
+// answer rather than by a hello that any relay can hand back.
 
 // PinDiscovery is what one model's internal providers look like after a probe.
 type PinDiscovery struct {
@@ -77,7 +71,8 @@ type PinValidation struct {
 // DiscoverPin asks one upstream model which internal providers it has and which
 // pipeline it speaks.
 func (p *Prober) DiscoverPin(ctx context.Context, line Line) PinDiscovery {
-	body, err := pinRequestbody(line.Model, pinnedProbeWord, pinAskTokens)
+	asked := newQuestion()
+	body, err := pinRequestbody(line.Model, asked.Text())
 	if err != nil {
 		return PinDiscovery{Detail: err.Error()}
 	}
@@ -134,12 +129,15 @@ func (p *Prober) DiscoverPin(ctx context.Context, line Line) PinDiscovery {
 	}
 }
 
-// ValidatePins asks each named provider, exclusively, whether it answers now.
+// ValidatePins asks each named provider, exclusively, whether it answers now. A
+// provider that serves the request but states the wrong result is reported as such:
+// that is a provider the gateway reached that is not doing the work.
 func (p *Prober) ValidatePins(ctx context.Context, line Line, providers []string, pipeline string) []PinValidation {
 	results := make([]PinValidation, 0, len(providers))
 	for _, provider := range providers {
 		started := p.now()
-		body, err := pinRequestbody(line.Model, pinnedProbeWord, pinAskTokens)
+		asked := newQuestion()
+		body, err := pinRequestbody(line.Model, asked.Text())
 		if err != nil {
 			results = append(results, PinValidation{Provider: provider, Reason: ReasonBadStatus, Detail: err.Error()})
 			continue
@@ -162,6 +160,12 @@ func (p *Prober) ValidatePins(ctx context.Context, line Line, providers []string
 			result.Reason = ReasonUnreachable
 			result.Detail = sendErr.Error()
 		case status >= 200 && status < 300:
+			detail, matched := matchAnswer(answer, asked.Answer())
+			if !matched {
+				result.Reason = ReasonWrongAnswer
+				result.Detail = detail
+				break
+			}
 			result.OK = true
 			result.Reason = ReasonOK
 		case status == http.StatusUnauthorized || status == http.StatusForbidden:
@@ -241,16 +245,16 @@ func (p *Prober) pinRequest(ctx context.Context, line Line, body []byte) (*url.U
 	return &target, request, nil
 }
 
-// pinRequestbody is the small chat request both discovery and validation send.
-func pinRequestbody(model, prompt string, maxTokens int) ([]byte, error) {
+// pinRequestbody is the small chat request both discovery and validation send. It
+// carries nothing but the model and the question, for the same reason the health
+// probe does: a parameter the gateway picked — an output bound a newer model spells
+// differently, a temperature some models refuse — must not be what the upstream
+// rejects the probe for.
+func pinRequestbody(model, prompt string) ([]byte, error) {
 	body := map[string]any{
-		"model":       model,
-		"messages":    []map[string]string{{"role": "user", "content": prompt}},
-		"stream":      false,
-		"temperature": 0,
-	}
-	if maxTokens > 0 {
-		body["max_tokens"] = maxTokens
+		"model":    model,
+		"messages": []map[string]string{{"role": "user", "content": prompt}},
+		"stream":   false,
 	}
 	encoded, err := json.Marshal(body)
 	if err != nil {

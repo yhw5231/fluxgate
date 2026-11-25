@@ -6,9 +6,11 @@
 // suspended, a subscription lapses; the next request to that line discovers it,
 // and until then the line is still selected. Probing turns that discovery into
 // something an operator can see before their users do: a short arithmetic
-// question is cheap, it needs no model to be healthy beyond answering at all,
-// and a wrong answer tells "the account is reachable" apart from "the account is
-// working".
+// question — two multi-digit operands and one of + - * / — is cheap, any working
+// model can answer it, and checking the result tells "the account is reachable"
+// apart from "the account is working". The request carries nothing but the model
+// and the question, so a parameter the gateway picked is never what an upstream
+// rejects.
 //
 // The probe is deliberately observational. It records what it found and never
 // changes the circuits: a line that is cooling down is cooled because a real
@@ -20,6 +22,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -201,7 +204,7 @@ func (p *Prober) Probe(ctx context.Context, line Line, kind Kind) Result {
 
 	switch {
 	case response.StatusCode >= 200 && response.StatusCode < 300:
-		p.verify(&result, body, asked.Sum())
+		p.verify(&result, body, asked.Answer())
 		return result
 	case response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden:
 		result.Reason = ReasonAuthRejected
@@ -226,28 +229,37 @@ func (p *Prober) Probe(ctx context.Context, line Line, kind Kind) Result {
 // answer is left alone — the account answered a real request, which is what the
 // probe is for — while a reply that states a number and states the wrong one is
 // reported, because that is an account that is reachable but not working.
-func (p *Prober) verify(result *Result, body []byte, want int) {
+func (p *Prober) verify(result *Result, body []byte, want int64) {
+	detail, matched := matchAnswer(body, want)
+	if !matched {
+		result.Reason = ReasonWrongAnswer
+		result.Detail = detail
+		return
+	}
+	result.OK = true
+	result.Reason = ReasonOK
+}
+
+// matchAnswer reports whether a served reply states the result the question asked
+// for, returning what to tell an operator when it does not. A reply with no
+// readable number at all is treated as matched: the account answered a real
+// request, and inventing a failure out of an answer that carries no number would
+// be worse than saying nothing.
+func matchAnswer(body []byte, want int64) (string, bool) {
 	answer, found := extractAnswer(body)
 	if !found {
-		result.OK = true
-		result.Reason = ReasonOK
-		return
+		return "", true
 	}
 	numbers := numbersIn(answer)
 	if len(numbers) == 0 {
-		result.OK = true
-		result.Reason = ReasonOK
-		return
+		return "", true
 	}
 	for _, number := range numbers {
 		if number == want {
-			result.OK = true
-			result.Reason = ReasonOK
-			return
+			return "", true
 		}
 	}
-	result.Reason = ReasonWrongAnswer
-	result.Detail = fmt.Sprintf("the answer %q does not contain %d", truncate(answer, 128), want)
+	return fmt.Sprintf("the answer %q does not contain %d", truncate(answer, 128), want), false
 }
 
 // question builds the probe request for one line. It returns the question that
@@ -267,12 +279,18 @@ func (p *Prober) question(line Line) (question, *url.URL, *http.Request, error) 
 	target := *base
 	asked := newQuestion()
 
+	// The probe asks with the smallest body a chat completion can carry: the model,
+	// the question, and nothing streamed. An output bound and a temperature are
+	// left out on purpose. Newer models reject `max_tokens` in favour of
+	// `max_completion_tokens`, and some accept no temperature but their own, so a
+	// probe that named them would be answered with a 400 about the probe's own
+	// request — and a working account would be reported broken over a parameter the
+	// gateway chose. The probe's job is to test the account, not the model's
+	// parameter support.
 	body, err := json.Marshal(map[string]any{
-		"model":       line.Model,
-		"messages":    []map[string]string{{"role": "user", "content": asked.Text()}},
-		"stream":      false,
-		"max_tokens":  32,
-		"temperature": 0,
+		"model":    line.Model,
+		"messages": []map[string]string{{"role": "user", "content": asked.Text()}},
+		"stream":   false,
 	})
 	if err != nil {
 		return question{}, nil, nil, fmt.Errorf("encode the probe request: %w", err)
@@ -291,6 +309,17 @@ func (p *Prober) question(line Line) (question, *url.URL, *http.Request, error) 
 		}
 		body = converted
 		api = protocol.APIResponses
+	}
+	// A channel that rewrites its request body needs those rules applied to the
+	// probe too. They are what a line's own upstream requires — a parameter it only
+	// accepts under another name, say — so a probe that skipped them would be
+	// rejected for whatever the rule supplies and report a working line as broken.
+	if needsBodyRules(line.Transform) {
+		rewritten, rewriteErr := transform.ApplyJSON(body, line.Model, line.Transform)
+		if rewriteErr != nil {
+			return question{}, nil, nil, fmt.Errorf("apply the line's body rules to the probe: %w", rewriteErr)
+		}
+		body = rewritten
 	}
 	target.Path = probeTargetPath(base, api)
 	request, err := http.NewRequest(http.MethodPost, target.String(), bytes.NewReader(body))
@@ -435,12 +464,12 @@ func answerInJSON(raw []byte) (string, bool) {
 // numbersIn lists every whole number in a reply, tolerating thousands separators
 // and the prose a model puts around an answer. A number too long to parse is
 // ignored rather than guessed at.
-func numbersIn(text string) []int {
+func numbersIn(text string) []int64 {
 	cleaned := strings.NewReplacer(",", "", "，", "").Replace(text)
 	matches := numberPattern.FindAllString(cleaned, -1)
-	numbers := make([]int, 0, len(matches))
+	numbers := make([]int64, 0, len(matches))
 	for _, match := range matches {
-		if number, err := strconv.Atoi(match); err == nil {
+		if number, err := strconv.ParseInt(match, 10, 64); err == nil {
 			numbers = append(numbers, number)
 		}
 	}
@@ -462,33 +491,103 @@ func truncate(text string, limit int) string {
 	return text[:limit] + "…"
 }
 
-// question is one arithmetic question. Three five-digit operands keep the sum
-// inside an integer and make a lucky guess implausible, while the arithmetic is
-// still trivial for any working model.
+// question is one arithmetic question: two multi-digit operands and one of the
+// four basic operations. Several digits make a lucky guess implausible, and taking
+// the operator from + - * / rather than always adding keeps a reply from being
+// accepted for repeating a number the prompt already carried. The answer is still
+// trivial for any working model — a health probe is meant to test the account, not
+// the model's arithmetic stamina — so multiplication keeps two-digit operands and
+// division keeps a two-digit divisor with a two-digit quotient, where a working
+// model computes the exact result, while addition and subtraction use five-digit
+// ones.
 type question struct {
-	a, b, c int
+	a, b int64
+	op   rune
 }
 
+// newQuestion draws one question, arranged so the expected answer is a whole number
+// that appears nowhere in the question: subtraction keeps the larger operand first
+// and division is exact, so the probe can tell a computed answer from an echo of the
+// prompt.
 func newQuestion() question {
-	return question{a: randomOperand(), b: randomOperand(), c: randomOperand()}
+	switch randomBelow(4) {
+	case 0:
+		return question{a: randomBetween(10000, 99999), b: randomBetween(10000, 99999), op: '+'}
+	case 1:
+		a, b := randomBetween(10000, 99999), randomBetween(10000, 99999)
+		if a < b {
+			a, b = b, a
+		}
+		if a == 2*b {
+			// The result would then be one of the operands, which an echo of the
+			// question would contain without computing anything.
+			b++
+		}
+		return question{a: a, b: b, op: '-'}
+	case 2:
+		return question{a: randomBetween(11, 99), b: randomBetween(11, 99), op: '*'}
+	default:
+		divisor := randomBetween(11, 99)
+		quotient := randomBetween(11, 99)
+		if quotient == divisor {
+			// A result equal to the divisor would be carried by the question itself,
+			// so an echo could pass for an answer: step the quotient aside, staying at
+			// two digits.
+			if divisor < 99 {
+				quotient = divisor + 1
+			} else {
+				quotient = divisor - 1
+			}
+		}
+		return question{a: divisor * quotient, b: divisor, op: '/'}
+	}
 }
 
 // Text renders the question as the prompt a client would send.
 func (q question) Text() string {
-	return fmt.Sprintf("What is %d + %d + %d? Reply with the number only.", q.a, q.b, q.c)
+	return fmt.Sprintf("What is %d %c %d? Reply with the number only.", q.a, q.op, q.b)
 }
 
-// Sum is the answer the probe expects.
-func (q question) Sum() int { return q.a + q.b + q.c }
+// Answer is the result the probe expects.
+func (q question) Answer() int64 {
+	switch q.op {
+	case '+':
+		return q.a + q.b
+	case '-':
+		return q.a - q.b
+	case '*':
+		return q.a * q.b
+	case '/':
+		if q.b == 0 {
+			return 0
+		}
+		return q.a / q.b
+	}
+	return 0
+}
 
-func randomOperand() int {
-	var buffer [4]byte
+// randomBelow returns a random number in [0, limit).
+func randomBelow(limit int64) int64 {
+	if limit <= 0 {
+		return 0
+	}
+	var buffer [8]byte
 	if _, err := rand.Read(buffer[:]); err != nil {
-		return 10000 + int(time.Now().UnixNano()%90000)
+		return time.Now().UnixNano() % limit
 	}
-	value := int(buffer[0])<<24 | int(buffer[1])<<16 | int(buffer[2])<<8 | int(buffer[3])
-	if value < 0 {
-		value = -value
+	return int64(binary.BigEndian.Uint64(buffer[:]) % uint64(limit))
+}
+
+// randomBetween returns a random number in [low, high].
+func randomBetween(low, high int64) int64 {
+	if high <= low {
+		return low
 	}
-	return 10000 + value%90000
+	return low + randomBelow(high-low+1)
+}
+
+// needsBodyRules reports whether a line carries JSON body mutations worth
+// applying to the probe request.
+func needsBodyRules(rules domain.TransformRules) bool {
+	return len(rules.DeleteJSON) > 0 || len(rules.OverrideJSON) > 0
 }

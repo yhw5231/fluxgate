@@ -8,6 +8,7 @@ import (
 	"github.com/yhw5231/fluxgate/internal/breaker"
 	"github.com/yhw5231/fluxgate/internal/domain"
 	"github.com/yhw5231/fluxgate/internal/probe"
+	"github.com/yhw5231/fluxgate/internal/router"
 	"github.com/yhw5231/fluxgate/internal/store"
 )
 
@@ -94,20 +95,39 @@ func probeLines(configuration store.Configuration) []probe.Line {
 }
 
 // probeModel picks the model a probe asks one line about, or an empty string when
-// the configuration names none exactly.
+// the configuration names no concrete model for that line.
+//
+// The name is the one a real request would carry, not the name the route exposes.
+// A route may map its exposed name onto the spelling an upstream knows, and a
+// channel may name its own upstream model; asking with anything else is what makes
+// a working account answer 400 for a model the upstream has never heard of. The
+// mapping is resolved by the router itself, so a probe asks exactly what dispatch
+// would send.
 func probeModel(route domain.Route, channel domain.Channel) string {
-	// The spelling the upstream listed is the name it will accept, so it wins
-	// whenever it is a concrete name.
-	if exactModelName(channel.SourceModel) {
-		return strings.TrimSpace(channel.SourceModel)
-	}
+	// A group exposes an operator's alias, which no upstream knows; only a channel
+	// that names its own upstream model can serve it, and only that name can be
+	// asked.
 	if route.IsGroup() {
-		// A group route exposes a display name that may be an operator's alias; the
-		// upstream has never heard of it.
+		if exactModelName(channel.SourceModel) {
+			return strings.TrimSpace(channel.SourceModel)
+		}
 		return ""
 	}
+	// A route that exposes a concrete model is asked with the model a request for
+	// that route would send: the channel's own spelling when it has one, else the
+	// route's mapping target, else the exposed name itself.
 	if exactModelName(route.ModelPattern) {
-		return strings.TrimSpace(route.ModelPattern)
+		model := strings.TrimSpace(router.ActualModel(strings.TrimSpace(route.ModelPattern), route, channel))
+		if exactModelName(model) {
+			return model
+		}
+		return ""
+	}
+	// A glob route names no model of its own, so the channel's spelling is the only
+	// concrete name there is. Sending the glob would ask the upstream about a model
+	// it has never heard of.
+	if exactModelName(channel.SourceModel) {
+		return strings.TrimSpace(channel.SourceModel)
 	}
 	return ""
 }

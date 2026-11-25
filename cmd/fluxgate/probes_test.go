@@ -79,6 +79,43 @@ func TestProbeLinesDoesNotSendAGroupDisplayName(t *testing.T) {
 	}
 }
 
+// A route that maps its exposed name onto the spelling an upstream knows is asked
+// with the mapped name: sending the exposed name is what makes a working account
+// answer 400 for a model the upstream has never heard of.
+func TestProbeLinesAsksWithTheMappedModel(t *testing.T) {
+	configuration := store.Configuration{
+		Routes: []domain.Route{
+			{ID: 1, ModelPattern: "gpt-6.1-sol", Mode: domain.RouteModePattern, Enabled: true,
+				ModelMapping: domain.ModelMapping{{Pattern: "gpt-6.1-sol", Target: "gpt-6.1-sol-2026-09-01"}},
+				Channels: []domain.Channel{
+					{ID: "10", Name: "星驰", BaseURL: "https://a.example/v1", APIKey: "key-one", SiteID: 1, Enabled: true},
+				}},
+		},
+	}
+	lines := probeLines(configuration)
+	if len(lines) != 1 || lines[0].Model != "gpt-6.1-sol-2026-09-01" {
+		t.Fatalf("lines = %#v, want the mapped model", lines)
+	}
+}
+
+// A channel that names the spelling its own upstream serves is asked with it, even
+// on a route whose exposed name looks like a concrete model.
+func TestProbeLinesAsksWithTheChannelsOwnSpelling(t *testing.T) {
+	configuration := store.Configuration{
+		Routes: []domain.Route{
+			{ID: 1, ModelPattern: "gpt-4.1", Mode: domain.RouteModePattern, Enabled: true,
+				Channels: []domain.Channel{
+					{ID: "10", Name: "Spelled", BaseURL: "https://a.example/v1", APIKey: "key-one", SiteID: 1, Enabled: true,
+						SourceModel: "gpt-4.1-2026-01-01"},
+				}},
+		},
+	}
+	lines := probeLines(configuration)
+	if len(lines) != 1 || lines[0].Model != "gpt-4.1-2026-01-01" {
+		t.Fatalf("lines = %#v, want the channel's own spelling", lines)
+	}
+}
+
 // A disabled line, a disabled route, or a line without a credential is not
 // probed: there is nothing to spend a question on.
 func TestProbeLinesSkipsWhatCannotAnswer(t *testing.T) {

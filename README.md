@@ -504,10 +504,12 @@ the upstream answers `502 pin_probe_failed` with the upstream's own words in
 
 `POST /management/pins/validate` with `{"site_id": 3, "model": "gpt-4.1",
 "providers": ["alibaba", "baseten"]}` asks each named provider, one at a time and
-exclusively, whether it answers now, and answers with one classified result per
-provider (`ok`, `rate_limited`, `auth_rejected`, `upstream_error`, `bad_status`,
-`unreachable`). Validation is a snapshot and is not stored: it costs the account's
-quota, which is why neither action runs on a schedule.
+exclusively, whether it answers now — with the same random arithmetic question the
+account probe asks, so a relay that hands back a hello is not called healthy — and
+answers with one classified result per provider (`ok`, `wrong_answer`,
+`rate_limited`, `auth_rejected`, `upstream_error`, `bad_status`, `unreachable`).
+Validation is a snapshot and is not stored: it costs the account's quota, which is
+why neither action runs on a schedule.
 
 Both actions are console actions too: the 渠道固定 table carries 探测 and 验证 per
 row, and the notice says what was found (the pipeline, the provider that actually
@@ -907,14 +909,27 @@ tells the gateway — which is exactly too late for the caller. The account prob
 answers the question on its own schedule, by using the line the way a client would.
 
 A probe sends one small chat completion through the same credential, client
-fingerprint, configured headers, proxy and timeout the gateway itself would use,
-and asks a random arithmetic question with three five-digit operands. The answer is
-classified rather than trusted:
+fingerprint, configured headers, body rules, proxy and timeout the gateway itself
+would use, and asks a random multi-digit arithmetic question: two operands and one
+of `+ - * /`, with a division that comes out exact. The answer is classified rather
+than trusted:
 
 - **能回答** — the upstream answered a real model request, which is what says the
   account is reachable at all.
-- **答对** — the reply contains the sum, which is what says the account is working
+- **答对** — the reply contains the result, which is what says the account is working
   and not merely billing.
+
+The request carries only the model, the question and `stream: false`. An output
+bound and a temperature are deliberately left out: newer models reject `max_tokens`
+in favour of `max_completion_tokens`, and some accept no temperature but their own,
+so naming them would get the probe a 400 about the gateway's own request and report
+a working account as broken. A channel that needs its own body shape says so in its
+transform rules, and those rules are applied to the probe exactly as dispatch
+applies them.
+
+The model it asks about is the one a real request would carry: the channel's own
+spelling when it names one, else the route's mapping target. A route that exposes an
+alias is therefore not probed with a name its upstream has never heard of.
 
 A served probe whose reply carries no readable text (a tool call, for instance) is
 left alone rather than reported: the account answered, and inventing a failure from

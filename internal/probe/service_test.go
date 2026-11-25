@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -69,9 +70,10 @@ func newServiceHarness(t *testing.T, lines []Line) *serviceHarness {
 	var calls int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&calls, 1)
-		total := sumOfRequest(t, r)
+		body, _ := io.ReadAll(r.Body)
+		answer, _ := questionAnswer(promptOfBody(body))
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(chatAnswer("The answer is " + itoa(total) + ".")))
+		_, _ = w.Write([]byte(chatAnswer("The answer is " + itoa(answer) + ".")))
 	}))
 	t.Cleanup(server.Close)
 
@@ -91,7 +93,7 @@ func newServiceHarness(t *testing.T, lines []Line) *serviceHarness {
 	return &serviceHarness{service: service, runs: runs, calls: &calls, now: &now}
 }
 
-func itoa(value int) string {
+func itoa(value int64) string {
 	// strconv would drag an import in for one call; the values are small.
 	if value == 0 {
 		return "0"

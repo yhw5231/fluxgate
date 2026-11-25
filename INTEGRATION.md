@@ -43,7 +43,7 @@
 | 错误日志独立保留 | 有 | 记录内含失败原因 | 合并为请求日志的失败视图 + 保留策略 |
 | **客户端指纹预设（23 个真实客户端请求头）** | 有 | 无 | **已移植**：`internal/clientprofile` |
 | **用量统计（token 记账、窗口聚合）** | 有 | 无 | 待移植：`gateway_usage_events` + `GET /management/usage` |
-| **账号自动探测（加法题）** | 有 | 无 | 待移植：`internal/probe` + 调度器 |
+| **账号自动探测（四则运算题）** | 有 | 无 | 待移植：`internal/probe` + 调度器 |
 | **内部渠道固定（model pin + 探测/验证）** | 有 | 无 | 待移植：上游/模型级固定 + 注入 `provider.only/order` |
 | **IPv6 代理池（租约、换 IP、一号一 IP）** | 有 | 无 | 待移植：`internal/proxypool` + `proxy_pools` 资源 |
 | 登录/会话 | token（localStorage） | HttpOnly Cookie 会话 + 防爆破 | 保留 Fluxgate |
@@ -68,10 +68,15 @@
     `FLUXGATE_USAGE_LOG_ENABLED` / `FLUXGATE_USAGE_LOG_KEEP`。
   - 管理台新增「用量」页：窗口选择、四项汇总、按模型/上游/密钥三张分组表、保留范围说明。
 - [x] **阶段 3：账号自动探测**（启动/冷却恢复/空闲三类触发）
-  - 新增 `internal/probe`：随机加法题（三个五位数）+ 答案校验（chat / responses /
-    data 信封 / 纯文本），按上游状态与回答分类为稳定 reason（ok / unreachable /
-    invalid_proxy / auth_rejected / rate_limited / upstream_error / bad_status /
-    wrong_answer）。
+  - 新增 `internal/probe`：随机多位数四则运算题（两个操作数 + `+ - * /`，除法整除，
+    答案不出现在题干里）+ 答案校验（chat / responses / data 信封 / 纯文本），按上游状态
+    与回答分类为稳定 reason（ok / unreachable / invalid_proxy / auth_rejected /
+    rate_limited / upstream_error / bad_status / wrong_answer）。
+  - 请求体只带 model / messages / stream:false：不写 `max_tokens` 与 `temperature`，
+    免得新模型按自己的拼法拒绝（上游回 400 会被误判成账号坏），线路自己的 JSON 改写规则
+    照转发链路原样套用。
+  - 探测用的模型名与真实请求一致：经 `router.ActualModel` 解析出渠道自身拼写或路由映射
+    目标，不把路由对外的名字直接发给上游，避免「模型不存在」被当成账号异常。
   - 触发调度：启动后全量核对、线路空闲超过间隔、线路从熔断中放出；探测走线路自己的
     密钥、客户端指纹、自定义头、代理与超时；**只记录事实，不改熔断状态**。
   - 新表 `gateway_probe_runs`（按条数裁剪），`GET /management/probes`、
@@ -103,8 +108,9 @@
     （planner）或顶层 `provider`（direct），再发一次钉到 `__probe__` 的请求收割可用
     内部渠道清单（planner 错误文本 / direct 错误 JSON）；合并后写回 `pipeline`、
     `providers`（仅在操作员没有自己写顺序时）、`last_provider`、`probed_at`，并重载配置。
-  - `POST /management/pins/validate`：逐个内部渠道独占发一次请求，分类为
-    ok / rate_limited / auth_rejected / upstream_error / bad_status / unreachable。
+  - `POST /management/pins/validate`：逐个内部渠道独占发一次请求（同一道四则运算题，
+    连答案一起核对），分类为 ok / wrong_answer / rate_limited / auth_rejected /
+    upstream_error / bad_status / unreachable。
   - 管理台「渠道固定」行内新增「探测」「验证」按钮：探测结果显示管线、实际渠道与发现
     的渠道数；验证结果汇总可用/限流/鉴权失败/不可用，并把失败明细放在提示条里。
 - [x] **阶段 5：IPv6 代理池**
