@@ -1,4 +1,4 @@
-/* ============================================================
+﻿/* ============================================================
    Fluxgate Console — 日间/夜间两套配色
    Self-contained: no external fonts or assets (CSP: self only)
 
@@ -351,7 +351,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 
 .auth-error {
   margin-top: 14px;
-  padding: 10px 12px;
+  padding: 10px 16px;
   background: var(--danger-soft);
   border: 1px solid rgba(var(--danger-rgb), 0.32);
   border-radius: var(--radius-sm);
@@ -381,10 +381,10 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 }
 
 .topbar-inner {
-  max-width: 1280px;
+  max-width: 1560px;
   height: var(--topbar-height);
   margin: 0 auto;
-  padding: 0 24px;
+  padding: 0 20px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -675,7 +675,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 }
 
 .data-table thead th {
-  padding: 10px 16px;
+  padding: 10px 12px;
   text-align: left;
   font-size: 11px;
   font-weight: 600;
@@ -688,7 +688,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 }
 
 .data-table tbody td {
-  padding: 12px 16px;
+  padding: 12px 12px;
   border-bottom: 1px solid rgba(var(--tint-rgb), 0.07);
   color: var(--text-secondary);
   vertical-align: middle;
@@ -1009,7 +1009,7 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 
 .settings-feedback {
   margin: 0 0 16px;
-  padding: 10px 12px;
+  padding: 10px 16px;
   border-radius: var(--radius-sm);
   font-size: 12.5px;
 }
@@ -1070,32 +1070,64 @@ input[type="password"].field-input { font-family: var(--font-mono); }
 
 .settings-card-body { padding: 22px; }
 
-/* ===== Management navigation =====
-   The console is one page with several views; the bar switches between them and
-   stays under the top bar so it is reachable from every view. */
-.console-nav {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  max-width: 1280px;
+/* ===== Console layout =====
+   The console is one page with several views, and they are grouped by what they
+   are for: 监控 reads the running state, 渠道 configures what is reached, 访问
+   decides who may use it, 系统 is the process itself. A sidebar carries those
+   groups; the content column beside it keeps the width the content needs. */
+.console-shell {
+  display: grid;
+  grid-template-columns: 194px minmax(0, 1fr);
+  gap: 20px;
+  max-width: 1560px;
   margin: 0 auto;
-  padding: 0 24px;
-  height: 46px;
-  overflow-x: auto;
-  scrollbar-width: none;
+  padding: 20px 20px 56px;
+  align-items: start;
 }
-.console-nav::-webkit-scrollbar { display: none; }
+
+.console-sidebar {
+  position: sticky;
+  /* Below the top bar, so the sidebar stays reachable while a long table scrolls. */
+  top: calc(var(--topbar-height) + 22px);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 14px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  max-height: calc(100vh - var(--topbar-height) - 44px);
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.nav-group { display: flex; flex-direction: column; gap: 2px; }
+
+.nav-group-title {
+  margin: 0;
+  padding: 2px 12px 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
 
 .nav-item {
   appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
   border: 1px solid transparent;
   background: none;
   border-radius: var(--radius-sm);
-  padding: 7px 14px;
+  padding: 8px 12px;
   font-family: inherit;
   font-size: 13px;
   font-weight: 550;
   color: var(--text-secondary);
+  text-align: left;
   cursor: pointer;
   white-space: nowrap;
   transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease;
@@ -1105,6 +1137,55 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   color: var(--accent);
   background: var(--accent-soft);
   border-color: rgba(var(--accent-rgb), 0.32);
+}
+
+.nav-icon { width: 16px; height: 16px; flex: none; opacity: 0.85; }
+.nav-item.is-active .nav-icon { opacity: 1; }
+
+.console-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+/* The content column supplies the page padding, so a view inside it is just a
+   stack of panels rather than a page of its own. */
+.console-main > .container {
+  max-width: none;
+  margin: 0;
+  padding: 0;
+  gap: 22px;
+}
+
+.topbar-crumb {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* A narrow viewport turns the sidebar into a scrolling row above the content:
+   the groups are still separated, but they no longer take a column away from
+   the tables, which are what a small screen needs the width for. */
+@media (max-width: 980px) {
+  .console-shell {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 14px 16px 40px;
+  }
+  .console-sidebar {
+    position: static;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 8px;
+    max-height: none;
+    overflow: visible;
+  }
+  .nav-group { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 4px; }
+  .nav-group-title { display: none; }
+  .nav-item { width: auto; padding: 7px 11px; }
+  .topbar-crumb { display: none; }
 }
 
 /* ===== Management panels ===== */

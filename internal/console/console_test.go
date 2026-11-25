@@ -358,8 +358,10 @@ func TestConsoleHasSettingsViewWithPasswordForm(t *testing.T) {
 }
 
 // The settings view is grouped by function: the account, the runtime policy and
-// the proxies are separate panels, and the bar inside the view switches between
-// them, so no single page carries all three at once.
+// the client fingerprint catalog are separate panels, and the bar inside the view
+// switches between them, so no single page carries all three at once. The proxies
+// are a view of their own rather than a settings panel, because they are part of
+// what clients are given (访问) rather than of the process.
 func TestConsoleGroupsSettingsByFunction(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/console/", nil)
 	response := httptest.NewRecorder()
@@ -374,7 +376,7 @@ func TestConsoleGroupsSettingsByFunction(t *testing.T) {
 	if !strings.Contains(page, `id="settings-nav"`) {
 		t.Error("console settings view has no sub navigation")
 	}
-	for _, group := range []string{"account", "policy", "proxies"} {
+	for _, group := range []string{"account", "policy", "profiles"} {
 		for _, wanted := range []string{
 			`data-settings-panel="` + group + `"`,
 			`data-settings-view="` + group + `"`,
@@ -386,13 +388,67 @@ func TestConsoleGroupsSettingsByFunction(t *testing.T) {
 	}
 	// Only the first group is open before the script runs, so the others have to
 	// carry the hidden attribute in the markup rather than relying on the script.
-	for _, group := range []string{"policy", "proxies"} {
+	for _, group := range []string{"policy", "profiles"} {
 		if !strings.Contains(page, `data-settings-panel="`+group+`" hidden`) {
 			t.Errorf("console settings group %q is not closed in the markup", group)
 		}
 	}
 	if strings.Contains(page, `data-settings-panel="account" hidden`) {
 		t.Error("console settings opens on a group the script has to reveal")
+	}
+
+	// The proxies left the settings view for one of their own.
+	if !strings.Contains(page, `data-view-panel="proxies"`) || !strings.Contains(page, `data-view="proxies"`) {
+		t.Error("console has no proxies view of its own")
+	}
+	if strings.Contains(page, `data-settings-view="proxies"`) {
+		t.Error("console still treats the proxies as a settings group")
+	}
+}
+
+// The navigation is grouped by what each view is for — 监控, 渠道, 访问, 系统 —
+// and every view names its group in one place, so a page is placeable without
+// reading the whole sidebar. The top bar names the group and view on screen.
+func TestConsoleGroupsNavigationByFunction(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/console/", nil)
+	response := httptest.NewRecorder()
+	Handler().ServeHTTP(response, request)
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	page := string(body)
+
+	for _, wanted := range []string{
+		`class="console-sidebar"`,
+		`class="console-main"`,
+		`id="topbar-crumb"`,
+		`nav-group-title">监控`,
+		`nav-group-title">渠道`,
+		`nav-group-title">访问`,
+		`nav-group-title">系统`,
+	} {
+		if !strings.Contains(page, wanted) {
+			t.Errorf("console navigation is missing %q", wanted)
+		}
+	}
+	// Every view is reachable from the sidebar, and every view has a panel, so the
+	// script's toggle has something to show for each name it accepts.
+	for _, view := range []string{
+		"overview", "usage", "probes", "requests",
+		"upstream", "routes",
+		"keys", "proxies",
+		"settings",
+	} {
+		for _, wanted := range []string{
+			`data-view="` + view + `"`,
+			`data-view-panel="` + view + `"`,
+		} {
+			if !strings.Contains(page, wanted) {
+				t.Errorf("console has no %q for the %s view", wanted, view)
+			}
+		}
 	}
 }
 
@@ -459,7 +515,7 @@ func TestConsoleCarriesTheManagementViewsAndEditor(t *testing.T) {
 	}
 	// Each view toggles as a whole, so the container and its navigation entry
 	// have to exist even before the script runs.
-	for _, view := range []string{"overview", "upstream", "routes", "requests", "keys", "settings"} {
+	for _, view := range []string{"overview", "usage", "probes", "upstream", "routes", "requests", "keys", "proxies", "settings"} {
 		if !strings.Contains(page, `data-view="`+view+`"`) {
 			t.Errorf("console navigation has no %q entry", view)
 		}

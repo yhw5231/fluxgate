@@ -29,7 +29,7 @@
   var VIEWS = ['overview', 'usage', 'probes', 'upstream', 'routes', 'requests', 'keys', 'settings'];
   /* 请求记录页读的是网关自己的日志，不依赖配置清单，所以它不在 MANAGEMENT_VIEWS
    * 里：配置读不出来的时候，记录仍然看得到。 */
-  var MANAGEMENT_VIEWS = { upstream: true, routes: true, keys: true, settings: true };
+  var MANAGEMENT_VIEWS = { upstream: true, routes: true, keys: true, proxies: true, settings: true };
   /* 会自己刷新的视图：概览读取运行时快照，路由页读取每条线路的实时状态，请求
    * 记录页读的是一份还在增长的日志。其余视图是可编辑的配置表，只能在操作者
    * 自己触发时重画。 */
@@ -38,7 +38,34 @@
   /* The settings view groups its panels by function and shows one group at a
    * time, so no single page carries the account, the runtime policy and the
    * proxies at once. */
-  var SETTINGS_VIEWS = ['account', 'policy', 'proxies'];
+  var SETTINGS_VIEWS = ['account', 'policy', 'profiles'];
+
+  /* The sidebar groups its views by what they are for, and the top bar names the
+   * group and the view it is showing, so a page is always placeable without
+   * looking at the sidebar. */
+  var VIEW_GROUPS = {
+    overview: '监控',
+    usage: '监控',
+    probes: '监控',
+    requests: '监控',
+    upstream: '渠道',
+    routes: '渠道',
+    keys: '访问',
+    proxies: '访问',
+    settings: '系统'
+  };
+
+  var VIEW_TITLES = {
+    overview: '概览',
+    usage: '用量',
+    probes: '探测',
+    requests: '请求记录',
+    upstream: '上游',
+    routes: '路由',
+    keys: '客户端密钥',
+    proxies: '代理',
+    settings: '设置'
+  };
 
   var state = {
     view: 'overview',
@@ -87,7 +114,8 @@
     els.authError = $('auth-error');
     els.authSubmit = $('auth-submit');
     els.app = $('app');
-    els.nav = $('console-nav');
+    els.nav = document.querySelector('.console-sidebar');
+    els.crumb = $('topbar-crumb');
     els.viewPanels = document.querySelectorAll('[data-view-panel]');
 
     els.status = $('topbar-status');
@@ -164,8 +192,15 @@
     els.probesRetention = document.querySelector('[data-probes-retention]');
     els.probesBody = document.querySelector('[data-probes-body]');
     els.probesEmpty = document.querySelector('[data-probes-empty]');
+    els.probesTable = document.querySelector('[data-probes-table]');
     els.probesRunAll = $('probes-run-all');
     els.probesClear = $('probes-clear');
+
+    // The client fingerprint catalog: the gateway owns the presets, this view
+    // only lays them out with the evidence each one records.
+    els.profilesMeta = document.querySelector('[data-profiles-meta]');
+    els.profilesBody = document.querySelector('[data-profiles-body]');
+    els.profilesEmpty = document.querySelector('[data-profiles-empty]');
 
     els.banner = $('error-banner');
     els.bannerTitle = els.banner.querySelector('[data-banner-title]');
@@ -1148,7 +1183,10 @@
       resetPasswordForm(els.passwordForm, els.currentPassword, els.newPassword,
         els.confirmPassword, els.passwordFeedback);
       showSettingsView(state.settingsView);
-      els.currentPassword.focus();
+      if (state.settingsView === 'account') { els.currentPassword.focus(); }
+    }
+    if (els.crumb) {
+      els.crumb.textContent = (VIEW_GROUPS[name] || '') + ' / ' + (VIEW_TITLES[name] || name);
     }
     // Only the live views refresh on their own: a management form must not be
     // repainted from under the operator while it is being filled in. The routing
@@ -1180,6 +1218,7 @@
       button.classList.toggle('is-active', active);
       button.setAttribute('aria-current', active ? 'page' : 'false');
     }
+    if (name === 'profiles') { renderProfiles(); }
   }
 
   function signOut() {
@@ -1463,6 +1502,7 @@
       renderUsage();
       renderProbes();
       renderPolicy();
+      renderProfiles();
     }).catch(function (err) {
       refreshFailure('无法连接网关', String(err && err.message ? err.message : err));
     }).then(function () {
@@ -2699,15 +2739,18 @@
 
     els.probesBody.textContent = '';
     if (state.probes.error) {
+      if (els.probesTable) { els.probesTable.hidden = true; }
       els.probesEmpty.hidden = false;
       setProbesEmptyText(state.probes.error);
       return;
     }
     if (runs.length === 0) {
+      if (els.probesTable) { els.probesTable.hidden = true; }
       els.probesEmpty.hidden = false;
       setProbesEmptyText('还没有探测记录。网关会在启动后、线路空闲时自动核对，也可以点「探测全部线路」立刻检查。');
       return;
     }
+    if (els.probesTable) { els.probesTable.hidden = false; }
     els.probesEmpty.hidden = true;
 
     runs.forEach(function (run) {
@@ -2806,6 +2849,124 @@
       return null;
     }
     throw new Error(errorMessage(result.body, '清空探测记录失败。'));
+  }
+
+  /* ===== 客户端指纹目录 =====
+   *
+   * 预设的清单、请求头、可信度与证据都由网关提供，这里只负责铺开：它回答「有
+   * 哪些客户端身份可选、它们分别是依据什么写的」。选预设的动作在上游表单里。
+   */
+
+  var PROFILE_CONFIDENCE = {
+    verified: { label: '已核实', variant: 'success' },
+    partial: { label: '部分核实', variant: 'warning' },
+    unverified: { label: '未核实', variant: 'muted' }
+  };
+
+  function profileHeaderCount(profile) {
+    var staticCount = profile && profile.headers ? Object.keys(profile.headers).length : 0;
+    var dynamicCount = profile && profile.dynamic ? Object.keys(profile.dynamic).length : 0;
+    return staticCount + dynamicCount;
+  }
+
+  function shorten(value, limit) {
+    var text = String(value === null || value === undefined ? '' : value);
+    if (text.length <= limit) { return text; }
+    return text.slice(0, limit - 1) + '…';
+  }
+
+  function profileDetail(profile) {
+    var wrapper = element('div', 'detail-panel');
+    var facts = element('div', 'detail-facts');
+    facts.appendChild(detailFact('ID', profile.id || '—'));
+    facts.appendChild(detailFact('静态头', String(profile.headers ? Object.keys(profile.headers).length : 0)));
+    var dynamicNames = profile.dynamic ? Object.keys(profile.dynamic) : [];
+    facts.appendChild(detailFact('动态头', dynamicNames.length ? dynamicNames.join(', ') : '—'));
+    wrapper.appendChild(facts);
+
+    if (profile.headers && Object.keys(profile.headers).length) {
+      var table = element('table', 'detail-table');
+      var head = document.createElement('thead');
+      var headRow = document.createElement('tr');
+      ['请求头', '值'].forEach(function (label) {
+        var th = document.createElement('th');
+        th.textContent = label;
+        headRow.appendChild(th);
+      });
+      head.appendChild(headRow);
+      table.appendChild(head);
+      var body = document.createElement('tbody');
+      Object.keys(profile.headers).sort().forEach(function (name) {
+        var row = document.createElement('tr');
+        cell(row, element('span', 'mono', name));
+        cell(row, element('span', 'mono', shorten(profile.headers[name], 120)));
+        body.appendChild(row);
+      });
+      table.appendChild(body);
+      wrapper.appendChild(table);
+    }
+
+    if (profile.note) {
+      var note = element('p', 'detail-note', profile.note);
+      wrapper.appendChild(note);
+    }
+    if (profile.evidence && profile.evidence.length) {
+      var evidence = element('div', 'detail-note');
+      evidence.appendChild(element('span', 'cell-muted', '证据出处：'));
+      profile.evidence.forEach(function (url) {
+        var line = element('div', 'mono', url);
+        evidence.appendChild(line);
+      });
+      wrapper.appendChild(evidence);
+    }
+    return wrapper;
+  }
+
+  function renderProfiles() {
+    if (!els.profilesBody) { return; }
+    var catalog = (state.configuration && state.configuration.client_profiles) || [];
+    els.profilesBody.textContent = '';
+    els.profilesMeta.textContent = catalog.length ? catalog.length + ' 个预设' : '';
+    if (catalog.length === 0) {
+      els.profilesEmpty.hidden = false;
+      return;
+    }
+    els.profilesEmpty.hidden = true;
+
+    catalog.forEach(function (profile) {
+      var key = String(profile.id || profile.name || '');
+      var expanded = isExpanded('profiles', key);
+      var row = document.createElement('tr');
+      row.className = 'row-expandable';
+      row.setAttribute('data-toggle-group', 'profiles');
+      row.setAttribute('data-toggle-key', key);
+      if (expanded) { row.classList.add('is-expanded'); }
+
+      var nameCell = document.createElement('td');
+      nameCell.className = 'toggle-cell';
+      nameCell.appendChild(expandCaret(expanded, profile.name || key));
+      nameCell.appendChild(element('span', 'cell-strong', (profile.starred ? '★ ' : '') + text(profile.name, key)));
+      var id = element('span', 'cell-muted mono', ' ');
+      id.textContent = ' ' + key;
+      nameCell.appendChild(id);
+      row.appendChild(nameCell);
+
+      var confidence = PROFILE_CONFIDENCE[profile.confidence]
+        || { label: text(profile.confidence), variant: 'muted' };
+      cell(row, badge(confidence.label, confidence.variant));
+      cell(row, String(profileHeaderCount(profile)), 'num');
+      var summary = profile.note ? shorten(profile.note, 80) : '—';
+      var summaryCell = element('span', 'cell-muted', summary);
+      if (profile.note) { summaryCell.title = profile.note; }
+      cell(row, summaryCell);
+
+      row.appendChild(expandActionCell('profiles', key, expanded, renderProfiles));
+      els.profilesBody.appendChild(row);
+
+      if (expanded) {
+        els.profilesBody.appendChild(detailRow(5, profileDetail(profile)));
+      }
+    });
   }
 
   function clearUsageLog() {
@@ -3134,6 +3295,7 @@
     toggleGroupRow(els.routingBody, UPSTREAM_GROUP, renderRouting);
     toggleGroupRow(els.upstreamsBody, 'upstreams', renderManagement);
     toggleGroupRow(els.requestsBody, 'requests', renderRequests);
+    toggleGroupRow(els.profilesBody, 'profiles', renderProfiles);
   }
 
   /* toggleGroupRow makes a whole row a toggle for its own detail, so an operator

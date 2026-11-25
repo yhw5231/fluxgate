@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 
@@ -44,7 +45,13 @@ func (l *lineSource) Lines() []probe.Line {
 	return probeLines(l.configuration)
 }
 
-// probeLines builds one probe target per enabled line.
+// probeLines builds one probe target per upstream credential.
+//
+// A probe is a question about an account, not about a model: one key serving
+// five models is one credential to verify, and a sweep that asked it five times
+// would spend five times the quota to answer the same question. The first line
+// that credential appears on is kept, together with the first model whose name
+// can be sent to the upstream.
 func probeLines(configuration store.Configuration) []probe.Line {
 	seen := make(map[string]bool, len(configuration.Channels))
 	lines := make([]probe.Line, 0, len(configuration.Channels))
@@ -56,7 +63,8 @@ func probeLines(configuration store.Configuration) []probe.Line {
 			if !channel.Enabled || strings.TrimSpace(channel.APIKey) == "" {
 				continue
 			}
-			if seen[channel.ID] {
+			key := fmt.Sprintf("%d\x00%s", channel.SiteID, channel.APIKey)
+			if seen[key] {
 				continue
 			}
 			model := probeModel(route, channel)
@@ -66,7 +74,7 @@ func probeLines(configuration store.Configuration) []probe.Line {
 				// and report a working account as broken.
 				continue
 			}
-			seen[channel.ID] = true
+			seen[key] = true
 			lines = append(lines, probe.Line{
 				ChannelID:      channel.ID,
 				ChannelName:    channel.Name,

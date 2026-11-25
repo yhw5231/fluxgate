@@ -75,6 +75,7 @@
           </div>
         </div>
         <div class="topbar-actions">
+          <span id="topbar-crumb" class="topbar-crumb">监控 / 概览</span>
           <span id="topbar-version" class="version" data-version title="仓库版本">&mdash;</span>
           <span id="topbar-uptime" class="uptime" data-uptime title="进程运行时长">&mdash;</span>
           <span id="topbar-status" class="status-pill status-unknown" data-status>
@@ -102,19 +103,63 @@
           </button>
         </div>
       </div>
-
-      <!-- 应用内视图切换。每个按钮对应一个 main，只有一个可见。 -->
-      <nav class="console-nav" id="console-nav" aria-label="管理台视图">
-        <button class="nav-item is-active" type="button" data-view="overview">概览</button>
-        <button class="nav-item" type="button" data-view="usage">用量</button>
-        <button class="nav-item" type="button" data-view="probes">探测</button>
-        <button class="nav-item" type="button" data-view="upstream">上游</button>
-        <button class="nav-item" type="button" data-view="routes">路由</button>
-        <button class="nav-item" type="button" data-view="requests">请求记录</button>
-        <button class="nav-item" type="button" data-view="keys">客户端密钥</button>
-        <button class="nav-item" type="button" data-view="settings">设置</button>
-      </nav>
     </header>
+
+    <!-- 导航按「要解决什么问题」分组：监控读运行状态，渠道配上游与路由，
+         访问管谁在用，系统管这个进程本身。内容是右侧一列，宽度交给内容。 -->
+    <div class="console-shell">
+      <aside class="console-sidebar" aria-label="管理台导航">
+        <nav class="nav-group" aria-label="监控">
+          <p class="nav-group-title">监控</p>
+          <button class="nav-item is-active" type="button" data-view="overview" aria-current="page">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l2.5-6 4 12L16 12h5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>概览</span>
+          </button>
+          <button class="nav-item" type="button" data-view="usage">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+            <span>用量</span>
+          </button>
+          <button class="nav-item" type="button" data-view="probes">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l2-6 3 12 2.5-7 2 4h4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>探测</span>
+          </button>
+          <button class="nav-item" type="button" data-view="requests">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4zM8 9h8M8 13h5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg>
+            <span>请求记录</span>
+          </button>
+        </nav>
+        <nav class="nav-group" aria-label="渠道">
+          <p class="nav-group-title">渠道</p>
+          <button class="nav-item" type="button" data-view="upstream">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v5H4zM4 14h16v5H4z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M8 8.5h.5M8 16.5h.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            <span>上游</span>
+          </button>
+          <button class="nav-item" type="button" data-view="routes">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="18" cy="6" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="12" cy="18" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M6 8.4v1.2a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V8.4M12 12.6v3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+            <span>路由</span>
+          </button>
+        </nav>
+        <nav class="nav-group" aria-label="访问">
+          <p class="nav-group-title">访问</p>
+          <button class="nav-item" type="button" data-view="keys">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 12h9M17 12v3M20 12v2.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+            <span>客户端密钥</span>
+          </button>
+          <button class="nav-item" type="button" data-view="proxies">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3.5 12h17M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18z" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+            <span>代理</span>
+          </button>
+        </nav>
+        <nav class="nav-group" aria-label="系统">
+          <p class="nav-group-title">系统</p>
+          <button class="nav-item" type="button" data-view="settings">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 2.8v2.4M12 18.8v2.4M4.5 7.2l2 1.2M17.5 15.6l2 1.2M4.5 16.8l2-1.2M17.5 8.4l2-1.2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+            <span>设置</span>
+          </button>
+        </nav>
+      </aside>
+
+      <div class="console-main">
 
     <!-- ===== 概览：只读的运行时快照 ===== -->
     <main class="container" data-view-panel="overview">
@@ -485,13 +530,32 @@
       </section>
     </main>
 
-    <!-- ===== 设置：按功能分成账号、运行策略、代理三个子页 =====
+    <!-- ===== 代理：网关到上游的出口 ===== -->
+    <main class="container" data-view-panel="proxies" hidden>
+      <section class="panel" data-management="proxies">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="title-tick" aria-hidden="true"></span>
+            <h2>代理</h2>
+            <span class="panel-meta" data-meta></span>
+          </div>
+          <button class="btn btn-primary" type="button" data-create="proxies">添加代理</button>
+        </header>
+        <p class="panel-help">网关到上游的出口。上游自己的代理地址优先，其次是这里标记为默认的代理，最后才是直连。改完之后下一次请求就走新的出口，不需要重启。</p>
+        <div class="table-wrap">
+          <table class="data-table" data-table="proxies"><tbody data-body="proxies"></tbody></table>
+        </div>
+        <div class="empty-state" data-empty="proxies" hidden><p data-empty-text>还没有代理。需要固定出口时添加一个 HTTP/SOCKS5 代理，并把它设为默认或在某个上游上单独指定。</p></div>
+      </section>
+    </main>
+
+    <!-- ===== 设置：按功能分成账号、运行策略、客户端指纹三个子页 =====
          每个子页是一个 data-settings-panel，只有一个可见；子页导航由脚本切换。 -->
     <main class="container" data-view-panel="settings" id="settings-view" hidden>
       <nav class="settings-nav" id="settings-nav" aria-label="设置分类">
         <button class="settings-tab is-active" type="button" data-settings-view="account" aria-current="page">账号</button>
         <button class="settings-tab" type="button" data-settings-view="policy">运行策略</button>
-        <button class="settings-tab" type="button" data-settings-view="proxies">代理</button>
+        <button class="settings-tab" type="button" data-settings-view="profiles">客户端指纹</button>
       </nav>
 
       <!-- 子页：账号 -->
@@ -553,25 +617,40 @@
         <div id="policy-panels"></div>
       </div>
 
-      <!-- 子页：代理 -->
-      <div data-settings-panel="proxies" hidden>
-        <section class="panel" data-management="proxies">
+      <!-- 子页：客户端指纹。预设是网关给的数据（名称、可信度、请求头与证据），
+           这里只负责把它铺开，让操作员知道有哪些可选的客户端身份。 -->
+      <div data-settings-panel="profiles" hidden>
+        <section class="panel">
           <header class="panel-header">
             <div class="panel-title">
               <span class="title-tick" aria-hidden="true"></span>
-              <h2>代理</h2>
-              <span class="panel-meta" data-meta></span>
+              <h2>客户端指纹预设</h2>
+              <span class="panel-meta" data-profiles-meta></span>
             </div>
-            <button class="btn btn-primary" type="button" data-create="proxies">添加代理</button>
           </header>
-          <p class="panel-help">网关到上游的出口代理。上游自己的代理地址优先，其次是这里标记为默认的代理，最后才是直连。</p>
+          <p class="panel-help">网关内置的客户端请求头预设：每个预设是一组真实 AI 编码客户端会发出的 UA 与协议头。在「上游」的编辑框里选一个，这个上游的所有线路就以那个客户端的身份访问它；预设里没有鉴权头，密钥仍由网关按线路注入。可信度说明这些头的来历：<strong>已核实</strong>有公开源码/文档证据，<strong>部分核实</strong>是部分头有证据、其余按同族客户端补齐，<strong>未核实</strong>只能当作猜测。</p>
           <div class="table-wrap">
-            <table class="data-table" data-table="proxies"><tbody data-body="proxies"></tbody></table>
+            <table class="data-table" data-profiles-table>
+              <thead>
+                <tr>
+                  <th>客户端</th>
+                  <th>可信度</th>
+                  <th class="num">请求头</th>
+                  <th>说明</th>
+                  <th class="actions"></th>
+                </tr>
+              </thead>
+              <tbody data-profiles-body></tbody>
+            </table>
           </div>
-          <div class="empty-state" data-empty="proxies" hidden><p data-empty-text>还没有代理。</p></div>
+          <div class="empty-state" data-profiles-empty hidden>
+            <p data-empty-text>配置还没有加载：签名并登录后这里会列出网关内置的客户端指纹。</p>
+          </div>
         </section>
       </div>
     </main>
+      </div>
+    </div>
   </div>
 
   <!-- 记录编辑表单。新建和编辑共用同一个模态框，字段由网关返回的字段清单生成。 -->

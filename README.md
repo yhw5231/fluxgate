@@ -311,13 +311,20 @@ models is all it takes to route them; the routes appear by themselves. Every
 accepted write reloads the configuration and hands the result to the routing
 engine, so an upstream added in the console serves traffic on the next request.
 
+The console is laid out by what each page is for. A sidebar carries four groups —
+监控 (概览, 用量, 探测, 请求记录), 渠道 (上游, 路由), 访问 (客户端密钥, 代理), and 系统
+(设置) — and the top bar names the group and the page on screen, so a page is
+placeable without reading the whole sidebar. On a narrow screen the sidebar
+becomes a wrapping row above the content, so a table keeps the width it needs.
+
 The views are 概览 (the live dashboard), 用量 (what the served requests cost in
 tokens, by model, upstream, and client key), 探测 (whether each account still
 works), 上游 (upstreams), 路由 (the routing table
 the gateway derived), 请求记录 (the record of served requests), 客户端密钥 (client
-keys), and 设置. The settings view is
+keys), 代理 (proxy profiles), and 设置. The settings view is
 grouped by function and shows one group at a time: 账号 (the administrator
-account), 运行策略 (the runtime policy), and 代理 (proxy profiles).
+account), 运行策略 (the runtime policy), and 客户端指纹 (the built-in client
+fingerprint presets with their evidence).
 
 The 路由 view answers one question per model and shows the details behind it. A
 collapsed row is a model and its headline: which upstreams serve it, how it is
