@@ -129,6 +129,9 @@ func TestRequestLogFiltersRecords(t *testing.T) {
 	}
 
 	written := []domain.RequestRecord{
+		// A probe whose upstream answered 200 but with the wrong result is a failure
+		// the failed filter has to show, even though its status is a success.
+		{RequestID: "probe-wrong", At: time.Now().UTC(), Model: "probe-model", Status: 200, ErrorCode: "wrong_answer", Source: domain.RequestSourceProbe},
 		{RequestID: "ok", At: time.Now().UTC(), Model: "gpt-4o", Status: 200},
 		{RequestID: "bad", At: time.Now().UTC(), Model: "gpt-4o", Status: 502, ErrorCode: "upstream_unavailable"},
 		{RequestID: "other", At: time.Now().UTC(), Model: "claude", Status: 429},
@@ -144,8 +147,8 @@ func TestRequestLogFiltersRecords(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListRequestRecords(failed) error = %v", err)
 	}
-	if got := requestIDs(failed); got != "unrouted,other,bad" {
-		t.Errorf("failed records = %s, want the three that were not served, newest first", got)
+	if got := requestIDs(failed); got != "unrouted,other,bad,probe-wrong" {
+		t.Errorf("failed records = %s, want the four that were not served, newest first", got)
 	}
 
 	byModel, err := store.ListRequestRecords(ctx, RequestLogFilter{Model: "GPT-4O"})
@@ -269,4 +272,93 @@ func requestIDs(records []domain.RequestRecord) string {
 		ids = append(ids, record.RequestID)
 	}
 	return strings.Join(ids, ",")
+}
+
+// The log says what made each request: a client, or one of the gateway's own
+// account probes. An empty source is a client request, which is what every record
+// written before probes were logged here is.
+func TestRequestLogRecordsWhatMadeTheRequest(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if err := store.EnsureRequestLogSchema(ctx); err != nil {
+		t.Fatalf("EnsureRequestLogSchema() error = %v", err)
+	}
+	for _, record := range []domain.RequestRecord{
+		{RequestID: "client", At: time.Now().UTC(), Model: "gpt-4o", Status: 200},
+		{RequestID: "probe", At: time.Now().UTC(), Model: "gpt-4o", Status: 200, Source: domain.RequestSourceProbe},
+	} {
+		if err := store.AppendRequestRecord(ctx, record, 0); err != nil {
+			t.Fatalf("AppendRequestRecord(%s) error = %v", record.RequestID, err)
+		}
+	}
+
+	records, err := store.ListRequestRecords(ctx, RequestLogFilter{})
+	if err != nil {
+		t.Fatalf("ListRequestRecords() error = %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("records = %d, want 2", len(records))
+	}
+	if records[0].Source != domain.RequestSourceProbe {
+		t.Errorf("newest record source = %q, want %q", records[0].Source, domain.RequestSourceProbe)
+	}
+	if records[1].Source != domain.RequestSourceProxy {
+		t.Errorf("client record source = %q, want %q", records[1].Source, domain.RequestSourceProxy)
+	}
+}
+
+// A request log created before probes were logged has no source column. The schema
+// pass adds it, and the records already in the table keep reading as client
+// requests rather than as an unreadable log.
+func TestRequestLogGainsTheSourceColumnOnAnOlderTable(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	legacy := `CREATE TABLE gateway_request_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		request_id TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		method TEXT NOT NULL DEFAULT '',
+		path TEXT NOT NULL DEFAULT '',
+		client_ip TEXT NOT NULL DEFAULT '',
+		key_id INTEGER NOT NULL DEFAULT 0,
+		key_name TEXT NOT NULL DEFAULT '',
+		model TEXT NOT NULL DEFAULT '',
+		stream INTEGER NOT NULL DEFAULT 0,
+		status INTEGER NOT NULL DEFAULT 0,
+		error_code TEXT NOT NULL DEFAULT '',
+		error_message TEXT NOT NULL DEFAULT '',
+		duration_ms INTEGER NOT NULL DEFAULT 0,
+		attempts INTEGER NOT NULL DEFAULT 0,
+		detail TEXT NOT NULL DEFAULT ''
+	)`
+	if _, err := store.db.ExecContext(ctx, legacy); err != nil {
+		t.Fatalf("create the older table: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO gateway_request_log (request_id, created_at, model, status)
+		VALUES ('legacy', ?, 'gpt-4o', 200)`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("write the legacy record: %v", err)
+	}
+
+	if err := store.EnsureRequestLogSchema(ctx); err != nil {
+		t.Fatalf("EnsureRequestLogSchema() error = %v", err)
+	}
+	if err := store.AppendRequestRecord(ctx, domain.RequestRecord{
+		RequestID: "probe", At: time.Now().UTC(), Model: "gpt-4o", Status: 200, Source: domain.RequestSourceProbe,
+	}, 0); err != nil {
+		t.Fatalf("AppendRequestRecord(probe) error = %v", err)
+	}
+
+	records, err := store.ListRequestRecords(ctx, RequestLogFilter{})
+	if err != nil {
+		t.Fatalf("ListRequestRecords() error = %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("records = %d, want the older and the new one", len(records))
+	}
+	if records[0].Source != domain.RequestSourceProbe {
+		t.Errorf("probe source = %q, want %q", records[0].Source, domain.RequestSourceProbe)
+	}
+	if records[1].RequestID != "legacy" || records[1].Source != domain.RequestSourceProxy {
+		t.Errorf("legacy record = %+v, want a client request", records[1])
+	}
 }

@@ -370,6 +370,12 @@ func (s *Server) serveMediaJob(w http.ResponseWriter, r *http.Request, request m
 	defer result.Response.Body.Close()
 
 	record.Status = result.Response.StatusCode
+	if record.Status >= http.StatusBadRequest {
+		// The upstream answered an error and it is relayed as it is. The record
+		// carries the reason beside the status, so the view can say what went wrong
+		// without the operator opening the attempt trace first.
+		record.ErrorCode, record.ErrorMessage = passthroughFailure(result.Trace, record.Status)
+	}
 	copyResponseHeaders(w.Header(), result.Response.Header)
 	w.Header().Set("X-Fluxgate-Upstream-Channel", result.Attempt.ChannelID)
 	w.WriteHeader(result.Response.StatusCode)

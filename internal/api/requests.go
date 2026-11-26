@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -65,6 +66,9 @@ type requestRecord struct {
 	ErrorMessage string                `json:"error_message,omitempty"`
 	DurationMS   int64                 `json:"duration_ms"`
 	Attempts     []domain.AttemptTrace `json:"attempts"`
+	// Source says what made the request: a client ("proxy") or the gateway's own
+	// account probe ("probe").
+	Source string `json:"source,omitempty"`
 }
 
 // handleRequestLog answers the console's request view.
@@ -123,6 +127,7 @@ func (s *Server) handleRequestLog(w http.ResponseWriter, r *http.Request) {
 			ErrorMessage: record.ErrorMessage,
 			DurationMS:   record.DurationMS,
 			Attempts:     attempts,
+			Source:       record.Source,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -209,6 +214,27 @@ type dispatchFailure struct {
 // caller is not there to read it; it exists so the record of the request says what
 // happened instead of blaming the upstream.
 const statusClientClosed = 499
+
+// passthroughFailure names an upstream error the gateway is relaying rather than
+// one it made up. Without it, the record of an upstream 4xx or 5xx that reached the
+// client carries a status and nothing else, while the upstream's own words sit on
+// the attempt — exactly the text an operator opens the record to read.
+func passthroughFailure(trace domain.RequestTrace, status int) (code, message string) {
+	code = "upstream_rejected"
+	message = fmt.Sprintf("the upstream answered HTTP %d", status)
+	if status >= http.StatusInternalServerError {
+		code = "upstream_error"
+	}
+	if last, ok := trace.LastFailure(); ok {
+		switch {
+		case strings.TrimSpace(last.Response) != "":
+			message += ": " + strings.TrimSpace(last.Response)
+		case strings.TrimSpace(last.Error) != "":
+			message += ": " + strings.TrimSpace(last.Error)
+		}
+	}
+	return code, message
+}
 
 // recordInterruptedStream fills in how a streamed answer ended when it did not end
 // with the upstream's own last event.

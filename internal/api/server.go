@@ -894,6 +894,13 @@ func (s *Server) handleProxy(endpoint proxyEndpoint) http.HandlerFunc {
 		}
 
 		record.Status = result.Response.StatusCode
+		if record.Status >= http.StatusBadRequest {
+			// The upstream answered an error and the client is about to receive it
+			// unchanged. The record says why in the same terms as a refusal the
+			// gateway made itself: the upstream's own words, kept on the attempt,
+			// are the explanation an operator opens this record for.
+			record.ErrorCode, record.ErrorMessage = passthroughFailure(result.Trace, record.Status)
+		}
 		copyResponseHeaders(w.Header(), result.Response.Header)
 		w.Header().Set("X-Fluxgate-Upstream-Channel", result.Attempt.ChannelID)
 		events := strings.Contains(strings.ToLower(result.Response.Header.Get("Content-Type")), "text/event-stream")

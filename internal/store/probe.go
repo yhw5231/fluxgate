@@ -94,46 +94,84 @@ func (s *SQLiteStore) ListProbeRuns(ctx context.Context, limit int) ([]probe.Res
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM gateway_probe_runs`).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count probe results: %w", err)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT at, kind, channel_id, channel_name, model, status, latency_ms, ok, reason, detail
-		FROM gateway_probe_runs ORDER BY id DESC LIMIT ?`, limit)
+	rows, err := s.db.QueryContext(ctx, probeResultQuery+` ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, 0, fmt.Errorf("list probe results: %w", err)
 	}
 	defer rows.Close()
 	results := make([]probe.Result, 0, limit)
 	for rows.Next() {
-		var (
-			at                                  string
-			kind, channelID, channelName, model string
-			status                              int
-			latencyMS                           int64
-			ok                                  int
-			reason, detail                      string
-		)
-		if err := rows.Scan(&at, &kind, &channelID, &channelName, &model, &status, &latencyMS, &ok, &reason, &detail); err != nil {
-			return nil, 0, fmt.Errorf("scan probe result: %w", err)
-		}
-		parsed, err := time.Parse(time.RFC3339Nano, at)
+		result, err := scanProbeResult(rows)
 		if err != nil {
-			return nil, 0, fmt.Errorf("parse probe result time: %w", err)
+			return nil, 0, err
 		}
-		results = append(results, probe.Result{
-			At:          parsed.UTC(),
-			Kind:        probe.Kind(kind),
-			ChannelID:   channelID,
-			ChannelName: channelName,
-			Model:       model,
-			Status:      status,
-			LatencyMS:   latencyMS,
-			OK:          ok != 0,
-			Reason:      reason,
-			Detail:      detail,
-		})
+		results = append(results, result)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("iterate probe results: %w", err)
 	}
 	return results, total, nil
+}
+
+// probeResultQuery is the columns a stored probe result is read from, in the order
+// scanProbeResult expects them.
+const probeResultQuery = `SELECT at, kind, channel_id, channel_name, model, status, latency_ms, ok, reason, detail
+	FROM gateway_probe_runs`
+
+// scanProbeResult reads one stored probe result.
+func scanProbeResult(row rowScanner) (probe.Result, error) {
+	var (
+		at                                  string
+		kind, channelID, channelName, model string
+		status                              int
+		latencyMS                           int64
+		ok                                  int
+		reason, detail                      string
+	)
+	if err := row.Scan(&at, &kind, &channelID, &channelName, &model, &status, &latencyMS, &ok, &reason, &detail); err != nil {
+		return probe.Result{}, fmt.Errorf("scan probe result: %w", err)
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, at)
+	if err != nil {
+		return probe.Result{}, fmt.Errorf("parse probe result time: %w", err)
+	}
+	return probe.Result{
+		At:          parsed.UTC(),
+		Kind:        probe.Kind(kind),
+		ChannelID:   channelID,
+		ChannelName: channelName,
+		Model:       model,
+		Status:      status,
+		LatencyMS:   latencyMS,
+		OK:          ok != 0,
+		Reason:      reason,
+		Detail:      detail,
+	}, nil
+}
+
+// LatestProbeResults returns the newest recorded result for each line, keyed by
+// channel id. The list of lines a probe could ask is a live view of the
+// configuration; this is what says how each of those lines last answered, and it
+// must not depend on the newest records happening to include every line.
+func (s *SQLiteStore) LatestProbeResults(ctx context.Context) (map[string]probe.Result, error) {
+	rows, err := s.db.QueryContext(ctx, probeResultQuery+`
+		WHERE id IN (SELECT MAX(id) FROM gateway_probe_runs GROUP BY channel_id)`)
+	if err != nil {
+		return nil, fmt.Errorf("list latest probe results: %w", err)
+	}
+	defer rows.Close()
+	latest := make(map[string]probe.Result)
+	for rows.Next() {
+		result, err := scanProbeResult(rows)
+		if err != nil {
+			return nil, err
+		}
+		latest[result.ChannelID] = result
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate latest probe results: %w", err)
+	}
+	return latest, nil
 }
 
 // ClearProbeRuns empties the probe log, returning how many records it removed.

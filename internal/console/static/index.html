@@ -399,17 +399,50 @@
         <header class="panel-header">
           <div class="panel-title">
             <span class="title-tick" aria-hidden="true"></span>
-            <h2>账号探测</h2>
-            <span class="panel-meta" data-probes-meta></span>
+            <h2>可探测线路</h2>
+            <span class="panel-meta" data-probes-targets-meta></span>
           </div>
           <div class="panel-actions">
             <span class="panel-note">每 10 秒自动刷新 &middot; <span data-next-refresh>&mdash;</span></span>
           </div>
         </header>
-        <p class="panel-help">网关用线路自己的密钥问一道随机加法题，按上游的回答判断账号还能不能用：<strong>能回答</strong>说明账号可达，<strong>答对</strong>说明账号可用。三类时机：重启后核对全部线路（启动探测）、线路连续无调用超过间隔（空闲探测）、线路从冷却中被放出来（恢复探测）；也可以在下面手动触发。探测只记录事实，不会改变熔断状态——把线路恢复上线的仍然是冷却到期或「概览」页的恢复操作。</p>
+        <p class="panel-help">网关现在能核对这些线路：每条线路用自己的密钥、问它自己的一个模型。<strong>可探测</strong>指这条线路有启用的路由、有一个能发给上游的模型名；每条都可以单独再探测一次。冷却中或已停用的线路也列在这里（自动探测不会按空闲去问它，但手动探测正好用来确认它是否已经恢复）。</p>
         <div class="panel-toolbar">
           <button id="probes-run-all" class="btn btn-primary btn-small" type="button"><span class="btn-label">探测全部线路</span></button>
           <span class="panel-note" data-probes-schedule></span>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table" data-probes-targets-table>
+            <thead>
+              <tr>
+                <th>线路</th>
+                <th>探测模型</th>
+                <th>最近结果</th>
+                <th class="num" title="最近一次探测上游返回的 HTTP 状态码；0 表示没有回答。">状态</th>
+                <th class="num">耗时</th>
+                <th>最近探测</th>
+                <th class="actions"></th>
+              </tr>
+            </thead>
+            <tbody data-probes-targets-body></tbody>
+          </table>
+        </div>
+        <div class="empty-state" data-probes-targets-empty hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M21 3v6h-6M12 7v5l3 2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <p data-empty-text>没有可探测的线路。到「上游」页添加一个上游并选中模型，网关就会核对它的每个密钥。</p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="title-tick" aria-hidden="true"></span>
+            <h2>探测记录</h2>
+            <span class="panel-meta" data-probes-meta></span>
+          </div>
+        </header>
+        <p class="panel-help">网关用线路自己的密钥问一道随机四则运算题，按上游的回答判断账号还能不能用：<strong>能回答</strong>说明账号可达，<strong>答对</strong>说明账号可用。三类时机：重启后核对全部线路（启动探测）、线路连续无调用超过间隔（空闲探测）、线路从冷却中被放出来（恢复探测）；也可以在上面手动触发。探测只记录事实，不会改变熔断状态——把线路恢复上线的仍然是冷却到期或「概览」页的恢复操作。每次探测也会写进「请求记录」，和客户端请求放在一起看得到。</p>
+        <div class="panel-toolbar">
           <span class="panel-note" data-probes-retention></span>
           <button id="probes-clear" class="btn btn-ghost btn-small" type="button">清空记录</button>
         </div>
@@ -495,7 +528,7 @@
             <span class="panel-note">每 10 秒自动刷新 &middot; <span data-next-refresh>&mdash;</span></span>
           </div>
         </header>
-        <p class="panel-help">网关服务过的每个请求都记在这里：结果、走的哪条线路、上游返回的原文，以及每一次尝试的耗时。线路只记真正发过请求的线路，被熔断（冷却）跳过的线路不在其中。客户端只拿到状态码和错误码，<strong>上游到底说了什么只在这里</strong>，所以排查报错从这里开始。点开一行能看到每次尝试的明细。</p>
+        <p class="panel-help">网关服务过的每个请求都记在这里，包括网关自己的<strong>账号探测</strong>：结果、走的哪条线路、上游返回的原文，以及每一次尝试的耗时。线路只记真正发过请求的线路，被熔断（冷却）跳过的线路不在其中。客户端只拿到状态码和错误码，<strong>上游到底说了什么只在这里</strong>，所以排查报错从这里开始。点开一行能看到每次尝试的明细和完整的上游返回，展开后的「复制详情」把整段记录复制出来。</p>
         <div class="panel-toolbar">
           <button id="requests-failed" class="btn btn-ghost btn-small" type="button" aria-pressed="false">只看失败</button>
           <input id="requests-model" class="filter-input" type="search" placeholder="按模型筛选…" aria-label="按模型筛选">

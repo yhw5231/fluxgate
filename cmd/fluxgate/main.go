@@ -262,6 +262,10 @@ func run(parent context.Context, logger *slog.Logger) error {
 		StartedAt:           time.Now().UTC(),
 	}
 	gatewayAPI.SetConfiguration(configuration)
+	// A probe is a request the gateway made on its own, so the request log keeps it
+	// beside the traffic it stands in for: an operator hunting a broken account
+	// should find the check in the same list as the requests that failed on it.
+	probeService.RecordRun = gatewayAPI.RecordProbeRun
 	// A configuration written from the console is reloaded and installed here, so
 	// an added channel or a changed weight serves traffic immediately instead of
 	// at the next restart.

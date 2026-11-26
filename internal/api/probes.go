@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yhw5231/fluxgate/internal/domain"
 	"github.com/yhw5231/fluxgate/internal/probe"
 )
 
@@ -37,6 +38,9 @@ type ProbeService interface {
 	ProbeAllAsync(ctx context.Context) bool
 	// ProbeChannel probes every line of one upstream.
 	ProbeChannel(ctx context.Context, channelID string) []probe.Result
+	// Targets reports the lines that could be probed now, with the newest result
+	// recorded for each.
+	Targets(ctx context.Context) []probe.Target
 	// ListRuns returns the newest results first, with the total the log holds.
 	ListRuns(ctx context.Context, limit int) ([]probe.Result, int64, error)
 	// ClearRuns empties the log.
@@ -71,10 +75,19 @@ func (s *Server) handleProbes(w http.ResponseWriter, r *http.Request) {
 	if runs == nil {
 		runs = []probe.Result{}
 	}
+	// The targets are what the schedule could ask right now, each with the newest
+	// result recorded for it: the view says "these are the lines and models a probe
+	// can check, and this is how each last answered" instead of only listing checks
+	// that already happened.
+	targets := s.Probes.Targets(r.Context())
+	if targets == nil {
+		targets = []probe.Target{}
+	}
 	applied := s.currentPolicy().Probe
 	writeJSON(w, http.StatusOK, map[string]any{
-		"probes": runs,
-		"total":  total,
+		"probes":  runs,
+		"targets": targets,
+		"total":   total,
 		"retention": map[string]any{
 			"keep":  applied.Keep,
 			"count": total,
@@ -162,4 +175,56 @@ func (s *Server) handleProbeClear(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logConfigurationChange(r, "console_probe_log_cleared", "probes", 0)
 	writeJSON(w, http.StatusOK, map[string]any{"cleared": removed})
+}
+
+// RecordProbeRun stores one finished probe in the request log. A probe is a request
+// the gateway made on its own behalf, and 请求记录 is where an operator looks for
+// what the gateway did and when; leaving probes out of it would keep the checks
+// nobody asked for out of the one place that explains failures.
+func (s *Server) RecordProbeRun(result probe.Result) {
+	if s == nil || s.RequestLog == nil {
+		return
+	}
+	applied := s.currentPolicy().RequestLog
+	if !applied.Enabled {
+		return
+	}
+	attempt := domain.AttemptTrace{
+		Number:      1,
+		ChannelID:   result.ChannelID,
+		ChannelName: result.ChannelName,
+		Model:       result.Model,
+		StatusCode:  result.Status,
+		StartedAt:   result.At,
+		DurationMS:  result.LatencyMS,
+	}
+	if result.Status == 0 {
+		// The upstream never answered, so there is no body to quote: the transport
+		// error is the whole explanation.
+		attempt.Error = result.Detail
+	} else {
+		attempt.Response = result.Detail
+	}
+	record := domain.RequestRecord{
+		RequestID:  newRequestID(),
+		At:         result.At,
+		Method:     "PROBE",
+		Path:       "/management/probes/" + string(result.Kind),
+		Model:      result.Model,
+		Status:     result.Status,
+		DurationMS: result.LatencyMS,
+		Attempts:   []domain.AttemptTrace{attempt},
+		Source:     domain.RequestSourceProbe,
+	}
+	if !result.OK {
+		record.ErrorCode = result.Reason
+		record.ErrorMessage = result.Detail
+	}
+	// A probe outlives the request that may have triggered it — a sweep runs in the
+	// background — so the write is not tied to a caller's context.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.RequestLog.AppendRequestRecord(ctx, record, applied.Keep); err != nil {
+		s.logger().Warn("probe_request_log_write_failed", "error", err.Error())
+	}
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/yhw5231/fluxgate/internal/domain"
+	"github.com/yhw5231/fluxgate/internal/probe"
 	"github.com/yhw5231/fluxgate/internal/proxy"
 	"github.com/yhw5231/fluxgate/internal/router"
 	"github.com/yhw5231/fluxgate/internal/store"
@@ -334,5 +335,117 @@ func TestRequestLogUnavailableWithoutARecorder(t *testing.T) {
 	}
 	if response.body["error"] == nil {
 		t.Fatalf("body = %v, want an error payload", response.body)
+	}
+}
+
+// An upstream error the gateway relays to the client is recorded with its reason,
+// not only its status: the record's own columns say what went wrong, and the
+// upstream's words are there to be read and copied.
+func TestPassthroughUpstreamErrorIsRecordedWithItsReason(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"unsupported parameter: max_tokens"}}`))
+	}))
+	defer upstream.Close()
+
+	server, _ := requestLogServer(t, allowTestAuthentication(), domain.Channel{
+		ID: "line-one", Name: "relay", BaseURL: upstream.URL, APIKey: "sk-upstream", Enabled: true,
+	})
+	response := proxyRequest(server, `{"model":"gpt-4.1","max_tokens":32}`)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want the upstream's 400 relayed", response.StatusCode)
+	}
+
+	logged := callManagement(server, http.MethodGet, "/management/requests", "management-secret", nil)
+	records, _ := logged.body["requests"].([]any)
+	if len(records) != 1 {
+		t.Fatalf("records = %d, want the one request", len(records))
+	}
+	record, _ := records[0].(map[string]any)
+	if record["failed"] != true || record["status"] != float64(http.StatusBadRequest) {
+		t.Errorf("record = %v, want the relayed error", record)
+	}
+	if record["error_code"] != "upstream_rejected" {
+		t.Errorf("error code = %v, want upstream_rejected", record["error_code"])
+	}
+	message, _ := record["error_message"].(string)
+	if !strings.Contains(message, "unsupported parameter") {
+		t.Errorf("error message = %q, want the upstream's own words", message)
+	}
+	if record["source"] != domain.RequestSourceProxy {
+		t.Errorf("source = %v, want a client request", record["source"])
+	}
+	attempts, _ := record["attempts"].([]any)
+	if len(attempts) != 1 {
+		t.Fatalf("attempts = %d, want the one attempt", len(attempts))
+	}
+	first, _ := attempts[0].(map[string]any)
+	if !strings.Contains(first["response"].(string), "unsupported parameter") {
+		t.Errorf("attempt response = %v, want the upstream body", first["response"])
+	}
+}
+
+// A probe is a request the gateway made on its own, so the request log shows it
+// beside client traffic — same list, same detail, and the reason it failed.
+func TestProbeRunsAppearInTheRequestLog(t *testing.T) {
+	server, _ := requestLogServer(t, allowTestAuthentication())
+	at := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	server.RecordProbeRun(probe.Result{
+		At: at, Kind: probe.KindManual,
+		ChannelID: "12", ChannelName: "relay", Model: "gpt-6.1-sol",
+		Status: 400, LatencyMS: 1320, OK: false,
+		Reason: probe.ReasonBadStatus,
+		Detail: `the upstream answered HTTP 400: {"error":{"message":"Upstream request failed"}}`,
+	})
+	// A probe whose upstream answered but got the arithmetic wrong is a failure too,
+	// even though its status is a success.
+	server.RecordProbeRun(probe.Result{
+		At: at.Add(time.Minute), Kind: probe.KindIdle,
+		ChannelID: "13", ChannelName: "backup", Model: "claude-3",
+		Status: 200, LatencyMS: 84, OK: false,
+		Reason: probe.ReasonWrongAnswer,
+		Detail: "the answer \"42\" does not contain 43",
+	})
+
+	logged := callManagement(server, http.MethodGet, "/management/requests", "management-secret", nil)
+	records, _ := logged.body["requests"].([]any)
+	if len(records) != 2 {
+		t.Fatalf("records = %d, want the two probes", len(records))
+	}
+	record, _ := records[0].(map[string]any)
+	if record["source"] != domain.RequestSourceProbe || record["method"] != "PROBE" {
+		t.Errorf("record = %v, want a probe record", record)
+	}
+	if record["path"] != "/management/probes/idle" {
+		t.Errorf("path = %v, want the kind of check that ran", record["path"])
+	}
+	if record["model"] != "claude-3" || record["error_code"] != probe.ReasonWrongAnswer {
+		t.Errorf("record = %v, want the model and the reason", record)
+	}
+	if record["failed"] != true {
+		t.Errorf("record = %v, want a wrong answer counted as a failure", record)
+	}
+	if key, _ := record["key_id"].(float64); key != 0 {
+		t.Errorf("key_id = %v, want no downstream key for a probe", record["key_id"])
+	}
+
+	failed := callManagement(server, http.MethodGet, "/management/requests?failed=1", "management-secret", nil)
+	if failedRecords, _ := failed.body["requests"].([]any); len(failedRecords) != 2 {
+		t.Errorf("failed records = %d, want both probes", failedRecords)
+	}
+
+	newest, _ := records[1].(map[string]any)
+	attempts, _ := newest["attempts"].([]any)
+	if len(attempts) != 1 {
+		t.Fatalf("attempts = %d, want the line the probe asked", len(attempts))
+	}
+	attempt, _ := attempts[0].(map[string]any)
+	if attempt["channel_name"] != "relay" || attempt["status"] != float64(http.StatusBadRequest) {
+		t.Errorf("attempt = %v, want the line and its answer", attempt)
+	}
+	if !strings.Contains(attempt["response"].(string), "Upstream request failed") {
+		t.Errorf("attempt response = %v, want the upstream's own words", attempt["response"])
 	}
 }

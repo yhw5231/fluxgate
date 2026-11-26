@@ -1,4 +1,4 @@
-﻿/* ============================================================
+/* ============================================================
    Fluxgate Console — 日间/夜间两套配色
    Self-contained: no external fonts or assets (CSP: self only)
 
@@ -867,6 +867,27 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   white-space: nowrap;
   vertical-align: bottom;
 }
+
+/* 展开的记录里，上游返回要能整段读：一行截断是表格列宽的限制，展开后没有这个限制，
+ * 所以按原文换行，方便核对，也方便手动选中。 */
+.detail-table .request-response {
+  display: block;
+  max-width: 100%;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.55;
+}
+
+/* 复制按钮跟在被复制的内容旁边，不跟内容抢宽度。 */
+.copy-button {
+  margin-left: 8px;
+  padding: 2px 8px;
+  font-size: 11px;
+  vertical-align: middle;
+}
+
+/* 结果列：状态徽标和「探测」标签并排，一眼分得清客户端请求和网关自己的检查。 */
+.result-cell { display: inline-flex; align-items: center; gap: 6px; }
 
 /* ===== Filter input ===== */
 .filter-input {

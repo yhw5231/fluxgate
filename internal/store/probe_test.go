@@ -120,3 +120,36 @@ func TestProbeSchemaIsIdempotent(t *testing.T) {
 		t.Fatalf("EnsureProbeSchema() second run error = %v", err)
 	}
 }
+
+// The newest result per line is what the console shows beside a line it could
+// probe, and it does not depend on the newest records happening to include every
+// line: a line probed once an hour ago still has its answer.
+func TestLatestProbeResultsKeepsTheNewestPerLine(t *testing.T) {
+	store := prepareProbeStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	writes := []probe.Result{
+		{At: base, ChannelID: "1", ChannelName: "relay", Model: "gpt-4.1", Status: 401, Reason: probe.ReasonAuthRejected},
+		{At: base.Add(time.Minute), ChannelID: "2", ChannelName: "backup", Model: "gpt-4.1", Status: 200, OK: true, Reason: probe.ReasonOK},
+		{At: base.Add(2 * time.Minute), ChannelID: "1", ChannelName: "relay", Model: "gpt-4.1", Status: 200, OK: true, Reason: probe.ReasonOK},
+	}
+	for _, result := range writes {
+		if err := store.AppendProbeRun(ctx, result, 100); err != nil {
+			t.Fatalf("AppendProbeRun() error = %v", err)
+		}
+	}
+
+	latest, err := store.LatestProbeResults(ctx)
+	if err != nil {
+		t.Fatalf("LatestProbeResults() error = %v", err)
+	}
+	if len(latest) != 2 {
+		t.Fatalf("latest = %#v, want one per line", latest)
+	}
+	if result := latest["1"]; !result.OK || !result.At.Equal(base.Add(2*time.Minute)) {
+		t.Errorf("line 1 = %#v, want its newest result", result)
+	}
+	if result := latest["2"]; !result.OK || !result.At.Equal(base.Add(time.Minute)) {
+		t.Errorf("line 2 = %#v, want the only result it has", result)
+	}
+}

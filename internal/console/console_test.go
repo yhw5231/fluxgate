@@ -1029,3 +1029,62 @@ func TestConsoleCarriesThePinProbeActions(t *testing.T) {
 		}
 	}
 }
+
+// 探测页先回答「现在能核对哪些线路、每条线路问哪个模型」：这张表读的是网关的当前
+// 配置，记录表读的是历史结果。两张表都在同一页，操作者不用去别处拼出「这条线路到底
+// 能不能探测」。
+func TestConsoleCarriesTheProbeTargets(t *testing.T) {
+	page := consoleAsset(t, "/console/")
+	for _, wanted := range []string{
+		// 表格、表体和空状态都要在脚本跑起来之前就存在。
+		`data-probes-targets-table`,
+		`data-probes-targets-body`,
+		`data-probes-targets-empty`,
+		// 表头说清这一列是「探测模型」，以及线路清单从哪里来。
+		`<th>探测模型</th>`,
+	} {
+		if !strings.Contains(page, wanted) {
+			t.Errorf("console page is missing %q", wanted)
+		}
+	}
+
+	script := consoleScript(t)
+	for _, wanted := range []string{
+		"renderProbeTargets",
+		"state.probes.targets",
+		// 同一个上游的几个密钥是几条不同的线路，名字一样，只有密钥标签分得开。
+		"lineKeyLabel(target.channel_id)",
+		// 冷却中的线路照样列出来，只是带一个徽标：手动探测正是用它确认恢复。
+		"target.held",
+		"冷却中",
+		// 没有结果和「上游没回答」是两件事：前者说还没有探测，后者是 0。
+		"还没有探测",
+	} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("console script is missing %q", wanted)
+		}
+	}
+}
+
+// 请求记录里既有客户端请求，也有网关自己的账号探测；错误要能展开读全文，也要能
+// 整段复制出来——复制是排查时唯一不必手抄表单的动作。
+func TestConsoleRequestRecordsLabelProbesAndCopyContent(t *testing.T) {
+	script := consoleScript(t)
+	for _, wanted := range []string{
+		// 探测记录带标签，不会被当成客户端请求。
+		"record.source === 'probe'",
+		"requestResultCell",
+		"这是网关自己的账号探测",
+		// 展开后的详情整段可复制，单个上游返回也能单独复制。
+		"copyRequestRecord",
+		"复制详情",
+		"copyCellButton",
+		"writeClipboard(lines.join",
+		// 探测记录没有客户端密钥，不能显示成 #0。
+		"账号探测",
+	} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("console script is missing %q", wanted)
+		}
+	}
+}

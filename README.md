@@ -343,8 +343,8 @@ is placeable without reading the whole sidebar. On a narrow screen the sidebar
 becomes a wrapping row above the content, so a table keeps the width it needs.
 
 The views are 概览 (the live dashboard), 用量 (what the served requests cost in
-tokens, by model, upstream, and client key), 探测 (whether each account still
-works), 上游 (upstreams), 路由 (the routing table
+tokens, by model, upstream, and client key), 探测 (the lines that can be checked, each
+with its model and newest result), 上游 (upstreams), 路由 (the routing table
 the gateway derived), 渠道固定 (the internal providers a model is pinned to),
 请求记录 (the record of served requests), 客户端密钥 (client
 keys), 代理 (proxy profiles), 代理池 (IPv6 proxy pools and the leases the gateway
@@ -818,6 +818,21 @@ redacted if the upstream echoed it). No upstream credential appears anywhere in 
 record: the line an attempt ran on identifies the key, and the gateway is the only party
 that ever holds the secret.
 
+An upstream error the gateway relays unchanged — a 400 or a 5xx that reaches the client as
+itself — is recorded with its reason too, not only its status: `upstream_rejected` for a
+4xx and `upstream_error` for a 5xx, with the upstream's own words in the message and on the
+attempt. The console shows a record expanded with that text in full, so it can be read
+without a tooltip, and both the whole record and a single attempt's upstream response can
+be copied in one click.
+
+`source` names what made each request: `proxy` for a client, `probe` for the gateway's own
+account probe. A probe is a request the gateway made on its own behalf, so it is logged
+here beside the traffic it stands in for — a failing check is looked up in the same list as
+the requests that failed on the same line. A probe record has no client key, carries the
+reason it failed (`bad_status`, `wrong_answer`, `rate_limited`, …) and the attempt that
+went out, and is counted as a failure when its upstream answered with the wrong result even
+though that status was a 200. `failed=1` includes those.
+
 The answer also carries `retention` — whether records are being kept and how many — so a
 view can say how far back the log reaches rather than implying it holds everything ever
 served. `DELETE /management/requests` empties the log.
@@ -952,12 +967,22 @@ a line back into service is 恢复 (the console's manual clear) or its cooldown
 expiring. A probe that found the account healthy and silently cleared the circuit
 would hide the failure that caused it.
 
+The console's 探测 page opens with the lines a probe could ask **right now** — the live
+configuration, not the history: each line, the model the probe would send to it, whether it
+is held out of rotation (still askable by hand), and the newest result recorded for it, or
+"还没有探测" when it has never been asked. One line can be probed again from that list at
+any time. Every finished probe is also written to the request log (`source: "probe"`), so
+the same check is readable beside the traffic it stands in for.
+
 Results are kept in `gateway_probe_runs`, bounded to the newest records, and shown
 under 探测. `GET /management/probes` answers the record plus the schedule in force:
 
 | Query | Meaning |
 | --- | --- |
 | `limit` | How many results to return, newest first. Default `100`, at most `1000`. |
+
+The answer carries `probes` (the recorded results), `targets` (the lines a probe could ask,
+each with its model and its newest result), `retention`, and `policy`.
 
 `POST /management/probes/run` asks for a check now. With `{"channel_id": "12"}` it
 probes that upstream and answers with the results; with no body it starts a sweep of

@@ -88,6 +88,29 @@ type RunStore interface {
 	ListProbeRuns(ctx context.Context, limit int) ([]Result, int64, error)
 }
 
+// LatestResultStore is the optional part of a run store that can answer the newest
+// result recorded for each line. The console's target list shows it beside the line
+// it belongs to, and a store that cannot answer simply leaves that column empty.
+type LatestResultStore interface {
+	LatestProbeResults(ctx context.Context) (map[string]Result, error)
+}
+
+// Target is one line the schedule can probe: where a question would go, the model
+// it would ask about, and the newest result recorded for that line. The console's
+// 探测 view lists these, so an operator sees what the gateway can check and how each
+// line last answered, and not only the checks that already happened.
+type Target struct {
+	ChannelID   string `json:"channel_id"`
+	ChannelName string `json:"channel_name"`
+	Model       string `json:"model"`
+	// Held reports that the line is out of rotation right now: its circuit is
+	// cooling down or disabled. The schedule does not probe such a line for
+	// idleness, and a manual probe is how an operator asks anyway.
+	Held bool `json:"held,omitempty"`
+	// Last is the newest result recorded for this line, absent until it is probed.
+	Last *Result `json:"last,omitempty"`
+}
+
 // Service schedules and runs probes for the gateway.
 type Service struct {
 	// Prober sends one probe. It is required.
@@ -103,6 +126,11 @@ type Service struct {
 	Store  RunStore
 	Logger *slog.Logger
 	Now    func() time.Time
+	// RecordRun is told about every finished probe, which is how a probe reaches the
+	// request log: a probe is a request the gateway made on its own, and an operator
+	// hunting a broken account should find it beside the traffic it stands in for.
+	// It is called from the probe workers, so it must be safe to call concurrently.
+	RecordRun func(Result)
 
 	settings atomic.Pointer[Settings]
 	// activity is when each line last carried traffic, which is the clock the idle
@@ -354,6 +382,62 @@ func (s *Service) heldLines(lines []Line, now time.Time, settings Settings) map[
 	return held
 }
 
+// Targets reports the lines the schedule could probe right now, each with the
+// newest result recorded for it. The list is a live view of the configuration, so a
+// line added from the console appears before it is ever probed — with no result yet.
+func (s *Service) Targets(ctx context.Context) []Target {
+	if s == nil {
+		return nil
+	}
+	lines := s.lines()
+	if len(lines) == 0 {
+		return nil
+	}
+	latest := s.latestResults(ctx)
+	held := s.heldLines(lines, s.now(), s.currentSettings())
+	targets := make([]Target, 0, len(lines))
+	for _, line := range lines {
+		target := Target{
+			ChannelID:   line.ChannelID,
+			ChannelName: line.ChannelName,
+			Model:       line.Model,
+			Held:        held[line.ChannelID],
+		}
+		if result, known := latest[line.ChannelID]; known {
+			// The stored result is copied: the map belongs to the reader, and the
+			// answer outlives the call that produced it.
+			stored := result
+			target.Last = &stored
+		}
+		targets = append(targets, target)
+	}
+	sort.SliceStable(targets, func(i, j int) bool {
+		if targets[i].ChannelName != targets[j].ChannelName {
+			return targets[i].ChannelName < targets[j].ChannelName
+		}
+		return targets[i].Model < targets[j].Model
+	})
+	return targets
+}
+
+// latestResults reads the newest result recorded for each line. A store that cannot
+// answer it is not an error: the target list still says which lines can be asked.
+func (s *Service) latestResults(ctx context.Context) map[string]Result {
+	reader, ok := s.Store.(LatestResultStore)
+	if !ok || reader == nil {
+		return map[string]Result{}
+	}
+	latest, err := reader.LatestProbeResults(ctx)
+	if err != nil {
+		s.logger().Warn("probe_latest_unreadable", "error", err.Error())
+		return map[string]Result{}
+	}
+	if latest == nil {
+		return map[string]Result{}
+	}
+	return latest
+}
+
 // DiscoverPin asks one upstream model which internal providers it has.
 func (s *Service) DiscoverPin(ctx context.Context, line Line) PinDiscovery {
 	if s == nil || s.Prober == nil {
@@ -534,6 +618,12 @@ func (s *Service) record(ctx context.Context, result Result, settings Settings) 
 		"status", result.Status,
 		"latency_ms", result.LatencyMS,
 	)
+	// The request log is told about every probe, whether or not this gateway keeps
+	// its own probe records: it is the one place that shows what the gateway did
+	// and when, and a check it ran on its own belongs there beside client traffic.
+	if s.RecordRun != nil {
+		s.RecordRun(result)
+	}
 	if s.Store == nil {
 		return
 	}

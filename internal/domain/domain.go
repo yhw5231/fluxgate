@@ -599,6 +599,16 @@ func (t RequestTrace) LastFailure() (AttemptTrace, bool) {
 	return AttemptTrace{}, false
 }
 
+// Request sources, as the request log records them. A record names what made the
+// request: a client calling the gateway, or the gateway's own account probe
+// checking a credential. The view uses it to tell traffic from checks.
+const (
+	// RequestSourceProxy is a request a client made through the gateway.
+	RequestSourceProxy = "proxy"
+	// RequestSourceProbe is a probe the account health schedule made on its own.
+	RequestSourceProbe = "probe"
+)
+
 // RequestRecord is one downstream request as the request log keeps it: what was
 // asked for, which lines were tried, what the upstreams answered, and how the
 // request ended. It names the client key by its row rather than by its secret,
@@ -622,11 +632,17 @@ type RequestRecord struct {
 	ErrorMessage string
 	DurationMS   int64
 	Attempts     []AttemptTrace
+	// Source is one of the RequestSource constants. An empty value means a client
+	// request, which is what every record was before probes were logged here too.
+	Source string
 }
 
-// Failed reports whether the record describes a request that was not served.
+// Failed reports whether the record describes a request that was not served. A
+// record that carries an error code is a failure too, even when the status alone
+// would not say so: a probe whose upstream answered 200 with the wrong result is
+// exactly that case.
 func (r RequestRecord) Failed() bool {
-	return r.Status == 0 || r.Status >= 400
+	return r.Status == 0 || r.Status >= 400 || strings.TrimSpace(r.ErrorCode) != ""
 }
 
 // Failure captures a failed upstream attempt without exposing it to the downstream client.

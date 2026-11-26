@@ -41,15 +41,22 @@ const gatewayRequestLogDDL = `CREATE TABLE IF NOT EXISTS gateway_request_log (
 	error_message TEXT NOT NULL DEFAULT '',
 	duration_ms INTEGER NOT NULL DEFAULT 0,
 	attempts INTEGER NOT NULL DEFAULT 0,
-	detail TEXT NOT NULL DEFAULT ''
+	detail TEXT NOT NULL DEFAULT '',
+	source TEXT NOT NULL DEFAULT 'proxy'
 )`
 
 // EnsureRequestLogSchema creates the request log on a database that does not have
-// it yet. It is called at startup, so the console's request view works from the
-// first request on.
+// it yet, and gives a table created before probes were logged the column that says
+// what made each request. It is called at startup, so the console's request view
+// works from the first request on.
 func (s *SQLiteStore) EnsureRequestLogSchema(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, gatewayRequestLogDDL); err != nil {
 		return fmt.Errorf("create gateway_request_log: %w", err)
+	}
+	// A database created before probes were logged has no source column, and every
+	// record it holds was a client request.
+	if err := s.addColumnIfMissing(ctx, "gateway_request_log", "source", "TEXT NOT NULL DEFAULT 'proxy'"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -70,8 +77,8 @@ func (s *SQLiteStore) AppendRequestRecord(ctx context.Context, record domain.Req
 	defer s.mu.Unlock()
 	if _, err := s.db.ExecContext(ctx, `INSERT INTO gateway_request_log (
 		request_id, created_at, method, path, client_ip, key_id, key_name, model,
-		stream, status, error_code, error_message, duration_ms, attempts, detail
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		stream, status, error_code, error_message, duration_ms, attempts, detail, source
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		strings.TrimSpace(record.RequestID),
 		createdAt.UTC().Format(time.RFC3339Nano),
 		record.Method,
@@ -87,6 +94,7 @@ func (s *SQLiteStore) AppendRequestRecord(ctx context.Context, record domain.Req
 		record.DurationMS,
 		len(record.Attempts),
 		string(detail),
+		requestSource(record.Source),
 	); err != nil {
 		return fmt.Errorf("store request record: %w", err)
 	}
@@ -149,7 +157,7 @@ func (s *SQLiteStore) ListRequestRecords(ctx context.Context, filter RequestLogF
 
 	where, args := requestLogWhere(filter)
 	query := `SELECT id, request_id, created_at, method, path, client_ip, key_id, key_name, model,
-		stream, status, error_code, error_message, duration_ms, detail FROM gateway_request_log` +
+		stream, status, error_code, error_message, duration_ms, detail, source FROM gateway_request_log` +
 		where + " ORDER BY id DESC LIMIT ? OFFSET ?"
 	args = append(args, limit, offset)
 
@@ -194,8 +202,10 @@ func requestLogWhere(filter RequestLogFilter) (string, []any) {
 	}
 	if filter.FailedOnly {
 		// A request that never reached an upstream carries no status at all and is
-		// a failure the operator needs to see just as much as a 502.
-		clauses = append(clauses, "(status = 0 OR status >= 400)")
+		// a failure the operator needs to see just as much as a 502. So is a record
+		// that carries an error code with a served status: a probe whose upstream
+		// answered 200 with the wrong result is one.
+		clauses = append(clauses, "(status = 0 OR status >= 400 OR error_code <> '')")
 	}
 	if model := strings.TrimSpace(filter.Model); model != "" {
 		clauses = append(clauses, "model = ? COLLATE NOCASE")
@@ -232,7 +242,7 @@ func scanRequestRecord(row rowScanner) (domain.RequestRecord, error) {
 	)
 	if err := row.Scan(&record.ID, &record.RequestID, &createdAt, &record.Method, &record.Path,
 		&record.ClientIP, &record.KeyID, &record.KeyName, &record.Model, &stream, &record.Status,
-		&record.ErrorCode, &record.ErrorMessage, &record.DurationMS, &detail); err != nil {
+		&record.ErrorCode, &record.ErrorMessage, &record.DurationMS, &detail, &record.Source); err != nil {
 		return domain.RequestRecord{}, fmt.Errorf("scan request record: %w", err)
 	}
 	record.Stream = stream != 0
@@ -258,4 +268,15 @@ func attemptsOf(record domain.RequestRecord) []domain.AttemptTrace {
 		return []domain.AttemptTrace{}
 	}
 	return record.Attempts
+}
+
+// requestSource normalizes what made a request. An empty value is a client request,
+// which is what every record written before this column existed was.
+func requestSource(source string) string {
+	switch strings.TrimSpace(source) {
+	case domain.RequestSourceProbe:
+		return domain.RequestSourceProbe
+	default:
+		return domain.RequestSourceProxy
+	}
 }

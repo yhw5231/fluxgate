@@ -21,6 +21,7 @@ type fakeProbes struct {
 	runs    []probe.Result
 	allRuns int
 	results []probe.Result
+	targets []probe.Target
 	channel string
 	busy    bool
 	cleared int64
@@ -62,6 +63,13 @@ func (f *fakeProbes) ProbeChannel(_ context.Context, channelID string) []probe.R
 		}
 	}
 	return selected
+}
+
+// Targets answers the lines this fake could probe, with their newest results.
+func (f *fakeProbes) Targets(context.Context) []probe.Target {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]probe.Target(nil), f.targets...)
 }
 
 func (f *fakeProbes) ListRuns(_ context.Context, limit int) ([]probe.Result, int64, error) {
@@ -127,6 +135,14 @@ func TestProbesEndpointReportsWhatWasFound(t *testing.T) {
 			Reason:      probe.ReasonOK,
 		}},
 		allRuns: 1,
+		targets: []probe.Target{
+			{ChannelID: "12", ChannelName: "relay", Model: "gpt-4.1", Last: &probe.Result{
+				At: time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC), ChannelID: "12", OK: true, Reason: probe.ReasonOK,
+			}},
+			// A line that can be asked but is held out of rotation right now, and one
+			// that has never been probed.
+			{ChannelID: "13", ChannelName: "backup", Model: "claude-3", Held: true},
+		},
 	}
 	server := probeServer(t, service)
 
@@ -140,6 +156,7 @@ func TestProbesEndpointReportsWhatWasFound(t *testing.T) {
 
 	var answer struct {
 		Probes    []probe.Result `json:"probes"`
+		Targets   []probe.Target `json:"targets"`
 		Total     int64          `json:"total"`
 		Retention map[string]any `json:"retention"`
 		Policy    map[string]any `json:"policy"`
@@ -152,6 +169,18 @@ func TestProbesEndpointReportsWhatWasFound(t *testing.T) {
 	}
 	if answer.Probes[0].ChannelName != "relay" || !answer.Probes[0].OK {
 		t.Fatalf("probe = %#v", answer.Probes[0])
+	}
+	// The target list travels with the records, so the view can say which lines could
+	// be probed, with which model, and how each last answered.
+	if len(answer.Targets) != 2 {
+		t.Fatalf("targets = %#v, want the lines a probe could ask", answer.Targets)
+	}
+	if answer.Targets[0].ChannelID != "12" || answer.Targets[0].Model != "gpt-4.1" ||
+		answer.Targets[0].Last == nil || !answer.Targets[0].Last.OK {
+		t.Fatalf("first target = %#v, want the probed line with its newest result", answer.Targets[0])
+	}
+	if !answer.Targets[1].Held || answer.Targets[1].Last != nil {
+		t.Fatalf("second target = %#v, want the held line with no result yet", answer.Targets[1])
 	}
 	if answer.Retention["keep"] == nil {
 		t.Fatalf("retention = %#v, want the configured bound", answer.Retention)

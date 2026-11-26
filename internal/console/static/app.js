@@ -91,8 +91,8 @@
     // usage holds the token accounting over the window the operator picked. It is
     // read on its own so a usage refresh never waits on the configuration.
     usage: { window: '7d', summary: null, error: null },
-    // probes holds what the account health checks found, newest first.
-    probes: { runs: [], total: 0, retention: null, policy: null, error: null, running: false },
+    // probes holds the lines a probe could ask, and what the probes found.
+    probes: { targets: [], runs: [], total: 0, retention: null, policy: null, error: null, running: false },
     // poolLeases holds the leases the gateway holds from its pools.
     poolLeases: { assignments: [], pools: [], sites: {}, error: null },
     // revealedKeys holds the client keys an operator asked to see, by row id.
@@ -191,8 +191,13 @@
       els.usageTables[table.getAttribute('data-usage-table')] = table.querySelector('tbody');
     });
 
-    // The probe view: the kind of each check, what it found, and the two actions
-    // (a sweep now, and one line again).
+    // The probe view: which lines could be asked and how each last answered, the
+    // kind of each check that ran, and the two actions (a sweep now, and one line
+    // again).
+    els.probesTargetsMeta = document.querySelector('[data-probes-targets-meta]');
+    els.probesTargetsBody = document.querySelector('[data-probes-targets-body]');
+    els.probesTargetsEmpty = document.querySelector('[data-probes-targets-empty]');
+    els.probesTargetsTable = document.querySelector('[data-probes-targets-table]');
     els.probesMeta = document.querySelector('[data-view-panel="probes"] [data-probes-meta]');
     els.probesSchedule = document.querySelector('[data-probes-schedule]');
     els.probesRetention = document.querySelector('[data-probes-retention]');
@@ -2756,7 +2761,7 @@
       timeCell.appendChild(clock);
       row.appendChild(timeCell);
 
-      cell(row, requestStatusBadge(record));
+      cell(row, requestResultCell(record));
       cell(row, record.model ? element('span', 'mono', record.model) : element('span', 'cell-muted', '—'));
       cell(row, requestLineSummary(record.attempts));
       cell(row, String(record.attempts ? record.attempts.length : 0), 'num');
@@ -2961,6 +2966,7 @@
 
   function applyProbes(result) {
     if (result && result.ok && result.body) {
+      state.probes.targets = Array.isArray(result.body.targets) ? result.body.targets : [];
       state.probes.runs = Array.isArray(result.body.probes) ? result.body.probes : [];
       state.probes.total = number(result.body.total);
       state.probes.retention = result.body.retention || null;
@@ -2968,6 +2974,7 @@
       state.probes.error = null;
       return;
     }
+    state.probes.targets = [];
     state.probes.runs = [];
     state.probes.total = 0;
     state.probes.retention = null;
@@ -3009,6 +3016,67 @@
     if (paragraph) { paragraph.textContent = message; }
   }
 
+  /* renderProbeTargets lays out the lines a probe could ask right now. The list is
+   * the live configuration, not the history: a line appears before it is ever
+   * probed, with its last answer beside it once there is one. The model shown is the
+   * one the probe would send, which is what makes "this line can be checked" a
+   * concrete claim rather than a list of names. */
+  function renderProbeTargets() {
+    if (!els.probesTargetsBody) { return; }
+    var targets = state.probes.targets || [];
+    els.probesTargetsBody.textContent = '';
+    if (els.probesTargetsMeta) {
+      els.probesTargetsMeta.textContent = targets.length === 0
+        ? '暂无可探测线路'
+        : '共 ' + targets.length + ' 条可探测线路';
+    }
+    if (targets.length === 0) {
+      if (els.probesTargetsTable) { els.probesTargetsTable.hidden = true; }
+      if (els.probesTargetsEmpty) { els.probesTargetsEmpty.hidden = false; }
+      return;
+    }
+    if (els.probesTargetsTable) { els.probesTargetsTable.hidden = false; }
+    if (els.probesTargetsEmpty) { els.probesTargetsEmpty.hidden = true; }
+
+    targets.forEach(function (target) {
+      var row = document.createElement('tr');
+
+      var nameCell = document.createElement('td');
+      nameCell.appendChild(element('span', 'cell-strong', text(target.channel_name, '#' + target.channel_id)));
+      // 同一个上游的几个密钥是几条不同的线路，名字一样，只有密钥标签分得开。
+      nameCell.appendChild(element('span', 'cell-muted', lineKeyLabel(target.channel_id)));
+      if (target.held) {
+        var held = badge('冷却中', 'warning');
+        held.title = '这条线路正在冷却或已被停用：自动探测不会按空闲去问它，手动探测仍然可以。';
+        nameCell.appendChild(document.createTextNode(' '));
+        nameCell.appendChild(held);
+      }
+      row.appendChild(nameCell);
+
+      cell(row, element('span', 'mono', text(target.model, '—')));
+
+      var last = target.last || null;
+      cell(row, last ? probeBadge(last) : element('span', 'cell-muted', '还没有探测'));
+      // 0 是「上游没有回答」，不是没有记录：没有探测过的那一格才是「—」。
+      cell(row, last ? String(number(last.status)) : '—', 'num');
+      cell(row, last ? formatMilliseconds(number(last.latency_ms)) : '—', 'num');
+      var when = element('span', 'cell-muted', last ? formatClock(last.at) : '—');
+      if (last) { when.title = formatTimestamp(last.at); }
+      cell(row, when);
+
+      var actions = document.createElement('td');
+      actions.className = 'actions';
+      var button = element('button', 'btn btn-ghost btn-small', '再探测');
+      button.type = 'button';
+      button.setAttribute('data-probe-channel', target.channel_id || '');
+      if (!target.channel_id) { button.disabled = true; }
+      actions.appendChild(button);
+      row.appendChild(actions);
+
+      els.probesTargetsBody.appendChild(row);
+    });
+  }
+
   function renderProbes() {
     if (!els.probesBody) { return; }
     var runs = state.probes.runs;
@@ -3019,6 +3087,7 @@
     els.probesRetention.textContent = state.probes.retention
       ? '保留最近 ' + formatTokens(state.probes.retention.keep) + ' 条'
       : '';
+    renderProbeTargets();
 
     els.probesBody.textContent = '';
     if (state.probes.error) {
@@ -3490,6 +3559,21 @@
     return node;
   }
 
+  /* requestResultCell is the result column: the status, plus what made the request
+   * when it was not a client. A probe is the gateway's own check, and reading its
+   * record as a client request would mislead whoever is looking for a user's
+   * failure. */
+  function requestResultCell(record) {
+    var node = element('span', 'result-cell');
+    node.appendChild(requestStatusBadge(record));
+    if (record.source === 'probe') {
+      var probe = tag('探测');
+      probe.title = '这是网关自己的账号探测，不是客户端请求。';
+      node.appendChild(probe);
+    }
+    return node;
+  }
+
   /* requestLineSummary is the failover path of a request, in the order it was
    * walked: the upstream it was first sent to, then every upstream it was retried
    * on after that. Keys are deliberately not part of it — which key carried an
@@ -3520,6 +3604,8 @@
   function requestNote(record) {
     var message = String(record.error_message || '').trim();
     if (message === '') {
+      // 「已转发」说的是客户端请求被送出去了；探测没有转发可言，正常就是正常。
+      if (record.source === 'probe') { return element('span', 'cell-muted', '正常'); }
       return element('span', 'cell-muted', record.failed ? '—' : '已转发');
     }
     var node = element('span', 'cell-muted request-note', message);
@@ -3528,19 +3614,71 @@
   }
 
   /* requestDetail is what an expanded request shows: the facts that identify it,
-   * and every attempt it made in the order it made them. */
+   * every attempt it made in the order it made them, and the one action an operator
+   * needs from a record — copying it out whole. */
   function requestDetail(record) {
     var wrapper = element('div', 'detail-panel');
     var facts = element('div', 'detail-facts');
     facts.appendChild(detailFact('请求 ID', text(record.request_id)));
-    facts.appendChild(detailFact('客户端密钥', record.key_name || ('#' + number(record.key_id))));
+    if (record.source === 'probe') {
+      // A probe carries no client key: saying "#0" would suggest one.
+      facts.appendChild(detailFact('来源', '账号探测'));
+    } else {
+      facts.appendChild(detailFact('客户端密钥', record.key_name || ('#' + number(record.key_id))));
+    }
     if (record.client_ip) { facts.appendChild(detailFact('来源', record.client_ip)); }
     facts.appendChild(detailFact('接口', text(record.path)));
     if (record.stream) { facts.appendChild(detailFact('流式', '是')); }
     if (record.error_code) { facts.appendChild(detailFact('错误码', record.error_code)); }
+    var copy = element('button', 'btn btn-ghost btn-small copy-button', '复制详情');
+    copy.type = 'button';
+    copy.title = '把这条记录整段复制到剪贴板：ID、接口、错误、每次尝试和上游返回。';
+    copy.addEventListener('click', function () { copyRequestRecord(record); });
+    facts.appendChild(copy);
     wrapper.appendChild(facts);
     wrapper.appendChild(requestAttemptTable(record.attempts || []));
     return wrapper;
+  }
+
+  /* copyRequestRecord puts one record on the clipboard as text, which is what an
+   * operator pastes into a report or a chat. The upstream's own words are the part
+   * that matters, so they travel with it rather than being left to a screenshot. */
+  function copyRequestRecord(record) {
+    var lines = [];
+    lines.push('请求 ID: ' + text(record.request_id));
+    lines.push('时间: ' + formatTimestamp(record.at));
+    lines.push('来源: ' + (record.source === 'probe' ? '账号探测' : '客户端请求'));
+    if (record.source !== 'probe') {
+      lines.push('客户端密钥: ' + (record.key_name || ('#' + number(record.key_id))));
+    }
+    lines.push('接口: ' + text(record.path) + (record.model ? ' · ' + record.model : ''));
+    lines.push('状态: ' + number(record.status) + ' · 耗时 ' + formatMilliseconds(record.duration_ms));
+    if (record.error_code) { lines.push('错误码: ' + record.error_code); }
+    if (record.error_message) { lines.push('错误: ' + record.error_message); }
+    var attempts = record.attempts || [];
+    if (attempts.length > 0) {
+      lines.push('尝试:');
+      attempts.forEach(function (attempt) {
+        var status = number(attempt.status);
+        var line = '  #' + number(attempt.number) + ' ' +
+          text(attempt.channel_name, '#' + attempt.channel_id) + ' · ' +
+          text(attempt.model, '—') + ' · ' +
+          (status === 0 ? '连接失败' : 'HTTP ' + status) + ' · ' +
+          formatMilliseconds(attempt.duration_ms);
+        lines.push(line);
+        var response = String(attempt.response || '').trim();
+        if (response !== '') { lines.push('    上游返回: ' + response); }
+        var failure = String(attempt.error || '').trim();
+        if (failure !== '') { lines.push('    错误: ' + failure); }
+      });
+    }
+    writeClipboard(lines.join('\n'), function (copied) {
+      if (copied) {
+        showNotice('已复制请求 ' + text(record.request_id) + ' 的详情。');
+        return;
+      }
+      showBanner('无法自动复制', '浏览器不允许自动写入剪贴板，请展开记录后手动选中内容复制。');
+    });
   }
 
   function detailFact(label, value) {
@@ -3622,24 +3760,47 @@
     return '#' + id;
   }
 
+  /* attemptResponseCell shows what the upstream said, in full and with a copy
+   * button. This text is the reason the record exists: the client never sees it,
+   * and it is what an operator pastes into a report. */
   function attemptResponseCell(attempt) {
     var td = document.createElement('td');
     var response = String(attempt.response || '').trim();
     if (response !== '') {
       var node = element('span', 'mono request-response', response);
-      node.title = response;
       td.appendChild(node);
+      td.appendChild(copyCellButton(response, '复制上游返回'));
       return td;
     }
     var failure = String(attempt.error || '').trim();
     if (failure !== '') {
       var errorNode = element('span', 'cell-muted request-response', failure);
-      errorNode.title = failure;
       td.appendChild(errorNode);
+      td.appendChild(copyCellButton(failure, '复制错误'));
       return td;
     }
     td.appendChild(element('span', 'cell-muted', '—'));
     return td;
+  }
+
+  /* copyCellButton copies the text the cell already shows. It is the one action a
+   * failure record needs: the reason travels with the operator instead of being
+   * retyped from a truncated line. */
+  function copyCellButton(value, label) {
+    var button = element('button', 'btn btn-ghost btn-small copy-button', '复制');
+    button.type = 'button';
+    button.title = label;
+    button.setAttribute('aria-label', label);
+    button.addEventListener('click', function () {
+      writeClipboard(value, function (copied) {
+        if (copied) {
+          showNotice('已复制。');
+          return;
+        }
+        showBanner('无法自动复制', '浏览器不允许自动写入剪贴板，请手动选中内容复制。');
+      });
+    });
+    return button;
   }
 
   /* clearRequestLog empties the log, which is how an operator puts a problem they
@@ -5890,9 +6051,11 @@
     if (els.probesClear) {
       els.probesClear.addEventListener('click', clearProbeLog);
     }
-    if (els.probesBody) {
-      // 每条记录都带着它那条线路的 id：想复查某一个账号时不用再去路由页找。
-      els.probesBody.addEventListener('click', function (event) {
+    var probesPanel = document.querySelector('[data-view-panel="probes"]');
+    if (probesPanel) {
+      // 每条记录和每条可探测线路都带着它那条线路的 id：想复查某一个账号时不用再去
+      // 路由页找。两处按钮共用一个委托，因为它们是同一个动作。
+      probesPanel.addEventListener('click', function (event) {
         var button = event.target.closest('[data-probe-channel]');
         if (!button) { return; }
         probeChannelNow(button.getAttribute('data-probe-channel'), button);

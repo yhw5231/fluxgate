@@ -30,6 +30,17 @@ func (m *memoryRuns) AppendProbeRun(_ context.Context, result Result, keep int) 
 	return nil
 }
 
+// LatestProbeResults answers the newest result per line, the way the store does.
+func (m *memoryRuns) LatestProbeResults(context.Context) (map[string]Result, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	latest := make(map[string]Result, len(m.runs))
+	for _, result := range m.runs {
+		latest[result.ChannelID] = result
+	}
+	return latest, nil
+}
+
 func (m *memoryRuns) ListProbeRuns(_ context.Context, limit int) ([]Result, int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -280,4 +291,65 @@ func TestServiceAsyncSweepRefusesASecondRun(t *testing.T) {
 	}
 	// Wait for it, so its store write cannot race the test's exit.
 	harness.service.wg.Wait()
+}
+
+// The target list is what the console shows above the probe records: every line the
+// schedule could ask, the model it would ask about, whether the line is held out of
+// rotation right now, and how it last answered.
+func TestServiceReportsWhatItCouldProbe(t *testing.T) {
+	harness := newServiceHarness(t, []Line{
+		harnessLine("line-1", "gpt-4.1"),
+		harnessLine("line-2", "claude-3"),
+	})
+	harness.service.Circuits = func() map[breaker.Scope]breaker.State {
+		return map[breaker.Scope]breaker.State{
+			{ChannelID: "line-2"}: {BlockedUntil: harness.now.Add(time.Hour)},
+		}
+	}
+
+	// A line that has never been probed is listed with no result yet.
+	targets := harness.service.Targets(context.Background())
+	if len(targets) != 2 {
+		t.Fatalf("targets = %#v, want one per line", targets)
+	}
+	if targets[0].ChannelID != "line-1" || targets[0].Model != "gpt-4.1" || targets[0].Last != nil {
+		t.Fatalf("first target = %#v, want line-1 with no result yet", targets[0])
+	}
+	if !targets[1].Held || targets[1].ChannelID != "line-2" {
+		t.Fatalf("second target = %#v, want the held line", targets[1])
+	}
+
+	// A probe fills in the newest result of the line it asked.
+	harness.service.ProbeChannel(context.Background(), "line-1")
+	targets = harness.service.Targets(context.Background())
+	if targets[0].Last == nil {
+		t.Fatalf("target = %#v, want the result of the probe that just ran", targets[0])
+	}
+	if !targets[0].Last.OK || targets[0].Last.Reason != ReasonOK || targets[0].Last.Kind != KindManual {
+		t.Fatalf("last result = %#v, want the manual probe that just ran", targets[0].Last)
+	}
+}
+
+// Every finished probe is told to whoever keeps the request log: a probe is a
+// request the gateway made on its own, and the log is where its effects show up.
+func TestServiceTellsTheRequestLogAboutEveryProbe(t *testing.T) {
+	harness := newServiceHarness(t, []Line{harnessLine("line-1", "gpt-4.1")})
+	var recorded []Result
+	var mu sync.Mutex
+	harness.service.RecordRun = func(result Result) {
+		mu.Lock()
+		recorded = append(recorded, result)
+		mu.Unlock()
+	}
+
+	harness.service.ProbeAll(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(recorded) != 1 {
+		t.Fatalf("recorded = %#v, want the one probe", recorded)
+	}
+	if recorded[0].ChannelID != "line-1" || !recorded[0].OK || recorded[0].Kind != KindManual {
+		t.Fatalf("recorded = %#v, want what the probe found", recorded[0])
+	}
 }
