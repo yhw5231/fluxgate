@@ -83,12 +83,12 @@ func channelState(t *testing.T, channel map[string]any) map[string]any {
 
 func TestSnapshotReportsACoolingLineByLine(t *testing.T) {
 	server, _ := managementServer(t)
-	addUpstream(t, server, "alpha", "gpt-4o", "sk-alpha-key")
+	alphaSite := addUpstream(t, server, "alpha", "gpt-4o", "sk-alpha-key")
 	addUpstream(t, server, "beta", "gpt-4o", "sk-beta-key")
 
 	blockedUntil := time.Now().Add(15 * time.Minute).UTC()
 	server.BreakerSnapshotter = staticCircuits{
-		{KeyID: "sk-alpha-key"}: {CooldownLevel: 2, BlockedUntil: blockedUntil},
+		{SiteID: alphaSite, KeyID: "sk-alpha-key"}: {CooldownLevel: 2, BlockedUntil: blockedUntil},
 	}
 
 	alpha := snapshotChannelByName(t, server, "alpha")
@@ -140,7 +140,7 @@ func TestSnapshotReportsALineItsConfigurationDisables(t *testing.T) {
 		t.Fatalf("disable upstream: status = %d, body = %v", response.status, response.body)
 	}
 	server.BreakerSnapshotter = staticCircuits{
-		{KeyID: "sk-alpha-key"}: {BlockedUntil: time.Now().Add(time.Hour)},
+		{SiteID: siteID, KeyID: "sk-alpha-key"}: {BlockedUntil: time.Now().Add(time.Hour)},
 	}
 
 	line := snapshotChannelByName(t, server, "alpha")
@@ -163,8 +163,8 @@ func TestSnapshotReportsTheCircuitThatHoldsALineLongest(t *testing.T) {
 	sooner := time.Now().Add(time.Minute).UTC()
 	later := time.Now().Add(time.Hour).UTC()
 	server.BreakerSnapshotter = staticCircuits{
-		{KeyID: "sk-alpha-key", Model: "gpt-4o"}:      {BlockedUntil: sooner},
-		{KeyID: "sk-alpha-key", Model: "gpt-4o-mini"}: {BlockedUntil: later, CooldownLevel: 3},
+		{SiteID: siteID, KeyID: "sk-alpha-key", Model: "gpt-4o"}:      {BlockedUntil: sooner},
+		{SiteID: siteID, KeyID: "sk-alpha-key", Model: "gpt-4o-mini"}: {BlockedUntil: later, CooldownLevel: 3},
 	}
 
 	state := channelState(t, snapshotChannelByName(t, server, "alpha"))
@@ -203,7 +203,7 @@ func TestSnapshotIgnoresACircuitTheLinesModeDoesNotName(t *testing.T) {
 	// A circuit filed under the credential alone is what the mode it ran in
 	// before recorded; the mode it runs in now files one per model.
 	server.BreakerSnapshotter = staticCircuits{
-		{KeyID: "sk-alpha-key"}: {BlockedUntil: time.Now().Add(time.Hour)},
+		{SiteID: siteID, KeyID: "sk-alpha-key"}: {BlockedUntil: time.Now().Add(time.Hour)},
 	}
 	state := channelState(t, snapshotChannelByName(t, server, "alpha"))
 	if state["status"] != "ready" {
@@ -213,7 +213,7 @@ func TestSnapshotIgnoresACircuitTheLinesModeDoesNotName(t *testing.T) {
 	// The circuit the mode does name is the one that holds the line out.
 	blockedUntil := time.Now().Add(time.Hour).UTC()
 	server.BreakerSnapshotter = staticCircuits{
-		{KeyID: "sk-alpha-key", Model: "gpt-4o"}: {CooldownLevel: 1, BlockedUntil: blockedUntil},
+		{SiteID: siteID, KeyID: "sk-alpha-key", Model: "gpt-4o"}: {CooldownLevel: 1, BlockedUntil: blockedUntil},
 	}
 	state = channelState(t, snapshotChannelByName(t, server, "alpha"))
 	if state["status"] != "cooling" {
@@ -231,14 +231,14 @@ func TestSnapshotIgnoresACircuitTheLinesModeDoesNotName(t *testing.T) {
 // fixed an upstream does not have to know which circuit the failure landed in.
 func TestBreakerResetClearsEveryCircuitOfALine(t *testing.T) {
 	server, _ := managementServer(t)
-	addUpstream(t, server, "alpha", "gpt-4o", "sk-alpha-key")
+	siteID := addUpstream(t, server, "alpha", "gpt-4o", "sk-alpha-key")
 	channelID, _ := snapshotChannelByName(t, server, "alpha")["id"].(string)
 
 	resetter := &recordingReset{}
 	server.BreakerReset = resetter
 	server.BreakerSnapshotter = staticCircuits{
-		{KeyID: "sk-alpha-key"}:                       {BlockedUntil: time.Now().Add(time.Hour)},
-		{KeyID: "sk-alpha-key", Model: "gpt-4o-mini"}: {},
+		{SiteID: siteID, KeyID: "sk-alpha-key"}:                       {BlockedUntil: time.Now().Add(time.Hour)},
+		{SiteID: siteID, KeyID: "sk-alpha-key", Model: "gpt-4o-mini"}: {},
 	}
 
 	response := callManagement(server, http.MethodPost, "/management/breakers/reset", "management-secret", map[string]any{
@@ -250,9 +250,9 @@ func TestBreakerResetClearsEveryCircuitOfALine(t *testing.T) {
 
 	want := []breaker.Scope{
 		{ChannelID: channelID},
-		{KeyID: "sk-alpha-key"},
-		{KeyID: "sk-alpha-key", Model: "gpt-4o"},
-		{KeyID: "sk-alpha-key", Model: "gpt-4o-mini"},
+		{SiteID: siteID, KeyID: "sk-alpha-key"},
+		{SiteID: siteID, KeyID: "sk-alpha-key", Model: "gpt-4o"},
+		{SiteID: siteID, KeyID: "sk-alpha-key", Model: "gpt-4o-mini"},
 	}
 	if len(resetter.cleared) != len(want) {
 		t.Fatalf("cleared = %v, want %v", resetter.cleared, want)
@@ -261,6 +261,118 @@ func TestBreakerResetClearsEveryCircuitOfALine(t *testing.T) {
 		if indexOfScope(resetter.cleared, scope) == -1 {
 			t.Errorf("cleared = %v, want it to contain %v", resetter.cleared, scope)
 		}
+	}
+}
+
+// Two upstreams may be configured with the same key string, and they are two
+// accounts: recovering one line must not clear the other upstream's circuit,
+// whether the request names a line or the credential.
+func TestBreakerResetKeepsAnotherUpstreamsCircuitOfTheSameKey(t *testing.T) {
+	server, _ := managementServer(t)
+	alphaSite := addUpstream(t, server, "alpha", "gpt-4o", "shared-key")
+	betaSite := addUpstream(t, server, "beta", "gpt-4o", "shared-key")
+	channelID, _ := snapshotChannelByName(t, server, "alpha")["id"].(string)
+
+	resetter := &recordingReset{}
+	server.BreakerReset = resetter
+	server.BreakerSnapshotter = staticCircuits{
+		{SiteID: alphaSite, KeyID: "shared-key"}: {BlockedUntil: time.Now().Add(time.Hour)},
+		{SiteID: betaSite, KeyID: "shared-key"}:  {BlockedUntil: time.Now().Add(time.Hour)},
+	}
+
+	// A line-scoped reset stays inside that line's upstream.
+	if response := callManagement(server, http.MethodPost, "/management/breakers/reset", "management-secret", map[string]any{
+		"scope": "channel", "channel_id": channelID,
+	}); response.status != http.StatusOK {
+		t.Fatalf("reset status = %d, body = %v", response.status, response.body)
+	}
+	if indexOfScope(resetter.cleared, breaker.Scope{SiteID: alphaSite, KeyID: "shared-key"}) == -1 {
+		t.Errorf("cleared = %v, want this upstream's circuit", resetter.cleared)
+	}
+	if indexOfScope(resetter.cleared, breaker.Scope{SiteID: betaSite, KeyID: "shared-key"}) != -1 {
+		t.Errorf("cleared = %v, want the other upstream's circuit left alone", resetter.cleared)
+	}
+
+	// A credential-scoped reset without a site clears the credential wherever it
+	// appears, and one that names a site clears only that account.
+	resetter.cleared = nil
+	if response := callManagement(server, http.MethodPost, "/management/breakers/reset", "management-secret", map[string]any{
+		"scope": "key", "key_id": "shared-key", "site_id": betaSite,
+	}); response.status != http.StatusOK {
+		t.Fatalf("reset status = %d, body = %v", response.status, response.body)
+	}
+	if indexOfScope(resetter.cleared, breaker.Scope{SiteID: betaSite, KeyID: "shared-key"}) == -1 {
+		t.Errorf("cleared = %v, want the account the request named", resetter.cleared)
+	}
+	if indexOfScope(resetter.cleared, breaker.Scope{SiteID: alphaSite, KeyID: "shared-key"}) != -1 {
+		t.Errorf("cleared = %v, want the account the request did not name left alone", resetter.cleared)
+	}
+
+	resetter.cleared = nil
+	if response := callManagement(server, http.MethodPost, "/management/breakers/reset", "management-secret", map[string]any{
+		"scope": "key", "key_id": "shared-key",
+	}); response.status != http.StatusOK {
+		t.Fatalf("reset status = %d, body = %v", response.status, response.body)
+	}
+	for _, scope := range []breaker.Scope{
+		{SiteID: alphaSite, KeyID: "shared-key"},
+		{SiteID: betaSite, KeyID: "shared-key"},
+	} {
+		if indexOfScope(resetter.cleared, scope) == -1 {
+			t.Errorf("cleared = %v, want every account of the key", resetter.cleared)
+		}
+	}
+}
+
+// A circuit filed under a credential carries no name the browser could send, so
+// recovering an upstream is how the console brings such a circuit back: it clears
+// every circuit that can hold any of that upstream's lines, and nothing of another
+// upstream's.
+func TestBreakerResetOfAnUpstreamClearsItsCircuitsOnly(t *testing.T) {
+	server, _ := managementServer(t)
+	alphaSite := addUpstream(t, server, "alpha", "gpt-4o", "shared-key")
+	betaSite := addUpstream(t, server, "beta", "gpt-4o", "shared-key")
+	alphaChannelID, _ := snapshotChannelByName(t, server, "alpha")["id"].(string)
+
+	resetter := &recordingReset{}
+	server.BreakerReset = resetter
+	server.BreakerSnapshotter = staticCircuits{
+		{SiteID: alphaSite, KeyID: "shared-key"}:                       {BlockedUntil: time.Now().Add(time.Hour)},
+		{SiteID: alphaSite, KeyID: "shared-key", Model: "gpt-4o-mini"}: {BlockedUntil: time.Now().Add(time.Hour)},
+		{SiteID: betaSite, KeyID: "shared-key"}:                        {BlockedUntil: time.Now().Add(time.Hour)},
+		{ChannelID: alphaChannelID}:                                    {},
+	}
+
+	response := callManagement(server, http.MethodPost, "/management/breakers/reset", "management-secret", map[string]any{
+		"scope": "site", "site_id": alphaSite,
+	})
+	if response.status != http.StatusOK {
+		t.Fatalf("reset status = %d, body = %v", response.status, response.body)
+	}
+
+	want := []breaker.Scope{
+		{ChannelID: alphaChannelID},
+		{SiteID: alphaSite, KeyID: "shared-key"},
+		{SiteID: alphaSite, KeyID: "shared-key", Model: "gpt-4o-mini"},
+	}
+	if len(resetter.cleared) != len(want) {
+		t.Fatalf("cleared = %v, want %v", resetter.cleared, want)
+	}
+	for _, scope := range want {
+		if indexOfScope(resetter.cleared, scope) == -1 {
+			t.Errorf("cleared = %v, want it to contain %v", resetter.cleared, scope)
+		}
+	}
+	if indexOfScope(resetter.cleared, breaker.Scope{SiteID: betaSite, KeyID: "shared-key"}) != -1 {
+		t.Errorf("cleared = %v, want the other upstream's circuit left alone", resetter.cleared)
+	}
+
+	// A site-scoped request that names no upstream is refused rather than answered
+	// as "clear everything".
+	if response := callManagement(server, http.MethodPost, "/management/breakers/reset", "management-secret", map[string]any{
+		"scope": "site",
+	}); response.status != http.StatusBadRequest {
+		t.Errorf("reset without site_id status = %d, want 400", response.status)
 	}
 }
 
@@ -296,14 +408,14 @@ func indexOfScope(scopes []breaker.Scope, wanted breaker.Scope) int {
 // state per line is that the gateway is the only holder of it.
 func TestSnapshotNeverCarriesTheCredential(t *testing.T) {
 	server, _ := managementServer(t)
-	addUpstream(t, server, "alpha", "gpt-4o", "sk-alpha-secret")
+	siteID := addUpstream(t, server, "alpha", "gpt-4o", "sk-alpha-secret")
 	line := snapshotChannelByName(t, server, "alpha")
 	channelID, _ := line["id"].(string)
 
 	server.BreakerSnapshotter = staticCircuits{
-		{KeyID: "sk-alpha-secret"}:                  {CooldownLevel: 1, BlockedUntil: time.Now().Add(time.Hour)},
-		{KeyID: "sk-alpha-secret", Model: "gpt-4o"}: {CooldownLevel: 2, BlockedUntil: time.Now().Add(time.Hour)},
-		{ChannelID: channelID}:                      {ConsecutiveFailures: 2},
+		{SiteID: siteID, KeyID: "sk-alpha-secret"}:                  {CooldownLevel: 1, BlockedUntil: time.Now().Add(time.Hour)},
+		{SiteID: siteID, KeyID: "sk-alpha-secret", Model: "gpt-4o"}: {CooldownLevel: 2, BlockedUntil: time.Now().Add(time.Hour)},
+		{ChannelID: channelID}:                                      {ConsecutiveFailures: 2},
 	}
 
 	response := callManagement(server, http.MethodGet, "/management/snapshot", "management-secret", nil)

@@ -1011,6 +1011,46 @@ func TestConsoleTogglesUpstreamStatusFromTheList(t *testing.T) {
 	}
 }
 
+// 每个密钥的并发是上游级的设置：表单里填一个数字，列表里只有真的设置过才标出来，
+// 默认不限。填 1 表示这个上游的每个密钥同一时间只处理一个请求，其余请求排队等待。
+func TestConsoleCarriesThePerKeyConcurrencySetting(t *testing.T) {
+	script := consoleScript(t)
+
+	for _, wanted := range []string{
+		"key_concurrency: {",
+		"label: '密钥并发'",
+		"同一时间只处理一个请求",
+		"function upstreamKeyConcurrency(",
+		"function keyConcurrencyLabel(",
+		// 没设置过的上游不占标签，设置过的才显示上限。
+		"if (upstreamKeyConcurrency(row) > 0) {",
+		// 展开的行说清楚这个上游的密钥现在能同时处理几个请求。
+		"每个密钥同时最多处理 ",
+	} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("console script is missing %q", wanted)
+		}
+	}
+}
+
+// 概览里的熔断记录按线路或按密钥归档。按线路归档的用它自己的 id 恢复；按密钥归档的
+// 记录里没有密钥（密钥只在网关里），所以按它所属的上游恢复——上游是浏览器能指到的、
+// 又覆盖这条 circuit 的最小单位，同一个密钥串挂在两个上游时也不会误清另一个。
+func TestConsoleRecoversACircuitItCannotName(t *testing.T) {
+	script := consoleScript(t)
+
+	for _, wanted := range []string{
+		"function breakerResetTarget(",
+		"scope: 'channel', channel_id: entry.channel_id",
+		"scope: 'site', site_id: number(entry.site_id)",
+		"post('/management/breakers/reset', target)",
+	} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("console script is missing %q", wanted)
+		}
+	}
+}
+
 // A pin names providers the upstream has never been asked about, so the console
 // carries two actions that ask it: a discovery (which providers exist, which
 // pipeline is spoken) and a validation (does each provider answer now).

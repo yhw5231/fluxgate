@@ -307,7 +307,8 @@ func TestMemoryStoreConcurrentUpdates(t *testing.T) {
 
 // A management view has to name the circuit a line runs under to say whether it
 // is blocked, and the circuit a channel's failures are filed in is derived from
-// the mode it runs in.
+// the mode it runs in. A circuit filed under a credential carries the upstream as
+// well, because one key string can be an account of two upstreams.
 func TestScopeForModeNamesTheCircuitAChannelFileAndKeyShare(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -317,19 +318,58 @@ func TestScopeForModeNamesTheCircuitAChannelFileAndKeyShare(t *testing.T) {
 	}{
 		{name: "channel circuit", mode: string(ModeCooldown), fallback: ModeKeyCooldown, want: Scope{ChannelID: "7"}},
 		{name: "disable is channel scoped", mode: string(ModeDisable), fallback: ModeCooldown, want: Scope{ChannelID: "7"}},
-		{name: "shared key circuit", mode: string(ModeKeyCooldown), fallback: ModeCooldown, want: Scope{KeyID: "sk-key"}},
-		{name: "per model circuit", mode: string(ModeKeyModelCooldown), fallback: ModeCooldown, want: Scope{KeyID: "sk-key", Model: "gpt-4o"}},
-		{name: "a channel without a mode runs in the process mode", mode: "", fallback: ModeKeyCooldown, want: Scope{KeyID: "sk-key"}},
-		{name: "an unknown mode falls back too", mode: "nonsense", fallback: ModeKeyModelCooldown, want: Scope{KeyID: "sk-key", Model: "gpt-4o"}},
+		{name: "shared key circuit", mode: string(ModeKeyCooldown), fallback: ModeCooldown, want: Scope{SiteID: 3, KeyID: "sk-key"}},
+		{name: "per model circuit", mode: string(ModeKeyModelCooldown), fallback: ModeCooldown, want: Scope{SiteID: 3, KeyID: "sk-key", Model: "gpt-4o"}},
+		{name: "a channel without a mode runs in the process mode", mode: "", fallback: ModeKeyCooldown, want: Scope{SiteID: 3, KeyID: "sk-key"}},
+		{name: "an unknown mode falls back too", mode: "nonsense", fallback: ModeKeyModelCooldown, want: Scope{SiteID: 3, KeyID: "sk-key", Model: "gpt-4o"}},
 	}
 
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			got := ScopeForMode(testCase.mode, testCase.fallback, "7", "sk-key", "gpt-4o")
+			got := ScopeForMode(testCase.mode, testCase.fallback, 3, "7", "sk-key", "gpt-4o")
 			if got != testCase.want {
 				t.Errorf("ScopeForMode() = %+v, want %+v", got, testCase.want)
 			}
 		})
+	}
+}
+
+// One key string used by two upstreams is two accounts, and the circuit each of
+// them opens is its own: a failure on one upstream's account does not take the
+// other upstream's line out of rotation, and recovering one leaves the other as
+// it was.
+func TestBreakerCoolsOneKeysAccountsApart(t *testing.T) {
+	now := time.Date(2026, time.September, 18, 12, 0, 0, 0, time.UTC)
+	circuit := newTestBreaker(ModeKeyCooldown, &now)
+
+	first := domain.Channel{ID: "alpha-line", SiteID: 1, APIKey: "shared-key"}
+	second := domain.Channel{ID: "beta-line", SiteID: 2, APIKey: "shared-key"}
+
+	failure := retryableFailure(first.ID, first.APIKey, "model-a")
+	failure.Attempt.SiteID = first.SiteID
+	for index := 0; index < 2; index++ {
+		circuit.RecordFailure(failure)
+	}
+
+	if !circuit.IsBlocked(first, "model-a") {
+		t.Fatal("the account that failed was not held out of rotation")
+	}
+	if circuit.IsBlocked(second, "model-a") {
+		t.Fatal("another upstream's account of the same key was held out with it")
+	}
+
+	// Each account's circuit is filed under its own upstream.
+	if _, ok := circuit.Store.Load(Scope{SiteID: 1, KeyID: "shared-key"}); !ok {
+		t.Fatal("the failing account's circuit is not filed under its upstream")
+	}
+	if _, ok := circuit.Store.Load(Scope{SiteID: 2, KeyID: "shared-key"}); ok {
+		t.Fatal("a circuit was filed for the upstream that never failed")
+	}
+
+	// A success on the other account leaves the cooling one alone.
+	circuit.RecordSuccess(domain.Attempt{SiteID: second.SiteID, ChannelID: second.ID, KeyID: second.APIKey, BreakerMode: second.BreakerMode, Model: "model-a"})
+	if !circuit.IsBlocked(first, "model-a") {
+		t.Fatal("recovering one account cleared its neighbour's circuit")
 	}
 }
 

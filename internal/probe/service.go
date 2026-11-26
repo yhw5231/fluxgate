@@ -370,7 +370,7 @@ func (s *Service) heldLines(lines []Line, now time.Time, settings Settings) map[
 	}
 	circuits := s.Circuits()
 	for _, line := range lines {
-		scope := breaker.ScopeForMode(line.BreakerMode, settings.BreakerMode, line.ChannelID, line.APIKey, line.Model)
+		scope := breaker.ScopeForMode(line.BreakerMode, settings.BreakerMode, line.SiteID, line.ChannelID, line.APIKey, line.Model)
 		state, known := circuits[scope]
 		if !known {
 			continue

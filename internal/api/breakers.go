@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/yhw5231/fluxgate/internal/breaker"
@@ -23,13 +25,6 @@ import (
 // clears everything the gateway has recorded.
 type BreakerResetter interface {
 	ResetBreakerStates(ctx context.Context, scopes []breaker.Scope) (int64, error)
-}
-
-type breakerResetRequest struct {
-	Scope     string `json:"scope"`
-	ChannelID string `json:"channel_id"`
-	KeyID     string `json:"key_id"`
-	Model     string `json:"model"`
 }
 
 // handleBreakerReset clears one circuit, or all of them.
@@ -66,9 +61,10 @@ func (s *Server) handleBreakerReset(w http.ResponseWriter, r *http.Request) {
 // A request that names a line clears every circuit that can hold that line out of
 // rotation. Which ones those are — the line's own, the one shared by every line
 // presenting the same credential, or that credential for one model — is something
-// only the gateway can answer, because the credential itself never leaves it. The
-// store's own circuit key is still accepted verbatim, for automation that
-// recorded a scope from the snapshot.
+// only the gateway can answer, because the credential itself never leaves it. A
+// request that names a credential instead clears it in every upstream that holds
+// it, or in the one `site_id` names: a key string can be an account of two
+// upstreams, and those are two accounts.
 func (s *Server) breakerScopes(w http.ResponseWriter, body map[string]any) ([]breaker.Scope, bool) {
 	scope, _ := body["scope"].(string)
 	scope = strings.TrimSpace(scope)
@@ -78,6 +74,20 @@ func (s *Server) breakerScopes(w http.ResponseWriter, body map[string]any) ([]br
 	channelID := stringField(body, "channel_id")
 	keyID := stringField(body, "key_id")
 	model := stringField(body, "model")
+	siteID, ok := s.siteField(w, body)
+	if !ok {
+		return nil, false
+	}
+	// A site-scoped request names an upstream and nothing else, so it is answered
+	// before the questions a circuit-scoped one has to answer.
+	if scope == "site" {
+		if siteID <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid_configuration",
+				"a site-scoped reset needs the site_id of the upstream")
+			return nil, false
+		}
+		return s.siteScopes(siteID), true
+	}
 	if channelID == "" && keyID == "" {
 		writeError(w, http.StatusBadRequest, "invalid_configuration",
 			"a circuit is identified by a channel, a key, or both")
@@ -87,35 +97,112 @@ func (s *Server) breakerScopes(w http.ResponseWriter, body map[string]any) ([]br
 	case "channel":
 		return s.lineScopes(channelID, model), true
 	case "key":
-		// The key scope carries no channel, which is how the breaker records it:
-		// a key-cooled circuit is shared by every channel presenting that key.
-		return []breaker.Scope{{KeyID: keyID}}, true
+		return s.keyScopes(keyID, "", siteID), true
 	case "key_model":
-		return []breaker.Scope{{KeyID: keyID, Model: model}}, true
+		return s.keyScopes(keyID, model, siteID), true
 	default:
 		writeError(w, http.StatusBadRequest, "invalid_configuration",
-			"scope must be all, channel, key, or key_model")
+			"scope must be all, site, channel, key, or key_model")
 		return nil, false
 	}
+}
+
+// siteScopes lists every circuit that can hold one upstream's lines out of
+// rotation: each line's own, and the circuits filed under each of its credentials.
+// A circuit filed under a credential covers every line presenting it, so the lines
+// of one upstream are the whole of what an operator means by bringing that
+// upstream back — and it is how a circuit the browser cannot name, because it is
+// filed under the credential, is still recoverable from the console.
+func (s *Server) siteScopes(siteID int64) []breaker.Scope {
+	scopes := make([]breaker.Scope, 0)
+	for _, route := range s.currentConfiguration().Routes {
+		for _, channel := range route.Channels {
+			if channel.SiteID != siteID {
+				continue
+			}
+			scopes = append(scopes, s.lineScopes(channel.ID, "")...)
+		}
+	}
+	return dedupeScopes(scopes)
+}
+
+// siteField reads the upstream a key-scoped request wants to narrow itself to.
+// It is optional: a request that leaves it out addresses the credential itself,
+// which is what a client that only knows a key means by it.
+func (s *Server) siteField(w http.ResponseWriter, body map[string]any) (int64, bool) {
+	raw, present := body["site_id"]
+	if !present || raw == nil {
+		return 0, true
+	}
+	number, err := numericField(raw)
+	if err != nil || number < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_configuration",
+			"site_id must be the whole number of an upstream")
+		return 0, false
+	}
+	return number, true
+}
+
+// numericField reads a whole number that arrived as a JSON number or as the text
+// a console submits.
+func numericField(raw any) (int64, error) {
+	switch value := raw.(type) {
+	case float64:
+		if value != float64(int64(value)) {
+			return 0, errors.New("not a whole number")
+		}
+		return int64(value), nil
+	case int64:
+		return value, nil
+	case string:
+		return strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	default:
+		return 0, errors.New("not a number")
+	}
+}
+
+// keyScopes lists every circuit filed under one credential: the whole-key one, or
+// the one filed for a single model, in every upstream that holds the credential
+// and — when the request named one — in that upstream alone. The circuit recorded
+// for a given upstream has to be named by its own site, because the site is part
+// of what the circuit is filed under; the extra scope is harmless when nothing was
+// recorded for it, since clearing a circuit that does not exist removes nothing.
+func (s *Server) keyScopes(keyID, model string, siteID int64) []breaker.Scope {
+	scopes := []breaker.Scope{{SiteID: siteID, KeyID: keyID, Model: model}}
+	if s.BreakerSnapshotter == nil {
+		return scopes
+	}
+	for scope := range s.BreakerSnapshotter.Snapshot() {
+		if scope.ChannelID != "" || scope.KeyID != keyID || scope.Model != model {
+			continue
+		}
+		if siteID != 0 && scope.SiteID != siteID {
+			continue
+		}
+		scopes = append(scopes, scope)
+	}
+	return dedupeScopes(scopes)
 }
 
 // lineScopes lists every circuit that can hold one line out of rotation: the
 // line's own, the credential's shared one, the credential's per-model one, and
 // every per-model circuit already recorded for that credential — a pattern route
-// is asked for many model names, and all of them reach the same line.
+// is asked for many model names, and all of them reach the same line. The
+// credential's circuits are the ones filed for this line's own upstream: another
+// upstream's circuit under the same key string is another account's.
 func (s *Server) lineScopes(channelID, model string) []breaker.Scope {
 	scopes := []breaker.Scope{{ChannelID: channelID}}
 	channel, known := s.findChannel(channelID)
 	if !known || channel.APIKey == "" {
 		return scopes
 	}
-	scopes = append(scopes, breaker.Scope{KeyID: channel.APIKey})
+	scopes = append(scopes, breaker.Scope{SiteID: channel.SiteID, KeyID: channel.APIKey})
 	if model != "" {
-		scopes = append(scopes, breaker.Scope{KeyID: channel.APIKey, Model: model})
+		scopes = append(scopes, breaker.Scope{SiteID: channel.SiteID, KeyID: channel.APIKey, Model: model})
 	}
 	if s.BreakerSnapshotter != nil {
 		for scope := range s.BreakerSnapshotter.Snapshot() {
-			if scope.KeyID == channel.APIKey && scope.Model != "" {
+			if scope.KeyID == channel.APIKey && scope.SiteID == channel.SiteID && scope.Model != "" {
 				scopes = append(scopes, scope)
 			}
 		}

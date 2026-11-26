@@ -17,6 +17,7 @@ import (
 	"github.com/yhw5231/fluxgate/internal/admin"
 	"github.com/yhw5231/fluxgate/internal/api"
 	"github.com/yhw5231/fluxgate/internal/breaker"
+	"github.com/yhw5231/fluxgate/internal/concurrency"
 	"github.com/yhw5231/fluxgate/internal/config"
 	"github.com/yhw5231/fluxgate/internal/domain"
 	"github.com/yhw5231/fluxgate/internal/policy"
@@ -117,6 +118,22 @@ func run(parent context.Context, logger *slog.Logger) error {
 		return err
 	}
 
+	// A circuit filed under a credential now carries the upstream it belongs to, so
+	// the circuits a previous release recorded under the credential alone are filed
+	// under their upstreams before anything reads them. It runs after the upstream
+	// tables exist, because the credential it resolves against is theirs.
+	filed, dropped, err := persistentStore.MigrateBreakerScopes(parent)
+	if err != nil {
+		return err
+	}
+	if filed > 0 || dropped > 0 {
+		logger.Info("breaker_scopes_migrated",
+			"filed", filed,
+			"dropped", dropped,
+			"detail", "circuits recorded under a credential alone are now filed per upstream",
+		)
+	}
+
 	configuration, err := persistentStore.LoadConfiguration(parent)
 	if err != nil {
 		return err
@@ -156,7 +173,15 @@ func run(parent context.Context, logger *slog.Logger) error {
 	// The selector and the resolver are updated in place by a console write
 	// rather than replaced, so a request already in flight finishes with the
 	// configuration it started with.
+	//
+	// An upstream may limit each of its keys to a number of requests at a time. One
+	// counter serves both halves of that: the selector skips a key that is full so
+	// the request lands on a key with room, and the engine takes the slot before it
+	// dispatches. It lives for the whole process, because a slot is held by the
+	// attempt that took it and a console write must not lose one.
+	keyLimiter := concurrency.NewLimiter()
 	selector := router.NewMemorySelectorWithFilter(configuration.Routes, circuitBreaker)
+	selector.SetKeyLimiter(keyLimiter)
 	proxyResolver := buildProxyResolver(configuration)
 	// A pool hands each account its own exit address. The lease is acquired on the
 	// first request through that account and remembered, so the address an upstream
@@ -227,6 +252,7 @@ func run(parent context.Context, logger *slog.Logger) error {
 		MediaTransportPool:    mediaTransportPool,
 		StreamIdleTimeout:     cfg.StreamIdleTimeout,
 		ResponseHeaderTimeout: cfg.ResponseHeaderTimeout,
+		Limiter:               keyLimiter,
 		Policy:                cfg.Retry,
 		Failover:              &cfg.Failover,
 	}

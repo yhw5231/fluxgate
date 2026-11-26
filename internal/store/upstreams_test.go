@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -621,6 +622,111 @@ func TestUpstreamCDModeIsStoredAndLoadedOntoItsLines(t *testing.T) {
 	}
 	if _, present := cdModes[siteID]; present {
 		t.Fatalf("cooldown modes = %v, want the deleted upstream forgotten", cdModes)
+	}
+}
+
+// The per-key concurrency is stored per upstream and reaches the lines the gateway
+// dispatches with, where it bounds how many requests one key may carry at a time.
+// It is an upstream's setting rather than a line's, so every key of the upstream
+// gets the same one, and a key nobody limited stays unlimited.
+func TestUpstreamKeyConcurrencyIsStoredAndLoadedOntoItsLines(t *testing.T) {
+	store := prepareUpstreamStore(t)
+	row := createUpstream(t, store, map[string]any{
+		"name":            "OneAtATime",
+		"url":             "https://api.example.com",
+		"key_concurrency": int64(1),
+		"keys":            []any{"first-key", "second-key"},
+		"models":          []any{"gpt-4.1"},
+	})
+	if row["key_concurrency"] != int64(1) {
+		t.Fatalf("key_concurrency = %#v, want 1", row["key_concurrency"])
+	}
+	siteID := row["id"].(int64)
+
+	loaded, err := store.LoadConfiguration(context.Background())
+	if err != nil {
+		t.Fatalf("LoadConfiguration() error = %v", err)
+	}
+	if len(loaded.Channels) != 2 {
+		t.Fatalf("loaded %d channels, want one per key", len(loaded.Channels))
+	}
+	for _, channel := range loaded.Channels {
+		if channel.KeyConcurrency != 1 {
+			t.Fatalf("loaded channel %s KeyConcurrency = %d, want 1", channel.ID, channel.KeyConcurrency)
+		}
+	}
+
+	// An upstream created without the field leaves its keys unlimited, which is
+	// what every upstream did before the setting existed.
+	plain := createUpstream(t, store, map[string]any{
+		"name": "Unlimited", "url": "https://api.other.com", "keys": []any{"key"}, "models": []any{"gpt-4.1"},
+	})
+	if plain["key_concurrency"] != int64(0) {
+		t.Fatalf("key_concurrency = %#v, want 0 when it is not set", plain["key_concurrency"])
+	}
+
+	// Raising the limit is a plain update, and it reaches the next load.
+	updated, err := store.UpdateResource(context.Background(), "upstreams", siteID, map[string]any{"key_concurrency": int64(3)})
+	if err != nil {
+		t.Fatalf("UpdateResource(key_concurrency) error = %v", err)
+	}
+	if updated["key_concurrency"] != int64(3) {
+		t.Fatalf("key_concurrency = %#v, want 3 after the update", updated["key_concurrency"])
+	}
+	loaded, err = store.LoadConfiguration(context.Background())
+	if err != nil {
+		t.Fatalf("LoadConfiguration() error = %v", err)
+	}
+	for _, channel := range loaded.Channels {
+		if channel.SiteID == siteID && channel.KeyConcurrency != 3 {
+			t.Fatalf("loaded channel %s KeyConcurrency = %d, want 3 after the update", channel.ID, channel.KeyConcurrency)
+		}
+	}
+
+	// Clearing it puts the key back to unlimited instead of storing a limit of
+	// zero that would read as "no requests at all".
+	cleared, err := store.UpdateResource(context.Background(), "upstreams", siteID, map[string]any{"key_concurrency": nil})
+	if err != nil {
+		t.Fatalf("UpdateResource(key_concurrency: nil) error = %v", err)
+	}
+	if cleared["key_concurrency"] != int64(0) {
+		t.Fatalf("key_concurrency = %#v, want 0 after clearing it", cleared["key_concurrency"])
+	}
+	limits, err := upstreamKeyConcurrencies(context.Background(), store.db)
+	if err != nil {
+		t.Fatalf("upstreamKeyConcurrencies() error = %v", err)
+	}
+	if _, present := limits[siteID]; present {
+		t.Fatalf("key concurrency = %v, want the cleared upstream forgotten", limits)
+	}
+
+	// A limit is a whole number of requests: a negative one and one beyond any real
+	// workload are refused rather than stored and never applied.
+	for _, rejected := range []int64{-1, maxUpstreamKeyConcurrency + 1} {
+		_, err := store.UpdateResource(context.Background(), "upstreams", siteID, map[string]any{"key_concurrency": rejected})
+		if err == nil {
+			t.Fatalf("UpdateResource(key_concurrency: %d) was accepted", rejected)
+		}
+		var validation ValidationError
+		if !errors.As(err, &validation) || validation.Field != "key_concurrency" {
+			t.Fatalf("UpdateResource(key_concurrency: %d) error = %v, want a key_concurrency field error", rejected, err)
+		}
+	}
+
+	// Deleting the upstream forgets its limit, so a reused site id cannot inherit
+	// one it never asked for.
+	if _, err := store.UpdateResource(context.Background(), "upstreams", siteID, map[string]any{"key_concurrency": int64(2)}); err != nil {
+		t.Fatalf("UpdateResource(key_concurrency) error = %v", err)
+	}
+	if _, err := store.DeleteResource(context.Background(), "upstreams", siteID); err != nil {
+		t.Fatalf("DeleteResource(upstreams) error = %v", err)
+	}
+	limits, err = upstreamKeyConcurrencies(context.Background(), store.db)
+	if err != nil {
+		t.Fatalf("upstreamKeyConcurrencies() error = %v", err)
+	}
+	if _, present := limits[siteID]; present {
+		t.Fatalf("key concurrency = %v, want the deleted upstream forgotten", limits)
 	}
 }
 

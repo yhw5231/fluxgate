@@ -523,6 +523,10 @@
       keys: { label: '密钥', help: '一行一个，可以整段粘贴。留空表示保持已保存的密钥不变。' },
       key_mode: { label: '密钥模式', type: 'select', options: KEY_MODE_OPTIONS, help: '可用优先：先用第一个密钥，失败或熔断后再用下一个。加权随机：按权重在所有密钥之间随机分配。' },
       key_cd_mode: { label: 'Key 冷却模式', type: 'select', options: CD_MODE_OPTIONS, help: '按 key 冷却（默认）：一个密钥失败后整个密钥退出轮换，它在这个上游的其他模型上也不再尝试。按 key + 模型冷却：只退出失败的那个模型，密钥在其他模型上照常使用。' },
+      key_concurrency: {
+        label: '密钥并发', type: 'number', step: '1', placeholder: '0',
+        help: '每个密钥同时最多处理几个请求。1 表示这个上游的每个密钥同一时间只处理一个请求，其余请求排在后面等它空出来；留空或 0 表示不限制。额度按密钥算：同一个密钥在这个上游的所有模型上共用这一个额度，所以并发为 1 时几张不同的模型请求也会依次通过这个密钥。'
+      },
       models: { label: '模型', help: '勾选这个上游提供的模型，保存后网关自动建立路由。' },
       model_mapping: { label: '模型映射', help: '把客户端请求的模型名换成上游认识的模型名。' }
     },
@@ -790,12 +794,27 @@
     return row.key_mode === 'available_first' ? 'available_first' : 'round_robin';
   }
 
+  /* 一个上游每个密钥的并发上限。0（或空）表示不限制，这也是没设置过的上游的
+   * 状态：网关不排队，请求直接发出去。 */
+  function upstreamKeyConcurrency(row) {
+    var limit = number(row.key_concurrency);
+    return limit > 0 ? limit : 0;
+  }
+
+  function keyConcurrencyLabel(row) {
+    return '并发 ' + upstreamKeyConcurrency(row);
+  }
+
   function upstreamKeysCell(row) {
     var wrapper = element('span', 'tag-list');
     var keys = upstreamKeyList(row);
     wrapper.appendChild(tag(keys.length + ' 个'));
     wrapper.appendChild(tag(keyModeLabel(upstreamKeyMode(row))));
     wrapper.appendChild(tag(cdModeLabel(row.key_cd_mode)));
+    // 并发上限只在设置过时占一个标签：没设置是默认状态，不必每个上游都写一遍。
+    if (upstreamKeyConcurrency(row) > 0) {
+      wrapper.appendChild(tag(keyConcurrencyLabel(row)));
+    }
     return wrapper;
   }
 
@@ -988,7 +1007,11 @@
       (row.key_cd_mode === 'key_model_cooldown'
         ? '密钥只在失败的那个模型上退出，其他模型照常使用。'
         : '密钥一旦失败就整体退出，它在其他模型上也不再被选中。') +
-      '一条线路连续失败到阈值会进入冷却，冷却到期后失败计数继续累加，所以它再失败一次就会重新冷却，冷却时长每次翻倍直到上限。'));
+      '一条线路连续失败到阈值会进入冷却，冷却到期后失败计数继续累加，所以它再失败一次就会重新冷却，冷却时长每次翻倍直到上限。' +
+      (upstreamKeyConcurrency(row) > 0
+        ? '每个密钥同时最多处理 ' + upstreamKeyConcurrency(row) + ' 个请求' +
+          (upstreamKeyConcurrency(row) === 1 ? '，也就是说一个密钥同一时间只处理一个，其余请求排队等它空出来。' : '。')
+        : '密钥并发没有设置：每个密钥同时处理多少个请求都不受网关限制。')));
     wrapper.appendChild(lineDetailTable(lines, LINE_LEADING_MODEL));
     return wrapper;
   }
@@ -2004,18 +2027,24 @@
   }
 
   /* resetBreaker clears one recorded circuit, by the identifiers the breaker
-   * filed it under. */
+   * filed it under.
+   *
+   * A circuit filed under a line is named by that line. One filed under a
+   * credential is named by the upstream it belongs to instead: the credential
+   * itself never reaches the browser, and a key string can be an account of two
+   * upstreams, so the upstream is the narrowest thing the browser can address
+   * that still covers the circuit. */
   function resetBreaker(entry, button) {
+    var target = breakerResetTarget(entry);
+    if (!target) {
+      showNotice('这条熔断记录没有可用的线路或上游信息，请用「全部恢复」清除。');
+      return;
+    }
     setSubmitting(button, true, '恢复');
-    post('/management/breakers/reset', {
-      scope: entry.scope || 'channel',
-      channel_id: entry.channel_id || '',
-      key_id: entry.key_id || '',
-      model: entry.model || ''
-    }).then(function (result) {
+    post('/management/breakers/reset', target).then(function (result) {
       setSubmitting(button, false, '恢复');
       if (result.ok) {
-        showNotice('已恢复该线路，下一个请求会重新尝试它。');
+        showNotice('已恢复，下一个请求会重新尝试它。');
         refresh();
         return;
       }
@@ -2025,6 +2054,18 @@
       setSubmitting(button, false, '恢复');
       showBanner('无法连接网关', String(err && err.message ? err.message : err));
     });
+  }
+
+  /* breakerResetTarget renders the request that clears one recorded circuit the
+   * way the gateway addresses one, or null when the browser cannot address it. */
+  function breakerResetTarget(entry) {
+    if (entry.channel_id) {
+      return { scope: 'channel', channel_id: entry.channel_id, model: entry.model || '' };
+    }
+    if (number(entry.site_id) > 0) {
+      return { scope: 'site', site_id: number(entry.site_id) };
+    }
+    return null;
   }
 
   function resetAllBreakers() {

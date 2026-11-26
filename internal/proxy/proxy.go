@@ -81,6 +81,12 @@ type Engine struct {
 	// because a long answer would be cut off as if the upstream had failed. When
 	// zero, DefaultStreamIdleTimeout is used.
 	StreamIdleTimeout time.Duration
+	// Limiter counts the requests in flight through each upstream key, which is
+	// how an upstream's per-key concurrency is enforced. An attempt takes its key's
+	// slot before it is dispatched and hands it back when the answer is over; a
+	// request whose every line is at its limit waits for a slot rather than being
+	// refused. When nil, no key is limited.
+	Limiter domain.KeyConcurrencyLimiter
 	// ResponseHeaderTimeout is the transport's response-header bound when one is
 	// configured, which is zero by default. It is carried here for one reason: the
 	// transport reports its expiry as a plain timeout, and a timeout that does not
@@ -169,7 +175,11 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 	pinned := domain.Selection{}
 
 	for attemptNumber := 1; attemptNumber <= retry.MaxAttempts; attemptNumber++ {
-		selection, err := e.Selector.Select(e.selectionRequest(input, excluded, pinned, policy.Failover))
+		// The line and its key's concurrency slot are taken together, because a
+		// request placed on a key that is already full would have to be moved
+		// anyway. A request whose every line is at its limit waits here for a slot
+		// instead of being answered with an error.
+		selection, release, err := e.selectSlot(ctx, e.selectionRequest(input, excluded, pinned, policy.Failover))
 		if err != nil {
 			if lastFailure.Err != nil || lastFailure.StatusCode != 0 {
 				return Result{Trace: trace}, finalError(lastFailure)
@@ -188,6 +198,7 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 		attemptsByChannel[channel.ID] = channelAttempt
 		attempt := domain.Attempt{
 			Number:       attemptNumber,
+			SiteID:       channel.SiteID,
 			ChannelID:    channel.ID,
 			ChannelName:  channel.Name,
 			ChannelIndex: channelAttempt,
@@ -217,7 +228,11 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 		// abandon is note for the cases where the failure ends the request, and it
 		// names the line in the error as well: a failure that only the request log
 		// can attribute leaves the caller reading a sentence about nothing.
+		//
+		// Every abandon happens before the upstream was reached, so the attempt
+		// never carried the request and its key's concurrency slot goes back here.
 		abandon := func(cause error) (Result, error) {
+			release()
 			note(cause)
 			return Result{Trace: trace}, fmt.Errorf("the request could not be sent over %s: %w",
 				domain.LineLabel(channel.Name, channel.ID), cause)
@@ -243,6 +258,9 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 				if !policy.Failover.Enabled || attemptNumber >= retry.MaxAttempts {
 					return abandon(convertErr)
 				}
+				// The line is skipped rather than blamed: nothing was sent, so its
+				// key's slot goes back before the next line is tried.
+				release()
 				note(convertErr)
 				continue
 			}
@@ -309,6 +327,17 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 			dispatchErr = fmt.Errorf("%w: the upstream did not send response headers within the %s response header timeout", dispatchErr, e.ResponseHeaderTimeout)
 		}
 		call.answer(response, streamIdle)
+		// The key's slot is held for as long as the upstream is doing the work. An
+		// answer read as one body is over when its last byte is read and the body
+		// is closed; a streamed one until the stream is closed. Handing the slot
+		// back when the headers arrived would let the key take a second request
+		// while its first was still being generated, which is exactly what the
+		// limit exists to prevent.
+		if response == nil {
+			release()
+		} else {
+			response.Body = &keySlotBody{ReadCloser: response.Body, release: release}
+		}
 		traced.DurationMS = now().Sub(attempt.StartedAt).Milliseconds()
 		if dispatchErr == nil && response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
 			// The caller asked in its own protocol, so a line that speaks the
@@ -372,6 +401,50 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 		return Result{Trace: trace}, conversionFailure
 	}
 	return Result{Trace: trace}, finalError(lastFailure)
+}
+
+// selectSlot resolves the line one attempt runs on and takes that line's key's
+// concurrency slot, which is the two questions a per-key limit makes inseparable.
+//
+// A request whose every line is momentarily at its key's limit waits for a slot
+// and asks again, instead of being answered with an error: the limit is a throttle
+// the operator set on the key, not a fault in the request. The slot it takes is
+// handed back by the caller when the attempt is over — when its answer is closed,
+// or immediately when nothing was sent.
+//
+// The wakeup is taken before the selector is asked, so a slot handed back while
+// the question is being answered is not missed; without that order a request can
+// sleep through the only release it was waiting for.
+func (e *Engine) selectSlot(ctx context.Context, request domain.SelectionRequest) (domain.Selection, func(), error) {
+	limiter := e.Limiter
+	for {
+		var wake <-chan struct{}
+		if limiter != nil {
+			wake = limiter.Wake()
+		}
+		selection, err := e.Selector.Select(request)
+		if err != nil {
+			if limiter != nil && errors.Is(err, domain.ErrChannelsBusy) {
+				if waitErr := limiter.Wait(ctx, wake); waitErr != nil {
+					return domain.Selection{}, nil, waitErr
+				}
+				continue
+			}
+			return domain.Selection{}, nil, err
+		}
+		if limiter == nil {
+			return selection, func() {}, nil
+		}
+		if release, ok := limiter.Acquire(selection.Channel); ok {
+			return selection, release, nil
+		}
+		// The line filled up between being chosen and being taken. Waiting for a
+		// slot and asking again also re-reads the routing table, which a console
+		// write may have replaced in the meantime.
+		if waitErr := limiter.Wait(ctx, wake); waitErr != nil {
+			return domain.Selection{}, nil, waitErr
+		}
+	}
 }
 
 // responseHeaderTimeoutExpired reports whether a dispatch failed on the transport's
@@ -726,6 +799,21 @@ type cancelReadCloser struct {
 func (body *cancelReadCloser) Close() error {
 	err := body.ReadCloser.Close()
 	body.cancel()
+	return err
+}
+
+// keySlotBody is one upstream answer on its way to the caller, holding the
+// concurrency slot of the key that produced it. Closing the body is the moment the
+// upstream is done with the request — which for a streamed answer is the end of
+// the stream, not the arrival of its headers — so that is when the slot goes back.
+type keySlotBody struct {
+	io.ReadCloser
+	release func()
+}
+
+func (body *keySlotBody) Close() error {
+	err := body.ReadCloser.Close()
+	body.release()
 	return err
 }
 

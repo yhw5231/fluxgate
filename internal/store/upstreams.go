@@ -72,6 +72,19 @@ const (
 	upstreamCDModeKey         = "key_cooldown"
 	upstreamCDModeKeyAndModel = "key_model_cooldown"
 
+	// upstreamKeyConcurrencySetting names the settings row that records how many
+	// requests at a time each key of an upstream may carry. It is not a sites
+	// column either: a limit belongs to the accounts the operator configured, not
+	// to one row of them, and it is a dispatch policy like the key mode beside it
+	// rather than a property of the address.
+	upstreamKeyConcurrencySetting = "gateway.upstream_key_concurrency"
+
+	// maxUpstreamKeyConcurrency bounds the per-key concurrency a write may store. A
+	// limit is a throttle, so a number no real workload reaches is a typo rather
+	// than a policy; the bound keeps one from turning into a limit that never
+	// applies and leaving an operator to believe it does.
+	maxUpstreamKeyConcurrency = 10000
+
 	// upstreamChannelWeight is the weight a generated channel carries, which is
 	// the share of the upstream's requests that key takes when the upstream
 	// rotates across its keys. The upstream's own weight is the site's
@@ -159,6 +172,11 @@ var upstreamResource = Resource{
 		// that just failed is not worth trying on the upstream's other models
 		// either, which is what key+model would do.
 		{Name: "key_cd_mode", Kind: KindText, Synthetic: true, MaxLength: 32, Choices: []string{upstreamCDModeKey, upstreamCDModeKeyAndModel}, DefaultValue: upstreamCDModeKey},
+		// How many requests at a time each key of this upstream may carry. It sits
+		// beside the key mode and the cooldown mode because it answers the third
+		// question about a key: which one answers, how it is taken out of rotation,
+		// and how much of it a request may use at once.
+		{Name: "key_concurrency", Kind: KindInt, Synthetic: true, Validate: validateKeyConcurrency},
 		{Name: "models", Kind: KindJSONArray, Synthetic: true, MaxLength: 65536, Validate: validateStringList},
 		{Name: "model_mapping", Kind: KindJSONObject, Synthetic: true, MaxLength: 32768, Validate: validateModelMapping},
 	},
@@ -253,6 +271,11 @@ func applyUpstream(ctx context.Context, tx *sql.Tx, siteID int64, values map[str
 		}
 	} else if err := ensureUpstreamCDMode(ctx, tx, siteID); err != nil {
 		return err
+	}
+	if raw, present := values["key_concurrency"]; present {
+		if err := applyUpstreamKeyConcurrency(ctx, tx, siteID, raw); err != nil {
+			return err
+		}
 	}
 	accountID, err := ensureUpstreamAccount(ctx, tx, siteID)
 	if err != nil {
@@ -989,6 +1012,132 @@ func forgetUpstreamCDMode(ctx context.Context, tx *sql.Tx, siteID int64) error {
 	return saveUpstreamCDModes(ctx, tx, modes)
 }
 
+/* ===== Per-upstream key concurrency =====
+ *
+ * A key is an account, and an upstream's own rate limit is usually counted per
+ * account. The operator states how many requests at a time each key of an upstream
+ * may carry — one, for an upstream that must never see a key twice at once — and
+ * the gateway holds each key to it.
+ *
+ * The limit belongs to the upstream rather than to a line, so it is stored once per
+ * site, in the settings table beside the priority and the cooldown mode, and it
+ * reaches every line of that upstream through the loader. */
+
+// upstreamKeyConcurrencies reads the limit stored for each upstream.
+func upstreamKeyConcurrencies(ctx context.Context, db queryer) (map[int64]int, error) {
+	var value string
+	err := db.QueryRowContext(ctx, `SELECT COALESCE(value, '') FROM settings WHERE key = ?`, upstreamKeyConcurrencySetting).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return map[int64]int{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read upstream key concurrency: %w", err)
+	}
+	return parseUpstreamKeyConcurrencies(value)
+}
+
+// upstreamKeyConcurrenciesFrom reads the limits out of an already-loaded settings
+// map, which is how the configuration loader reaches them: it has every settings
+// row in hand before it builds the routing table.
+func upstreamKeyConcurrenciesFrom(settings map[string]string) (map[int64]int, error) {
+	return parseUpstreamKeyConcurrencies(settings[upstreamKeyConcurrencySetting])
+}
+
+// parseUpstreamKeyConcurrencies decodes the stored object. An entry that is not a
+// whole number, names no site, or falls outside the bounds a write accepts is
+// skipped rather than failing the load: a limit is a throttle, and one unreadable
+// entry must not cost the gateway its whole configuration.
+func parseUpstreamKeyConcurrencies(value string) (map[int64]int, error) {
+	limits := map[int64]int{}
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || trimmed == "null" {
+		return limits, nil
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &decoded); err != nil {
+		return nil, fmt.Errorf("parse upstream key concurrency: %w", err)
+	}
+	for key, entry := range decoded {
+		siteID, err := strconv.ParseInt(strings.TrimSpace(key), 10, 64)
+		if err != nil || siteID <= 0 {
+			continue
+		}
+		number, ok := entry.(float64)
+		if !ok || number != float64(int64(number)) {
+			continue
+		}
+		// Zero is the default — a key nobody limited — so it is not stored and is
+		// not read back as a limit of zero.
+		if limit := int(number); limit > 0 && limit <= maxUpstreamKeyConcurrency {
+			limits[siteID] = limit
+		}
+	}
+	return limits, nil
+}
+
+func saveUpstreamKeyConcurrencies(ctx context.Context, tx *sql.Tx, limits map[int64]int) error {
+	if len(limits) == 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, upstreamKeyConcurrencySetting); err != nil {
+			return fmt.Errorf("clear upstream key concurrency: %w", err)
+		}
+		return nil
+	}
+	encoded, err := json.Marshal(limits)
+	if err != nil {
+		return fmt.Errorf("encode upstream key concurrency: %w", err)
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO settings (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, upstreamKeyConcurrencySetting, string(encoded))
+	if err != nil {
+		return fmt.Errorf("store upstream key concurrency: %w", err)
+	}
+	return nil
+}
+
+// applyUpstreamKeyConcurrency stores one upstream's per-key concurrency. Zero —
+// and a cleared field, which arrives as nil — means the keys are unlimited, so it
+// removes the entry instead of writing a limit that would never apply.
+func applyUpstreamKeyConcurrency(ctx context.Context, tx *sql.Tx, siteID int64, raw any) error {
+	limit := 0
+	if raw != nil {
+		number, err := toInt64(raw)
+		if err != nil {
+			return invalidField("key_concurrency", "a whole number is required")
+		}
+		if err := validateKeyConcurrency(number); err != nil {
+			return invalidField("key_concurrency", "%s", err.Error())
+		}
+		limit = int(number)
+	}
+	limits, err := upstreamKeyConcurrencies(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if limit <= 0 {
+		if _, present := limits[siteID]; !present {
+			return nil
+		}
+		delete(limits, siteID)
+	} else {
+		limits[siteID] = limit
+	}
+	return saveUpstreamKeyConcurrencies(ctx, tx, limits)
+}
+
+// forgetUpstreamKeyConcurrency drops a deleted upstream's limit, so a site id the
+// database later reuses does not inherit it.
+func forgetUpstreamKeyConcurrency(ctx context.Context, tx *sql.Tx, siteID int64) error {
+	limits, err := upstreamKeyConcurrencies(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if _, present := limits[siteID]; !present {
+		return nil
+	}
+	delete(limits, siteID)
+	return saveUpstreamKeyConcurrencies(ctx, tx, limits)
+}
+
 /* ===== Read path ===== */
 
 // UpstreamKey returns the first key of a stored upstream.
@@ -1034,12 +1183,17 @@ func decorateUpstreams(ctx context.Context, db queryer, rows []map[string]any) e
 	if err != nil {
 		return err
 	}
+	keyConcurrencies, err := upstreamKeyConcurrencies(ctx, db)
+	if err != nil {
+		return err
+	}
 	for _, row := range rows {
 		siteID, ok := row["id"].(int64)
 		if !ok {
 			continue
 		}
 		row["priority"] = int64(priorities[siteID])
+		row["key_concurrency"] = int64(keyConcurrencies[siteID])
 		accountID, err := upstreamAccountID(ctx, db, siteID)
 		if err != nil {
 			return err
@@ -1217,6 +1371,15 @@ func cascadeDeleteUpstream(ctx context.Context, tx *sql.Tx, siteID int64) (map[s
 	if err := forgetUpstreamCDMode(ctx, tx, siteID); err != nil {
 		return nil, err
 	}
+	if err := forgetUpstreamKeyConcurrency(ctx, tx, siteID); err != nil {
+		return nil, err
+	}
+	// A circuit filed under one of this upstream's credentials is about an account
+	// that is going away, so it goes with it: the account it describes no longer
+	// exists, and a site id the database later reuses must not inherit it.
+	if err := deleteSiteKeyBreakerStates(ctx, tx, siteID); err != nil {
+		return nil, err
+	}
 	// The pins belong to the upstream, so they go before the early return below:
 	// an upstream whose keys were never written still has pins worth removing.
 	if pins, err := deletePinsForSite(ctx, tx, siteID); err != nil {
@@ -1360,6 +1523,24 @@ func deleteBreakerStates(ctx context.Context, tx *sql.Tx, channelIDs []string) e
 		if _, err := tx.ExecContext(ctx, `DELETE FROM gateway_breaker_states WHERE channel_id = ?`, channelID); err != nil {
 			return fmt.Errorf("delete breaker state: %w", err)
 		}
+	}
+	return nil
+}
+
+// deleteSiteKeyBreakerStates drops the circuits filed under a deleted upstream's
+// credentials. The channel-scoped rows of the same upstream go with its channels,
+// which carry the channel id; these carry the upstream instead, because the account
+// they describe is the credential in one upstream.
+func deleteSiteKeyBreakerStates(ctx context.Context, tx *sql.Tx, siteID int64) error {
+	var present int64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'gateway_breaker_states'`).Scan(&present); err != nil {
+		return fmt.Errorf("look for the breaker table: %w", err)
+	}
+	if present == 0 {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM gateway_breaker_states WHERE site_id = ?`, siteID); err != nil {
+		return fmt.Errorf("delete the upstream's key circuits: %w", err)
 	}
 	return nil
 }

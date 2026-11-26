@@ -77,6 +77,7 @@ func probeLines(configuration store.Configuration) []probe.Line {
 			}
 			seen[key] = true
 			lines = append(lines, probe.Line{
+				SiteID:         channel.SiteID,
 				ChannelID:      channel.ID,
 				ChannelName:    channel.Name,
 				BaseURL:        channel.BaseURL,

@@ -1295,6 +1295,24 @@ func validatePositive(value any) error {
 // normalization step so the rejection carries a reason code.
 var errMustBePositive = errors.New("must be greater than zero")
 
+// validateKeyConcurrency bounds the per-key concurrency an upstream may be given.
+// Zero is meaningful — it leaves the key unlimited, which is what every upstream
+// did before the setting existed — so only a negative value is refused, together
+// with the number beyond which no real workload could be the intent.
+func validateKeyConcurrency(value any) error {
+	number, ok := value.(int64)
+	if !ok {
+		return errors.New("a whole number is required")
+	}
+	if number < 0 {
+		return errors.New("must be zero or more")
+	}
+	if number > maxUpstreamKeyConcurrency {
+		return fmt.Errorf("must be %d or less", maxUpstreamKeyConcurrency)
+	}
+	return nil
+}
+
 // validateToken bounds a short identifier such as a platform or a status value.
 // It deliberately accepts any token rather than a fixed list, because the
 // gateway only ever compares these against one known value: rejecting an

@@ -31,6 +31,12 @@ type Policy struct {
 
 // Scope identifies one independently tracked breaker circuit.
 type Scope struct {
+	// SiteID is the upstream the credential belongs to. A key is an account of one
+	// upstream — the same key string used by two upstreams is two accounts, each
+	// with its own rate limit and its own failures — so a circuit filed under a
+	// credential is filed under it per upstream. It is zero on a channel-scoped
+	// circuit, whose channel id already names one line of one upstream.
+	SiteID    int64
 	ChannelID string
 	KeyID     string
 	Model     string
@@ -152,7 +158,7 @@ func (b *Breaker) RecordFailure(failure domain.Failure) {
 	}
 	current := b.currentPolicy()
 	policy := normalizePolicy(b.policyForMode(modeOrDefault(failure.Attempt.BreakerMode, current.Mode)))
-	scope := scopeForMode(policy.Mode, failure.Attempt.ChannelID, failure.Attempt.KeyID, failure.Attempt.Model)
+	scope := scopeForMode(policy.Mode, failure.Attempt.SiteID, failure.Attempt.ChannelID, failure.Attempt.KeyID, failure.Attempt.Model)
 	if b.alreadyCounted(scope, failure.Attempt.RequestID) {
 		return
 	}
@@ -206,7 +212,7 @@ func (b *Breaker) RecordSuccess(attempt domain.Attempt) {
 		return
 	}
 	mode := modeOrDefault(attempt.BreakerMode, b.currentPolicy().Mode)
-	scope := scopeForMode(mode, attempt.ChannelID, attempt.KeyID, attempt.Model)
+	scope := scopeForMode(mode, attempt.SiteID, attempt.ChannelID, attempt.KeyID, attempt.Model)
 	b.forget(scope)
 	b.Store.Update(scope, func(State) State { return State{} })
 }
@@ -221,7 +227,7 @@ func (b *Breaker) forget(scope Scope) {
 }
 
 func (b *Breaker) scope(channel domain.Channel, model string) Scope {
-	return ScopeForMode(channel.BreakerMode, b.currentPolicy().Mode, channel.ID, channel.APIKey, model)
+	return ScopeForMode(channel.BreakerMode, b.currentPolicy().Mode, channel.SiteID, channel.ID, channel.APIKey, model)
 }
 
 // ScopeForMode returns the circuit a channel's failures are recorded under. An
@@ -229,9 +235,11 @@ func (b *Breaker) scope(channel domain.Channel, model string) Scope {
 // process-wide mode a channel without one of its own runs in.
 //
 // It is exported so a management view can name the circuit that holds a line out
-// of rotation without holding the credential the circuit is filed under.
-func ScopeForMode(mode string, fallback Mode, channelID, keyID, model string) Scope {
-	return scopeForMode(modeOrDefault(mode, fallback), channelID, keyID, model)
+// of rotation without holding the credential the circuit is filed under. The
+// upstream is part of the identity of a credential-scoped circuit and is ignored
+// by a channel-scoped one, whose channel id already belongs to one upstream.
+func ScopeForMode(mode string, fallback Mode, siteID int64, channelID, keyID, model string) Scope {
+	return scopeForMode(modeOrDefault(mode, fallback), siteID, channelID, keyID, model)
 }
 
 // EffectiveMode returns the mode one channel runs in: the mode it carries itself,
@@ -258,12 +266,17 @@ func modeOrDefault(configured string, fallback Mode) Mode {
 	}
 }
 
-func scopeForMode(mode Mode, channelID, keyID, model string) Scope {
+// scopeForMode files a failure under the circuit its mode names. A channel-scoped
+// circuit carries the channel alone: a line belongs to one upstream, so its id is
+// already the whole identity. A credential-scoped one carries the upstream as
+// well, because one key string can be an account of two upstreams and those are
+// two accounts: they fail, cool down, and recover apart from each other.
+func scopeForMode(mode Mode, siteID int64, channelID, keyID, model string) Scope {
 	switch mode {
 	case ModeKeyCooldown:
-		return Scope{KeyID: keyID}
+		return Scope{SiteID: siteID, KeyID: keyID}
 	case ModeKeyModelCooldown:
-		return Scope{KeyID: keyID, Model: model}
+		return Scope{SiteID: siteID, KeyID: keyID, Model: model}
 	default:
 		return Scope{ChannelID: channelID}
 	}

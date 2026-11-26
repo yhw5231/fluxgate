@@ -1,6 +1,6 @@
 # Fluxgate
 
-Fluxgate is a lightweight, independently deployable Go gateway that reads the existing upstream SQLite configuration and provides OpenAI-compatible proxy endpoints — chat, responses, embeddings, images and video — with bounded server-side retries, priority-then-weight routing, proxy selection, and persistent circuit-breaker state. A line can also state which conversational protocol its upstream really speaks, and the gateway translates between chat completions and the Responses API when a caller used the other one. It ships with an embedded management console that both shows the running state and edits that configuration: upstreams with their priorities, weights, keys and models, the routing the gateway derives from them, client keys, proxy profiles, and the retry, failover, and circuit-breaker policy the gateway applies while it runs.
+Fluxgate is a lightweight, independently deployable Go gateway that reads the existing upstream SQLite configuration and provides OpenAI-compatible proxy endpoints — chat, responses, embeddings, images and video — with bounded server-side retries, priority-then-weight routing, per-key concurrency limits, proxy selection, and persistent circuit-breaker state. A line can also state which conversational protocol its upstream really speaks, and the gateway translates between chat completions and the Responses API when a caller used the other one. It ships with an embedded management console that both shows the running state and edits that configuration: upstreams with their priorities, weights, keys and models, the routing the gateway derives from them, client keys, proxy profiles, and the retry, failover, and circuit-breaker policy the gateway applies while it runs.
 
 This repository is where the standalone **UniGate** gateway (formerly `cline2api-go`)
 was merged into Fluxgate. UniGate's account-facing capabilities now live in this
@@ -237,6 +237,11 @@ docker compose up -d --build
 docker compose ps
 ```
 
+An upgrade that changes the shape of a gateway-owned table brings the database up to it
+at startup: a missing column is added, and the circuit file is migrated to the identity
+the release expects (see [Circuit-breaker settings](#circuit-breaker-settings)). Nothing
+has to be run by hand, and a line that was held out of rotation stays held.
+
 ### Deploy with Docker directly
 
 Build the image:
@@ -370,7 +375,7 @@ weight are both edited in place: type a number in the row, press Enter or 保存
 the change is stored and applied for the next request. A 线路状态 column summarizes
 how that upstream's lines currently stand, and expanding a row lists them.
 
-The upstream form is built around the six things that actually vary between
+The upstream form is built around the things that actually vary between
 upstreams:
 
 - **The address is completed, not corrected later.** A trailing slash is dropped and a
@@ -399,6 +404,20 @@ upstreams:
 - **Key selection has two modes.** 可用优先 (available first) prefers the first key
   and moves to the next one only when it fails or is cooling down; 加权随机
   (weighted random) spreads requests across every key in proportion to its weight.
+- **A key can be limited to a number of requests at a time.** 密钥并发 is how many
+  requests one key of that upstream may carry at once. Set to 1, every key serves one
+  request at a time and the next one waits for it to finish; an empty value, which is
+  the default, leaves the keys unlimited. The allowance belongs to the key rather than
+  to a model, so one key serving several routes shares the one limit. A request is
+  placed on a key that has room, and when every key of the model is at its limit the
+  request waits for a slot instead of failing: the wait is bounded by the caller, so a
+  client that hangs up leaves nothing queued. The slot is held for as long as the
+  answer lasts — for a streamed answer until the stream ends — so a key of concurrency
+  1 never has two upstream requests open, and a retry on the same key hands its slot
+  back before the next attempt. The gateway's own probes — the account health check,
+  the model listing, and the provider discovery — are not counted: they are checks
+  rather than traffic, and a key that is merely full must not be reported as a broken
+  one.
 - **The client is presented as itself.** An upstream routinely serves a coding client
   differently from a bare HTTP caller — a different model list, a different error, a
   different rate limit. 客户端指纹 selects one of 23 built-in presets of the request
@@ -743,14 +762,21 @@ circuits, and one entry per line with its effective `enabled` flag alongside a `
 block saying what the gateway would do with it right now — `ready`, `cooling` (with the
 `blocked_until` deadline and the `cooldown_level` it reached), `disabled` (a `disable`
 circuit, which only an operator clears), or `inactive` (the configuration itself holds
-the line out of rotation). A circuit is filed by the credential the line presents, so
-the state is resolved per line by the gateway and the `scope` it names is where the
-circuit lives; the credential itself is never part of a line's entry.
+the line out of rotation). A circuit is filed by the credential the line presents and,
+for a credential-scoped one, by the upstream that credential belongs to — one key string
+used by two upstreams is two accounts, and they cool down and recover apart — so the
+state is resolved per line by the gateway and the `scope` it names is where the circuit
+lives; the credential itself is never part of a line's entry. Each circuit in the
+`breakers` list names the lines it holds, and a credential-scoped one carries its
+`site_id`, which is what a console action addresses it by.
 
 `upstreams` is the composite resource the console's upstream form writes, and the only
 one whose fields are assembled from several tables. Alongside the columns of `sites` it
-carries five synthetic fields: `keys` (a JSON array of strings, one per key, matched by
-position), `key_mode` (`available_first` or `round_robin`), `models` (the exposed model
+carries these synthetic fields: `keys` (a JSON array of strings, one per key, matched by
+position), `key_mode` (`available_first` or `round_robin`), `key_cd_mode`
+(`key_cooldown` or `key_model_cooldown`, how a failing key leaves rotation),
+`key_concurrency` (how many requests one key may carry at once, `0` meaning unlimited),
+`models` (the exposed model
 names the upstream serves), `model_mapping` (a JSON object of exposed name to the
 name that upstream knows), and `priority` (the whole number selection compares first).
 Writing `keys` or `models` creates the account, the token
@@ -764,6 +790,12 @@ one model a platform serves from two channel groups is one route with a line per
 `priority` is stored in the settings table under
 `gateway.upstream_priorities` as a JSON object of upstream id to whole number, because
 it is not a `sites` column; an upstream the object does not mention has priority `0`.
+`key_cd_mode` and `key_concurrency` are stored the same way, under
+`gateway.upstream_cd_modes` and `gateway.upstream_key_concurrency`: a per-key limit
+belongs to the accounts of an upstream rather than to one of its lines, so it is
+recorded once per upstream and loaded onto every line that upstream serves. A
+`key_concurrency` of `0`, or an empty value, removes the entry and leaves the keys
+unlimited.
 The tables themselves remain addressable one by one for a detail the form
 does not show, such as a forced endpoint or a per-key proxy.
 
@@ -771,10 +803,14 @@ does not show, such as a forced endpoint or a per-key proxy.
 /management/breakers/reset` clears recorded circuits: `scope: "all"` clears every one,
 while a `channel` scope naming a `channel_id` clears every circuit that can hold that
 line out of rotation — the line's own, the circuit shared by every line presenting the
-same credential, and that credential's per-model circuits — because bringing one line
-back is what an operator means and which circuit filed the failure is the gateway's to
-know. The `key` and `key_model` scopes stay available for automation that read a scope
-from the snapshot. `POST /management/upstreams/models` asks an upstream for its model
+same credential in that line's own upstream, and that credential's per-model circuits —
+because bringing one line back is what an operator means and which circuit filed the
+failure is the gateway's to know. A `site` scope naming a `site_id` does the same for
+every line of one upstream, which is how a circuit the browser cannot name — one filed
+under a credential, which never leaves the gateway — is still recovered from the
+console. The `key` and `key_model` scopes stay available for automation: they name the
+credential itself, in every upstream that holds it, or in the one their optional
+`site_id` names. `POST /management/upstreams/models` asks an upstream for its model
 list: the body carries the `url`, one `key`, the `proxy_url`, and any `headers` from the
 form before it is saved, or an `id` and a masked key so the gateway probes with the key
 it already stores. An empty `proxy_url` probes through the default proxy profile, which
@@ -1389,6 +1425,14 @@ so a request falls to the next tier instead of failing while a preferred line co
 down. An upstream that has never been given a priority has `0`, which is what
 every upstream had before priorities existed.
 
+A line whose key is at its 密钥并发 limit is filtered out the same way, so a request
+is placed on a key that has room and two keys of one upstream serve two requests at
+once. When *every* line of the model is at its limit, that is a throttle rather than
+a refusal: the request waits for a slot and asks again, instead of being answered
+with `503 no_available_channel`. The wait is bounded by the caller's own connection,
+so a client that hangs up leaves nothing queued, and the listing in `/v1/models`
+keeps advertising a model whose keys are merely busy.
+
 ### Downstream key restrictions
 
 - `supported_models` is an **exclusion** list. A requested model matching any
@@ -1455,6 +1499,18 @@ succeeded is one piece of evidence. Without that rule one `429` would walk a thr
 three up three cooldown levels and hold the line for minutes.
 
 Channel-specific breaker modes loaded from the existing configuration can override the default mode. Breaker state is persisted in the Go-owned `gateway_breaker_states` table and restored after restart. A `disable` circuit does not return to service by itself; it is cleared from the console (恢复) or through `POST /management/breakers/reset`.
+
+A circuit's identity follows its mode: a `cooldown` or `disable` circuit belongs to one
+line, a `key_cooldown` one to one key of one upstream, and a `key_model_cooldown` one to
+that key for one model. The upstream is part of a key-scoped circuit's identity because a
+key is an account of one upstream: two upstreams configured with the same key string are
+two accounts, with their own failures, their own cooldown, and their own recovery, and
+deleting an upstream takes its accounts' circuits with it. A database written by a
+release that filed a key's circuit under the credential alone is migrated at startup: each
+recorded circuit is filed under the upstreams whose accounts hold that credential, with
+the state it was recorded with — a disabled circuit stays disabled — and a credential the
+configuration no longer holds leaves nothing behind. The migration is logged as
+`breaker_scopes_migrated` with how many circuits it filed and how many it dropped.
 
 ### Request-log settings
 

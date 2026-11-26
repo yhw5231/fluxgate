@@ -35,6 +35,14 @@ var (
 	ErrModelNotRoutable = errors.New("no enabled route matches the requested model")
 )
 
+// KeyLimiter reports whether a line's key is already carrying as many requests as
+// its upstream allows. It is the selector's half of the per-key concurrency limit:
+// a line whose key is full is skipped so the request is placed on a key that has
+// room, and the engine takes the slot from the same limiter before dispatching.
+type KeyLimiter interface {
+	Busy(channel domain.Channel) bool
+}
+
 // ChannelFilter can remove temporarily or permanently blocked channels at selection time.
 type ChannelFilter interface {
 	// IsBlocked reports whether a channel is held out of rotation for one model.
@@ -61,7 +69,11 @@ type MemorySelector struct {
 	mu     sync.Mutex
 	routes []domain.Route
 	filter ChannelFilter
-	random *rand.Rand
+	// limiter reports which keys are at their concurrency limit. A selector that
+	// has none selects as if every key had room, and the engine's own acquire then
+	// enforces the limit on the key it was given.
+	limiter KeyLimiter
+	random  *rand.Rand
 }
 
 func NewMemorySelector(routes []domain.Route) *MemorySelector {
@@ -92,6 +104,15 @@ func (s *MemorySelector) SetRoutes(routes []domain.Route) {
 	s.routes = copied
 }
 
+// SetKeyLimiter installs the counter that says which keys are at their
+// concurrency limit. Like the routing table it is replaced in place, so the
+// gateway needs no restart for the limit to shape selection.
+func (s *MemorySelector) SetKeyLimiter(limiter KeyLimiter) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.limiter = limiter
+}
+
 // Select resolves a channel for the requested model, applying the downstream
 // key policy and skipping channels already excluded by the retry loop.
 func (s *MemorySelector) Select(request domain.SelectionRequest) (domain.Selection, error) {
@@ -103,8 +124,15 @@ func (s *MemorySelector) Select(request domain.SelectionRequest) (domain.Selecti
 		return domain.Selection{}, ErrModelNotRoutable
 	}
 
-	eligible := s.eligible(route, request, displayNameMatches(request.Model, route.DisplayName))
+	eligible, busy := s.candidates(route, request, displayNameMatches(request.Model, route.DisplayName))
 	if len(eligible) == 0 {
+		if len(busy) > 0 {
+			// Every line that could serve the request is at its key's concurrency
+			// limit. Nothing is broken and no upstream has failed, so this is
+			// reported as its own condition: the engine waits for a slot and asks
+			// again rather than answering the caller with an error.
+			return domain.Selection{}, domain.ErrChannelsBusy
+		}
 		return domain.Selection{}, ErrNoChannel
 	}
 
@@ -224,7 +252,10 @@ func lineOrderBefore(left, right string) bool {
 }
 
 // HasCandidate reports whether any channel could serve the model, without
-// drawing a channel.
+// drawing a channel. A line whose key is momentarily full counts as a candidate:
+// it answers again the moment the requests already on its key finish, and a model
+// listing that dropped it would be telling a client the gateway cannot serve the
+// model at all.
 func (s *MemorySelector) HasCandidate(model string, policy domain.RoutingPolicy) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -234,7 +265,8 @@ func (s *MemorySelector) HasCandidate(model string, policy domain.RoutingPolicy)
 		return false
 	}
 	request := domain.SelectionRequest{Model: model, Policy: policy}
-	return len(s.eligible(route, request, displayNameMatches(model, route.DisplayName))) > 0
+	available, busy := s.candidates(route, request, displayNameMatches(model, route.DisplayName))
+	return len(available)+len(busy) > 0
 }
 
 // findRoute applies the upstream route precedence: an explicit group matched by
@@ -316,9 +348,18 @@ func (s *MemorySelector) channelsFor(route domain.Route) []domain.Channel {
 	return channels
 }
 
-func (s *MemorySelector) eligible(route domain.Route, request domain.SelectionRequest, bypassSourceModel bool) []domain.Channel {
+// candidates lists the channels of a matched route that may serve the request,
+// split into the ones whose key has room right now and the ones that are at their
+// key's concurrency limit. A line held out of rotation for any other reason — a
+// disabled line, a circuit, an exclusion — is in neither list.
+//
+// The two lists are what makes a throttle different from a refusal: a request with
+// no line in the first list but a line in the second is waiting behind a key that
+// is busy, which the engine answers by waiting for a slot.
+func (s *MemorySelector) candidates(route domain.Route, request domain.SelectionRequest, bypassSourceModel bool) (available, busy []domain.Channel) {
 	channels := s.channelsFor(route)
-	eligible := make([]domain.Channel, 0, len(channels))
+	available = make([]domain.Channel, 0, len(channels))
+	busy = make([]domain.Channel, 0, 1)
 	for _, channel := range channels {
 		if !channel.Enabled {
 			continue
@@ -355,9 +396,15 @@ func (s *MemorySelector) eligible(route domain.Route, request domain.SelectionRe
 		if s.filter != nil && s.filter.IsBlocked(channel, ActualModel(request.Model, route, channel)) {
 			continue
 		}
-		eligible = append(eligible, channel)
+		// A key at its concurrency limit is still a line the request could reach a
+		// moment from now, so it is kept apart rather than dropped.
+		if s.limiter != nil && s.limiter.Busy(channel) {
+			busy = append(busy, channel)
+			continue
+		}
+		available = append(available, channel)
 	}
-	return eligible
+	return available, busy
 }
 
 // pickWeighted draws one key out of the chosen upstream's keys, each key's chance

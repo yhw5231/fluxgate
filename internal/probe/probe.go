@@ -76,6 +76,10 @@ const (
 // Line is one upstream line as the probe needs it: where to send the request,
 // which credential to present, and which model to ask about.
 type Line struct {
+	// SiteID is the upstream the line belongs to, and with the credential it is
+	// how the circuit holding the line out of rotation is found: a credential is an
+	// account of one upstream, and one key string can be an account of two.
+	SiteID        int64
 	ChannelID     string
 	ChannelName   string
 	BaseURL       string

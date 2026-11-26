@@ -1,8 +1,11 @@
 package domain
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -44,6 +47,12 @@ type Channel struct {
 	// generated per request — a session identifier — rather than a constant.
 	ClientProfile  string
 	RequestTimeout time.Duration
+	// KeyConcurrency is how many requests this line's key may carry at the same
+	// time, as the operator configured it on the upstream. Zero means the key is
+	// not limited. The limit belongs to the key rather than to the line: every
+	// line presenting one credential shares the one allowance, which is what
+	// makes a value of 1 mean "this key serves one request at a time".
+	KeyConcurrency int
 
 	// Routing identity. SiteID, AccountID and TokenID identify the upstream
 	// credential so downstream key exclusions can be applied.
@@ -67,6 +76,24 @@ type Channel struct {
 	// are attached per site rather than per route because an upstream serves its
 	// providers the same way whatever model name a client used to reach it.
 	Pins []ModelPin
+}
+
+// CredentialKey identifies the upstream credential the line dispatches with,
+// which is what a per-key concurrency limit is counted against. Two lines of one
+// upstream that present the same key — the same key on two routes, for
+// instance — share one allowance, because they are the same account. The
+// upstream is part of the identity so a key string that happens to be used by
+// two upstreams is counted as the two accounts it really is.
+func (c Channel) CredentialKey() string {
+	return CredentialKeyOf(c.SiteID, c.APIKey)
+}
+
+// CredentialKeyOf renders the identity a key is counted under: the upstream it
+// belongs to and the credential itself. It is what a per-key concurrency allowance
+// and a credential-scoped circuit are filed by, so the two agree on when two lines
+// are the same account.
+func CredentialKeyOf(siteID int64, credential string) string {
+	return strconv.FormatInt(siteID, 10) + "\x00" + credential
 }
 
 // The two ways one model's internal providers can be pinned.
@@ -553,6 +580,13 @@ type Attempt struct {
 	// failure can be reported by name: an observer, or the record of a request
 	// that could not be dispatched, has no route table to look either of them up
 	// in, and a failure that names no upstream is one nobody can act on.
+	//
+	// SiteID and KeyID identify the account the attempt presented. Both travel
+	// with the attempt because a circuit is filed under the account — the upstream
+	// and the credential together, since one key string can be an account of two
+	// upstreams — and an observer that had only the credential could not tell those
+	// two accounts apart.
+	SiteID       int64
 	ChannelID    string
 	ChannelName  string
 	ChannelIndex int
@@ -704,6 +738,38 @@ type Selector interface {
 	// HasCandidate reports whether any channel could serve the model without
 	// consuming weighted round-robin state.
 	HasCandidate(model string, policy RoutingPolicy) bool
+}
+
+// ErrChannelsBusy reports that every line that could serve a request is
+// momentarily at its key's concurrency limit. It is a throttle rather than a
+// refusal: nothing about the configuration is wrong and no upstream has failed,
+// so the request waits for a slot instead of being answered with an error.
+var ErrChannelsBusy = errors.New("every eligible line is at its key's concurrency limit")
+
+// KeyConcurrencyLimiter counts the requests in flight through each upstream key,
+// so an upstream configured with a concurrency of N serves at most N requests per
+// key at a time and one configured with 1 serves one. A line whose concurrency is
+// zero is not limited.
+//
+// The selector asks Busy so a request is placed on a key that has room, and the
+// engine takes the slot with Acquire before it dispatches; both work from the same
+// counter, so a line the selector skipped is one the engine would have refused.
+type KeyConcurrencyLimiter interface {
+	// Busy reports whether the line's key is already at its limit.
+	Busy(channel Channel) bool
+	// Acquire takes one slot of the line's key, answering the release to call
+	// when the request is over. It answers false when the key is at its limit,
+	// which is the race the selector cannot close: two attempts may be chosen for
+	// one key between the two calls.
+	Acquire(channel Channel) (release func(), ok bool)
+	// Wake returns a channel that is closed when a slot is handed back. A caller
+	// takes it before it asks whether a key is busy, so a release that lands while
+	// it is asking is not missed.
+	Wake() <-chan struct{}
+	// Wait blocks until that channel is closed, or the context ends. It reports
+	// the context's error when the wait was abandoned, which is what a request
+	// whose caller hung up answers with.
+	Wait(ctx context.Context, wake <-chan struct{}) error
 }
 
 // FailureObserver receives attempt outcomes so future selectors can implement cooldowns.

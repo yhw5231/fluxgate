@@ -200,6 +200,7 @@ func (s *Server) pinLine(siteID int64, model string) (probe.Line, bool) {
 				continue
 			}
 			return probe.Line{
+				SiteID:         channel.SiteID,
 				ChannelID:      channel.ID,
 				ChannelName:    channel.Name,
 				BaseURL:        channel.BaseURL,

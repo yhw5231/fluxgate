@@ -556,11 +556,11 @@ func TestEngineHoldsOutAMappedLineThatKeepsFailing(t *testing.T) {
 	}
 
 	// The circuit is filed under the model the line was asked for, not the one the
-	// client asked for.
-	if _, known := circuit.Store.Load(breaker.Scope{KeyID: "dead-key", Model: "mapped-model"}); !known {
+	// client asked for, and under the upstream the account belongs to.
+	if _, known := circuit.Store.Load(breaker.Scope{SiteID: 1, KeyID: "dead-key", Model: "mapped-model"}); !known {
 		t.Error("the failing line's circuit is not filed under the model it was asked for")
 	}
-	if !circuit.IsBlocked(domain.Channel{ID: "dead", APIKey: "dead-key", BreakerMode: "key_model_cooldown"}, "mapped-model") {
+	if !circuit.IsBlocked(domain.Channel{ID: "dead", SiteID: 1, APIKey: "dead-key", BreakerMode: "key_model_cooldown"}, "mapped-model") {
 		t.Error("the failing line is not held out of rotation")
 	}
 }
@@ -577,8 +577,8 @@ func TestEngineTracesOnlyTheLinesItAsked(t *testing.T) {
 		mode  string
 		scope breaker.Scope
 	}{
-		{"whole line cooling", "key_cooldown", breaker.Scope{KeyID: "dead-key"}},
-		{"line cooling for the model it is asked for", "key_model_cooldown", breaker.Scope{KeyID: "dead-key", Model: "mapped-model"}},
+		{"whole line cooling", "key_cooldown", breaker.Scope{SiteID: 1, KeyID: "dead-key"}},
+		{"line cooling for the model it is asked for", "key_model_cooldown", breaker.Scope{SiteID: 1, KeyID: "dead-key", Model: "mapped-model"}},
 	}
 
 	for _, scenario := range cooling {

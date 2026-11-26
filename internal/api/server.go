@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -470,13 +471,17 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 		// filed under a credential is shared by every line presenting it, so it
 		// names those lines instead — the credential itself never leaves the
 		// gateway.
-		ChannelID           string   `json:"channel_id,omitempty"`
-		Lines               []string `json:"lines,omitempty"`
-		Model               string   `json:"model,omitempty"`
-		ConsecutiveFailures int      `json:"consecutive_failures"`
-		CooldownLevel       int      `json:"cooldown_level"`
-		BlockedUntil        string   `json:"blocked_until,omitempty"`
-		Disabled            bool     `json:"disabled"`
+		ChannelID string   `json:"channel_id,omitempty"`
+		Lines     []string `json:"lines,omitempty"`
+		Model     string   `json:"model,omitempty"`
+		// SiteID is the upstream a credential-scoped circuit belongs to. One key
+		// string can be an account of two upstreams, and those are two accounts, so
+		// the circuit is filed per upstream and this is what tells them apart.
+		SiteID              int64  `json:"site_id,omitempty"`
+		ConsecutiveFailures int    `json:"consecutive_failures"`
+		CooldownLevel       int    `json:"cooldown_level"`
+		BlockedUntil        string `json:"blocked_until,omitempty"`
+		Disabled            bool   `json:"disabled"`
 	}
 
 	configuration := s.currentConfiguration()
@@ -492,7 +497,9 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 	channels := make([]channelSnapshot, 0, len(configuration.Channels))
 	// A circuit filed under a credential is named by the lines that present it.
 	// The credential is what the circuit is keyed by, so it is the only thing that
-	// can resolve one to the other, and it never leaves the gateway.
+	// can resolve one to the other, and it never leaves the gateway. The upstream
+	// is part of the key: one key string can be an account of two upstreams, and the
+	// lines of one are not the lines of the other.
 	linesByKey := map[string][]string{}
 	for _, route := range configuration.Routes {
 		mappings := make([]modelMappingSnapshot, 0, len(route.ModelMapping))
@@ -507,8 +514,11 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 		})
 
 		for _, channel := range route.Channels {
-			if channel.APIKey != "" && !containsString(linesByKey[channel.APIKey], channel.Name) {
-				linesByKey[channel.APIKey] = append(linesByKey[channel.APIKey], channel.Name)
+			if channel.APIKey != "" {
+				key := channel.CredentialKey()
+				if !containsString(linesByKey[key], channel.Name) {
+					linesByKey[key] = append(linesByKey[key], channel.Name)
+				}
 			}
 			proxySource := "direct"
 			switch {
@@ -578,22 +588,26 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 		if !state.BlockedUntil.IsZero() {
 			blockedUntil = state.BlockedUntil.UTC().Format(time.RFC3339Nano)
 		}
-		lines := append([]string(nil), linesByKey[scope.KeyID]...)
+		lines := append([]string(nil), linesByKey[domain.CredentialKeyOf(scope.SiteID, scope.KeyID)]...)
 		sort.Strings(lines)
 		breakers = append(breakers, breakerSnapshot{
 			Scope:               circuitScopeName(scope),
 			ChannelID:           scope.ChannelID,
 			Lines:               lines,
 			Model:               scope.Model,
+			SiteID:              scope.SiteID,
 			ConsecutiveFailures: state.ConsecutiveFailures,
 			CooldownLevel:       state.CooldownLevel,
 			BlockedUntil:        blockedUntil,
 			Disabled:            state.Disabled,
 		})
 	}
+	// The upstream is part of a credential-scoped circuit's identity, so two
+	// circuits of one key string on two upstreams sort by their own site rather than
+	// in whatever order the map handed them over.
 	sort.Slice(breakers, func(i, j int) bool {
-		left := breakers[i].Scope + "\x00" + breakers[i].ChannelID + "\x00" + strings.Join(breakers[i].Lines, ",") + "\x00" + breakers[i].Model
-		right := breakers[j].Scope + "\x00" + breakers[j].ChannelID + "\x00" + strings.Join(breakers[j].Lines, ",") + "\x00" + breakers[j].Model
+		left := breakers[i].Scope + "\x00" + breakers[i].ChannelID + "\x00" + strings.Join(breakers[i].Lines, ",") + "\x00" + breakers[i].Model + "\x00" + strconv.FormatInt(breakers[i].SiteID, 10)
+		right := breakers[j].Scope + "\x00" + breakers[j].ChannelID + "\x00" + strings.Join(breakers[j].Lines, ",") + "\x00" + breakers[j].Model + "\x00" + strconv.FormatInt(breakers[j].SiteID, 10)
 		return left < right
 	})
 
@@ -629,17 +643,20 @@ func lineCircuit(circuits map[breaker.Scope]breaker.State, channel domain.Channe
 		return breaker.State{}, breaker.Scope{}, false
 	}
 	candidates := []breaker.Scope{
-		breaker.ScopeForMode(channel.BreakerMode, fallback, channel.ID, channel.APIKey, router.ActualModel(routedModelName(route), route, channel)),
+		breaker.ScopeForMode(channel.BreakerMode, fallback, channel.SiteID, channel.ID, channel.APIKey, router.ActualModel(routedModelName(route), route, channel)),
 	}
 	switch breaker.EffectiveMode(channel.BreakerMode, fallback) {
 	case breaker.ModeKeyCooldown:
 		if channel.APIKey != "" {
-			candidates = append(candidates, breaker.Scope{KeyID: channel.APIKey})
+			candidates = append(candidates, breaker.Scope{SiteID: channel.SiteID, KeyID: channel.APIKey})
 		}
 	case breaker.ModeKeyModelCooldown:
 		if channel.APIKey != "" {
 			for scope := range circuits {
-				if scope.KeyID == channel.APIKey && scope.Model != "" {
+				// A circuit is filed per upstream, so another upstream's circuit
+				// under the same key string is another account's and does not hold
+				// this line.
+				if scope.KeyID == channel.APIKey && scope.SiteID == channel.SiteID && scope.Model != "" {
 					candidates = append(candidates, scope)
 				}
 			}

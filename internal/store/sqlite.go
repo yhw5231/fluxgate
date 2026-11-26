@@ -367,6 +367,7 @@ func (s *SQLiteStore) columnExists(ctx context.Context, table, column string) (b
 func (s *SQLiteStore) EnsureBreakerSchema(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS gateway_breaker_states (
 		scope_key TEXT PRIMARY KEY,
+		site_id INTEGER NOT NULL DEFAULT 0,
 		channel_id TEXT NOT NULL DEFAULT '',
 		key_id TEXT NOT NULL DEFAULT '',
 		model TEXT NOT NULL DEFAULT '',
@@ -379,6 +380,13 @@ func (s *SQLiteStore) EnsureBreakerSchema(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create gateway_breaker_states: %w", err)
 	}
+	// A circuit filed under a credential carries the upstream it belongs to, which
+	// is a column an older gateway's table does not have. It is added in place, and
+	// the rows recorded by that gateway are filed under their upstream by
+	// MigrateBreakerScopes.
+	if err := s.addColumnIfMissing(ctx, "gateway_breaker_states", "site_id", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
 	_, err = s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS gateway_breaker_states_blocked_until_idx ON gateway_breaker_states(blocked_until)`)
 	if err != nil {
 		return fmt.Errorf("create breaker expiry index: %w", err)
@@ -386,8 +394,126 @@ func (s *SQLiteStore) EnsureBreakerSchema(ctx context.Context) error {
 	return nil
 }
 
+// MigrateBreakerScopes files the circuits recorded before a key's upstream became
+// part of its identity under their upstream, and reports how many it filed and how
+// many it dropped.
+//
+// A circuit filed under a credential used to name the credential alone, which made
+// one key string on two upstreams one circuit: a failure on either held both out of
+// rotation. The upstream is now part of that identity, so a recorded circuit is
+// rewritten per upstream that holds the credential — the two accounts it always
+// was — and a credential the configuration no longer holds leaves nothing behind.
+// The state itself travels unchanged, including a disabled circuit, so an upgrade
+// neither cools a line down again nor brings a held line back.
+//
+// A circuit filed under a channel needs no migration: a channel id names one line
+// of one upstream, so its key did not have to change.
+func (s *SQLiteStore) MigrateBreakerScopes(ctx context.Context) (int64, int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, fmt.Errorf("begin breaker scope migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	type legacyCircuit struct {
+		scopeKey  string
+		keyID     string
+		model     string
+		failures  int64
+		level     int64
+		blocked   any
+		disabled  int64
+		updatedAt string
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT scope_key, key_id, model, consecutive_failures, cooldown_level, blocked_until, disabled, updated_at
+		FROM gateway_breaker_states WHERE key_id <> '' AND site_id = 0 ORDER BY scope_key`)
+	if err != nil {
+		return 0, 0, fmt.Errorf("read circuits filed under a credential: %w", err)
+	}
+	legacy := make([]legacyCircuit, 0, 8)
+	for rows.Next() {
+		var circuit legacyCircuit
+		if err := rows.Scan(&circuit.scopeKey, &circuit.keyID, &circuit.model, &circuit.failures, &circuit.level, &circuit.blocked, &circuit.disabled, &circuit.updatedAt); err != nil {
+			rows.Close()
+			return 0, 0, fmt.Errorf("scan circuit filed under a credential: %w", err)
+		}
+		legacy = append(legacy, circuit)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, 0, fmt.Errorf("read circuits filed under a credential: %w", err)
+	}
+	rows.Close()
+	if len(legacy) == 0 {
+		return 0, 0, nil
+	}
+
+	filed, dropped := int64(0), int64(0)
+	for _, circuit := range legacy {
+		sites, err := credentialSites(ctx, tx, circuit.keyID)
+		if err != nil {
+			return 0, 0, err
+		}
+		if len(sites) > 0 {
+			for _, siteID := range sites {
+				// A circuit this run has already filed — a restart after an
+				// interrupted upgrade — is left as it stands rather than overwritten
+				// with the older state it was derived from.
+				if _, err := tx.ExecContext(ctx, `INSERT INTO gateway_breaker_states (
+					scope_key, site_id, channel_id, key_id, model, consecutive_failures,
+					cooldown_level, blocked_until, disabled, updated_at
+				) VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?)
+				ON CONFLICT(scope_key) DO NOTHING`,
+					scopeKey(breaker.Scope{SiteID: siteID, KeyID: circuit.keyID, Model: circuit.model}),
+					siteID, circuit.keyID, circuit.model, circuit.failures, circuit.level,
+					circuit.blocked, circuit.disabled, circuit.updatedAt); err != nil {
+					return 0, 0, fmt.Errorf("file circuit under upstream %d: %w", siteID, err)
+				}
+			}
+			filed++
+		} else {
+			dropped++
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM gateway_breaker_states WHERE scope_key = ?`, circuit.scopeKey); err != nil {
+			return 0, 0, fmt.Errorf("remove the circuit filed under a credential alone: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, fmt.Errorf("commit breaker scope migration: %w", err)
+	}
+	return filed, dropped, nil
+}
+
+// credentialSites lists the upstreams whose accounts hold one credential, which is
+// what a circuit recorded under the credential alone has to be filed under. A key
+// may be an account's own credential or one of its tokens, and a credential the
+// configuration no longer holds answers nothing.
+func credentialSites(ctx context.Context, tx *sql.Tx, credential string) ([]int64, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT site_id FROM (
+			SELECT site_id FROM accounts WHERE access_token = ? OR COALESCE(api_token, '') = ?
+			UNION
+			SELECT a.site_id FROM account_tokens t JOIN accounts a ON a.id = t.account_id WHERE t.token = ?
+		) ORDER BY site_id`, credential, credential, credential)
+	if err != nil {
+		return nil, fmt.Errorf("resolve the upstreams holding a credential: %w", err)
+	}
+	defer rows.Close()
+	sites := make([]int64, 0, 2)
+	for rows.Next() {
+		var siteID int64
+		if err := rows.Scan(&siteID); err != nil {
+			return nil, fmt.Errorf("scan the upstream holding a credential: %w", err)
+		}
+		sites = append(sites, siteID)
+	}
+	return sites, rows.Err()
+}
+
 func (s *SQLiteStore) LoadBreakerStates(ctx context.Context) (map[breaker.Scope]breaker.State, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT channel_id, key_id, model, consecutive_failures, cooldown_level, blocked_until, disabled FROM gateway_breaker_states`)
+	rows, err := s.db.QueryContext(ctx, `SELECT site_id, channel_id, key_id, model, consecutive_failures, cooldown_level, blocked_until, disabled FROM gateway_breaker_states`)
 	if err != nil {
 		return nil, fmt.Errorf("load breaker states: %w", err)
 	}
@@ -398,7 +524,7 @@ func (s *SQLiteStore) LoadBreakerStates(ctx context.Context) (map[breaker.Scope]
 		var state breaker.State
 		var blocked sql.NullString
 		var disabled int
-		if err := rows.Scan(&scope.ChannelID, &scope.KeyID, &scope.Model, &state.ConsecutiveFailures, &state.CooldownLevel, &blocked, &disabled); err != nil {
+		if err := rows.Scan(&scope.SiteID, &scope.ChannelID, &scope.KeyID, &scope.Model, &state.ConsecutiveFailures, &state.CooldownLevel, &blocked, &disabled); err != nil {
 			return nil, fmt.Errorf("scan breaker state: %w", err)
 		}
 		state.Disabled = disabled != 0
@@ -434,9 +560,10 @@ func (s *SQLiteStore) UpdateBreakerState(ctx context.Context, scope breaker.Scop
 		blocked = next.BlockedUntil.UTC().Format(time.RFC3339Nano)
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO gateway_breaker_states (
-		scope_key, channel_id, key_id, model, consecutive_failures, cooldown_level, blocked_until, disabled, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		scope_key, site_id, channel_id, key_id, model, consecutive_failures, cooldown_level, blocked_until, disabled, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(scope_key) DO UPDATE SET
+		site_id=excluded.site_id,
 		channel_id=excluded.channel_id,
 		key_id=excluded.key_id,
 		model=excluded.model,
@@ -444,7 +571,7 @@ func (s *SQLiteStore) UpdateBreakerState(ctx context.Context, scope breaker.Scop
 		cooldown_level=excluded.cooldown_level,
 		blocked_until=excluded.blocked_until,
 		disabled=excluded.disabled,
-		updated_at=excluded.updated_at`, scopeKey(scope), scope.ChannelID, scope.KeyID, scope.Model,
+		updated_at=excluded.updated_at`, scopeKey(scope), scope.SiteID, scope.ChannelID, scope.KeyID, scope.Model,
 		next.ConsecutiveFailures, next.CooldownLevel, blocked, boolInt(next.Disabled), time.Now().UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return breaker.State{}, fmt.Errorf("upsert breaker state: %w", err)
@@ -754,6 +881,14 @@ func (s *SQLiteStore) loadRoutes(ctx context.Context, configuration *Configurati
 		return err
 	}
 
+	// How many requests at a time each upstream's keys may carry is stored the
+	// same way, and it reaches every line of that upstream: a limit belongs to the
+	// account, and the account is what the line dispatches with.
+	keyConcurrencies, err := upstreamKeyConcurrenciesFrom(configuration.Settings)
+	if err != nil {
+		return err
+	}
+
 	// The internal-provider pins are attached per upstream, so they are read once
 	// and handed to the lines of whichever upstream they belong to.
 	pins, err := s.loadModelPins(ctx)
@@ -761,7 +896,7 @@ func (s *SQLiteStore) loadRoutes(ctx context.Context, configuration *Configurati
 		return err
 	}
 
-	channels, err := s.loadChannelRows(ctx, routes, routeIndex, priorities, cdModes, pins)
+	channels, err := s.loadChannelRows(ctx, routes, routeIndex, priorities, cdModes, keyConcurrencies, pins)
 	if err != nil {
 		return err
 	}
@@ -812,7 +947,7 @@ func (s *SQLiteStore) loadRouteRows(ctx context.Context, groupSources map[int64]
 	return routes, rows.Err()
 }
 
-func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route, routeIndex map[int64]int, sitePriorities map[int64]int, siteCDModes map[int64]string, modelPins map[int64][]domain.ModelPin) ([]domain.Channel, error) {
+func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route, routeIndex map[int64]int, sitePriorities map[int64]int, siteCDModes map[int64]string, siteKeyConcurrencies map[int64]int, modelPins map[int64][]domain.ModelPin) ([]domain.Channel, error) {
 	rows, err := s.db.QueryContext(ctx, channelQuery)
 	if err != nil {
 		return nil, fmt.Errorf("load route channels: %w", err)
@@ -889,6 +1024,7 @@ func (s *SQLiteStore) loadChannelRows(ctx context.Context, routes []domain.Route
 			UpstreamAPI:        strings.TrimSpace(siteUpstreamAPI),
 			SitePoolID:         sitePoolID,
 			Pins:               modelPins[siteID],
+			KeyConcurrency:     siteKeyConcurrencies[siteID],
 		}
 		// The upstream's own cooldown mode decides how a failing key is held out
 		// of rotation: per key, or per key and model. An upstream the console has
@@ -1035,7 +1171,16 @@ func parseTime(value string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unsupported time value %q", value)
 }
 
+// scopeKey is the primary key a circuit is recorded under. The upstream is part of
+// it only when the circuit carries one: a circuit filed under a credential names
+// the account, which is the credential in one upstream, while one filed under a
+// channel names a line whose id already belongs to one upstream. Leaving the
+// upstream out of the second shape is what keeps the circuits of every line
+// recorded by an earlier gateway readable without rewriting them.
 func scopeKey(scope breaker.Scope) string {
+	if scope.SiteID != 0 {
+		return strconv.FormatInt(scope.SiteID, 10) + "\x00" + scope.ChannelID + "\x00" + scope.KeyID + "\x00" + scope.Model
+	}
 	return scope.ChannelID + "\x00" + scope.KeyID + "\x00" + scope.Model
 }
 
