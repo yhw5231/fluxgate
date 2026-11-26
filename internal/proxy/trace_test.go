@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yhw5231/fluxgate/internal/domain"
 	"github.com/yhw5231/fluxgate/internal/router"
@@ -185,5 +186,90 @@ func TestForwardRedactsTheCredentialFromAnUpstreamError(t *testing.T) {
 	}
 	if !strings.Contains(string(received), "sk-leaky-upstream") {
 		t.Errorf("body = %q, want the upstream's own bytes", received)
+	}
+}
+
+// A failure that happened before anything was sent still names the line: the
+// record of a failed request that does not say which upstream it was about is a
+// blank an operator cannot act on.
+func TestForwardNamesTheLineEvenWhenNothingWasSent(t *testing.T) {
+	engine := Engine{
+		Selector: router.NewMemorySelector(routeFor(nil, domain.Channel{
+			// An address no request can be built from, which is the one failure a
+			// line can have without its upstream ever seeing the request.
+			ID: "line", Name: "relay", BaseURL: "http://exa mple.com/v1", Enabled: true,
+		})),
+		Client: &http.Client{},
+		Policy: domain.RetryPolicy{MaxAttempts: 1, MaxAttemptsPerChannel: 1},
+	}
+
+	result, err := engine.Forward(context.Background(), domain.Request{
+		Method: http.MethodPost, Path: "/v1/chat/completions",
+		Body: []byte(`{"model":"m"}`), Model: "m", RequestID: "req-1",
+	})
+	if err == nil {
+		t.Fatal("Forward() error = nil, want the unusable address to fail the request")
+	}
+	if !strings.Contains(err.Error(), "relay (line line)") {
+		t.Errorf("error = %q, want the line named", err)
+	}
+	if len(result.Trace.Attempts) != 1 {
+		t.Fatalf("traced attempts = %d, want the selected line recorded: %#v",
+			len(result.Trace.Attempts), result.Trace.Attempts)
+	}
+	attempt := result.Trace.Attempts[0]
+	if attempt.ChannelName != "relay" || attempt.ChannelID != "line" {
+		t.Errorf("attempt line = %q/%q, want relay/line", attempt.ChannelName, attempt.ChannelID)
+	}
+	if attempt.Error == "" {
+		t.Error("attempt records no reason, want what stopped it")
+	}
+}
+
+// headerTimeoutError stands in for the transport's response-header bound expiring,
+// which the transport reports as a plain timeout.
+type headerTimeoutError struct{}
+
+func (headerTimeoutError) Error() string { return "http2: timeout awaiting response headers" }
+func (headerTimeoutError) Timeout() bool { return true }
+
+// A configured response-header bound expiring is a limit of the gateway's own, not
+// an upstream that answered nothing. The recorded failure has to say which bound
+// expired and on which line; without that, a model that was still thinking is read
+// as a dead upstream.
+func TestForwardNamesTheBoundThatExpiredAndTheLine(t *testing.T) {
+	engine := Engine{
+		Selector: router.NewMemorySelector(routeFor(nil, domain.Channel{
+			ID: "7", Name: "hun-ds4.1", BaseURL: "https://hub.example/v1", Enabled: true,
+		})),
+		Client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, headerTimeoutError{}
+		})},
+		ResponseHeaderTimeout: 30 * time.Second,
+		Policy:                domain.RetryPolicy{MaxAttempts: 1, MaxAttemptsPerChannel: 1},
+	}
+
+	result, err := engine.Forward(context.Background(), domain.Request{
+		Method: http.MethodPost, Path: "/v1/chat/completions",
+		Body: []byte(`{"model":"m"}`), Model: "m",
+	})
+	if err == nil {
+		t.Fatal("Forward() error = nil, want the expired bound to fail the request")
+	}
+	for _, want := range []string{
+		"hun-ds4.1 (line 7)",
+		"timeout awaiting response headers",
+		"response header timeout",
+		"30s",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to contain %q", err, want)
+		}
+	}
+	if len(result.Trace.Attempts) != 1 || result.Trace.Attempts[0].ChannelName != "hun-ds4.1" {
+		t.Fatalf("trace = %#v, want the line recorded", result.Trace.Attempts)
+	}
+	if !strings.Contains(result.Trace.Attempts[0].Error, "response header timeout") {
+		t.Errorf("attempt error = %q, want the bound named", result.Trace.Attempts[0].Error)
 	}
 }

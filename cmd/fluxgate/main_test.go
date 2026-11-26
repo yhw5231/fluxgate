@@ -1,9 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"log/slog"
 	"net/http"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/yhw5231/fluxgate/internal/config"
 	"github.com/yhw5231/fluxgate/internal/domain"
 	"github.com/yhw5231/fluxgate/internal/store"
 )
@@ -96,5 +101,41 @@ func TestBuildProxyResolverModelsChannelAndSiteProxyDecisions(t *testing.T) {
 	}
 	if got := resolver.Config.Sites["system-site.example"]; got != "system" {
 		t.Fatalf("system site proxy decision = %q, want system", got)
+	}
+}
+
+// A response-header bound shorter than the request timeout decides the same phase
+// first, so a model that is still thinking is recorded as a failed upstream. The
+// setting comes from the deployment's environment, so it is named at startup; the
+// documented default stays quiet.
+func TestWarnResponseHeaderTimeoutBelowTheRequestTimeout(t *testing.T) {
+	var logged bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logged, nil))
+
+	warnResponseHeaderTimeout(logger, config.Config{
+		RequestTimeout:        5 * time.Minute,
+		ResponseHeaderTimeout: 30 * time.Second,
+	})
+	warning := logged.String()
+	if !strings.Contains(warning, "response_header_timeout_below_request_timeout") {
+		t.Fatalf("log = %q, want the header bound named", warning)
+	}
+	if !strings.Contains(warning, "30s") || !strings.Contains(warning, "5m0s") {
+		t.Errorf("log = %q, want both bounds", warning)
+	}
+
+	logged.Reset()
+	warnResponseHeaderTimeout(logger, config.Config{RequestTimeout: 5 * time.Minute})
+	if logged.Len() != 0 {
+		t.Errorf("log = %q, want silence when the header bound is off", logged.String())
+	}
+
+	logged.Reset()
+	warnResponseHeaderTimeout(logger, config.Config{
+		RequestTimeout:        5 * time.Minute,
+		ResponseHeaderTimeout: 10 * time.Minute,
+	})
+	if logged.Len() != 0 {
+		t.Errorf("log = %q, want silence when the header bound is the longer one", logged.String())
 	}
 }

@@ -816,7 +816,10 @@ the attempt was retried, and as much of the upstream's own response body as expl
 failure (512 bytes, whitespace collapsed, with the credential the attempt presented
 redacted if the upstream echoed it). No upstream credential appears anywhere in a
 record: the line an attempt ran on identifies the key, and the gateway is the only party
-that ever holds the secret.
+that ever holds the secret. An attempt that never left the gateway — an address that
+cannot be parsed, a proxy that cannot be resolved — is recorded on its line as well,
+with the reason it stopped there, so a failed request always says which upstream it was
+about instead of showing a blank where the line belongs.
 
 An upstream error the gateway relays unchanged — a 400 or a 5xx that reaches the client as
 itself — is recorded with its reason too, not only its status: `upstream_rejected` for a
@@ -851,15 +854,21 @@ inside its error body:
 {
   "error": {
     "code": "upstream_unavailable",
-    "message": "upstream request failed after attempt 2 with status 429: {\"error\":{\"message\":\"insufficient balance\"}}",
+    "message": "relay (line 7) failed after attempt 2 with status 429: {\"error\":{\"message\":\"insufficient balance\"}}",
     "type": "gateway_error",
     "request_id": "9f2c1a7b4e8d0356",
     "attempts": 2,
+    "upstream": "relay",
+    "channel_id": "7",
     "upstream_status": 429,
     "upstream_message": "{\"error\":{\"message\":\"insufficient balance\"}}"
   }
 }
 ```
+
+The message opens with the line the failure happened on — the upstream, and the line
+itself — because a caller of a gateway holding several upstreams can do nothing with
+an anonymous URL. `upstream` and `channel_id` repeat it in the structured fields.
 
 The upstream's answer travels to the client as well as to the log, because an opaque
 `502 upstream_unavailable` costs an operator a trip through the gateway's console for
@@ -1122,13 +1131,20 @@ Proxy errors use the OpenAI error envelope with a `code` field:
   can serve it. No upstream request is attempted.
 - `502 upstream_unavailable`: every attempt against the selected channels
   failed. The response carries the last upstream status.
-- `504 upstream_timeout`: the attempt took longer than
-  `FLUXGATE_REQUEST_TIMEOUT` before the upstream answered.
+- `504 upstream_timeout`: a bound of the gateway's own expired before the upstream
+  answered — `FLUXGATE_REQUEST_TIMEOUT` for a whole attempt, or
+  `FLUXGATE_RESPONSE_HEADER_TIMEOUT` when that bound is configured. The message
+  names the bound that expired, so a timeout is not read as an upstream fault.
 - `504 upstream_silent`: a streamed answer went quiet for longer than
   `FLUXGATE_STREAM_IDLE_TIMEOUT`, or the upstream never started answering it.
 - `499 client_canceled`: the caller closed the connection while the upstream was
   still working, and the upstream request was canceled with it. The caller is not
   there to read this; it is recorded so the console shows what actually happened.
+
+Every failure that happened on a line names that line — the upstream and the line
+it was reached on — in its message, and carries `upstream` and `channel_id` beside
+`upstream_status` in its details. A failed request can therefore be reported with
+the upstream it was about instead of being quoted as an anonymous URL.
 
 Example model request:
 
@@ -1569,7 +1585,11 @@ removes its entry rather than storing one.
   the upstream may take to start answering; a second, shorter bound underneath it
   cut requests off before that one could apply, and the upstream then recorded a
   canceled request while the gateway was still waiting. Set it only to impose a
-  bound on the response header alone.
+  bound on the response header alone. A value shorter than
+  `FLUXGATE_REQUEST_TIMEOUT` is logged at startup (`response_header_timeout_below_request_timeout`)
+  and recorded as a `504 upstream_timeout` failure naming that bound, because a
+  model that is still thinking when it expires is otherwise mistaken for a failed
+  upstream.
 - `FLUXGATE_IDLE_CONN_TIMEOUT`: Upstream idle connection timeout. Default: `90s`.
 - `FLUXGATE_READ_HEADER_TIMEOUT`: Downstream request-header timeout. Default: `10s`.
 - `FLUXGATE_READ_TIMEOUT`: Downstream request read timeout. Default: `30s`.

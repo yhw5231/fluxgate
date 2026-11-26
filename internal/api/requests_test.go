@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -384,6 +385,60 @@ func TestPassthroughUpstreamErrorIsRecordedWithItsReason(t *testing.T) {
 	first, _ := attempts[0].(map[string]any)
 	if !strings.Contains(first["response"].(string), "unsupported parameter") {
 		t.Errorf("attempt response = %v, want the upstream body", first["response"])
+	}
+}
+
+// transportTimeout stands in for a transport timeout — the response-header bound
+// expiring, most often — which arrives as a plain timeout rather than as a done
+// context.
+type transportTimeout struct{}
+
+func (transportTimeout) Error() string { return "http2: timeout awaiting response headers" }
+func (transportTimeout) Timeout() bool { return true }
+
+// A transport timeout is a bound of the gateway's own expiring, not an upstream
+// refusing: it is a 504, and the failure says which line it was about. Reported as
+// a bad gateway it would send an operator looking for a fault that is not there.
+func TestTimeoutIsAttributedToItsLine(t *testing.T) {
+	trace := domain.RequestTrace{Attempts: []domain.AttemptTrace{{
+		Number: 1, ChannelID: "7", ChannelName: "hun-ds4.1", Model: "deepseek-v4.1-flash",
+		Error: "Post \"https://hub.wanai.de/v1/chat/completions\": http2: timeout awaiting response headers",
+	}}}
+	err := fmt.Errorf("hun-ds4.1 (line 7) failed after attempt 1: %w", transportTimeout{})
+
+	failure := classifyDispatchError(err, trace, "req-1", false)
+	if failure.Status != http.StatusGatewayTimeout || failure.Code != "upstream_timeout" {
+		t.Errorf("failure = %d %q, want 504 upstream_timeout", failure.Status, failure.Code)
+	}
+	if failure.Details["upstream"] != "hun-ds4.1" || failure.Details["channel_id"] != "7" {
+		t.Errorf("details = %v, want the line that failed", failure.Details)
+	}
+	if !strings.Contains(failure.Message, "hun-ds4.1 (line 7)") {
+		t.Errorf("message = %q, want the line named", failure.Message)
+	}
+	// The cause is quoted once: the engine's message already carries it.
+	if count := strings.Count(failure.Message, "timeout awaiting response headers"); count != 1 {
+		t.Errorf("message = %q, want the cause quoted once, got %d", failure.Message, count)
+	}
+}
+
+// An upstream error relayed to the client names the upstream that answered: the
+// caller talks to a gateway holding several, and "the upstream" alone leaves it
+// guessing which one replied.
+func TestPassthroughFailureNamesTheLine(t *testing.T) {
+	trace := domain.RequestTrace{Attempts: []domain.AttemptTrace{{
+		Number: 1, ChannelID: "7", ChannelName: "hun-ds4.1", StatusCode: http.StatusTooManyRequests,
+		Response: `{"error":{"message":"insufficient balance"}}`,
+	}}}
+
+	code, message := passthroughFailure(trace, http.StatusTooManyRequests)
+	if code != "upstream_rejected" {
+		t.Errorf("code = %q, want upstream_rejected", code)
+	}
+	for _, want := range []string{"hun-ds4.1 (line 7)", "HTTP 429", "insufficient balance"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("message = %q, want it to contain %q", message, want)
+		}
 	}
 }
 

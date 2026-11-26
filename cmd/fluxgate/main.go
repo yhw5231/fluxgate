@@ -132,6 +132,7 @@ func run(parent context.Context, logger *slog.Logger) error {
 	}
 
 	applyRequestTimeout(&configuration, cfg.RequestTimeout)
+	warnResponseHeaderTimeout(logger, cfg)
 
 	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
 	baseTransport.DialContext = (&net.Dialer{
@@ -217,16 +218,17 @@ func run(parent context.Context, logger *slog.Logger) error {
 		},
 	}
 	engine := &proxy.Engine{
-		Selector:           selector,
-		Observer:           observer,
-		Client:             &http.Client{Transport: baseTransport},
-		MediaClient:        &http.Client{Transport: mediaTransport},
-		ProxyResolver:      proxyResolver,
-		TransportPool:      transportPool,
-		MediaTransportPool: mediaTransportPool,
-		StreamIdleTimeout:  cfg.StreamIdleTimeout,
-		Policy:             cfg.Retry,
-		Failover:           &cfg.Failover,
+		Selector:              selector,
+		Observer:              observer,
+		Client:                &http.Client{Transport: baseTransport},
+		MediaClient:           &http.Client{Transport: mediaTransport},
+		ProxyResolver:         proxyResolver,
+		TransportPool:         transportPool,
+		MediaTransportPool:    mediaTransportPool,
+		StreamIdleTimeout:     cfg.StreamIdleTimeout,
+		ResponseHeaderTimeout: cfg.ResponseHeaderTimeout,
+		Policy:                cfg.Retry,
+		Failover:              &cfg.Failover,
 	}
 	// The runtime policy is the environment's settings with whatever the console
 	// stored on top of them. It is installed once here and again after every
@@ -359,6 +361,26 @@ func applyRequestTimeout(configuration *store.Configuration, fallback time.Durat
 			configuration.Channels[index].RequestTimeout = fallback
 		}
 	}
+}
+
+// warnResponseHeaderTimeout reports the two-bound setting that turns a slow model
+// into a failed upstream: a response-header bound expiring underneath the request
+// timeout that was supposed to be the only limit on how long an upstream may take to
+// start answering.
+//
+// The documented default is zero, so a value here came from the deployment's own
+// environment — often one carried over from a release whose default was 30s. Naming
+// it at startup is what keeps it from being rediscovered request by request, as an
+// upstream that "did not answer".
+func warnResponseHeaderTimeout(logger *slog.Logger, cfg config.Config) {
+	if cfg.ResponseHeaderTimeout <= 0 || cfg.ResponseHeaderTimeout >= cfg.RequestTimeout {
+		return
+	}
+	logger.Warn("response_header_timeout_below_request_timeout",
+		"response_header_timeout", cfg.ResponseHeaderTimeout.String(),
+		"request_timeout", cfg.RequestTimeout.String(),
+		"detail", "an upstream slower than the response header timeout is reported as a failed one; set FLUXGATE_RESPONSE_HEADER_TIMEOUT=0 to bound only by FLUXGATE_REQUEST_TIMEOUT",
+	)
 }
 
 func buildProxyResolver(configuration store.Configuration) *proxy.Resolver {

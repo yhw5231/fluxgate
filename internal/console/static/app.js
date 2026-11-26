@@ -3585,7 +3585,7 @@
   function requestLineSummary(attempts) {
     var path = [];
     (attempts || []).forEach(function (attempt) {
-      var name = text(attempt.channel_name, '#' + attempt.channel_id);
+      var name = attemptLineName(attempt);
       // Consecutive repeats are one step: trying another key of the same upstream
       // is still the same upstream, but coming back to one is a step of its own.
       if (path.length === 0 || path[path.length - 1] !== name) { path.push(name); }
@@ -3661,7 +3661,7 @@
       attempts.forEach(function (attempt) {
         var status = number(attempt.status);
         var line = '  #' + number(attempt.number) + ' ' +
-          text(attempt.channel_name, '#' + attempt.channel_id) + ' · ' +
+          attemptLineName(attempt) + ' · ' +
           text(attempt.model, '—') + ' · ' +
           (status === 0 ? '连接失败' : 'HTTP ' + status) + ' · ' +
           formatMilliseconds(attempt.duration_ms);
@@ -3740,13 +3740,23 @@
    * and the key that carried it. The failover path is the parent row's business;
    * the key is readable here, which is what this expanded record is for. */
   function attemptLine(attempt) {
-    var upstream = text(attempt.channel_name, '#' + attempt.channel_id);
+    var upstream = attemptLineName(attempt);
     var key = lineKeyLabel(attempt.channel_id);
     var node = element('span', 'line-path');
     node.appendChild(element('span', 'cell-strong', upstream));
     node.appendChild(element('span', 'cell-muted', key));
     node.title = upstream + ' · ' + key;
     return node;
+  }
+
+  /* attemptLineName is the upstream an attempt went to, and never nothing: the
+   * record exists to say where a failure happened, so a line whose upstream name
+   * is not resolvable any more is named by its id rather than left blank. */
+  function attemptLineName(attempt) {
+    var name = text(attempt.channel_name, '');
+    if (name !== '') { return name; }
+    var id = String(attempt.channel_id === null || attempt.channel_id === undefined ? '' : attempt.channel_id);
+    return id !== '' ? '#' + id : '未知线路';
   }
 
   /* lineKeyLabel names the key behind a line id: 「令牌 #23」 or 「凭据 #5」 while

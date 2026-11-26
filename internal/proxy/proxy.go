@@ -81,7 +81,13 @@ type Engine struct {
 	// because a long answer would be cut off as if the upstream had failed. When
 	// zero, DefaultStreamIdleTimeout is used.
 	StreamIdleTimeout time.Duration
-	Policy            domain.RetryPolicy
+	// ResponseHeaderTimeout is the transport's response-header bound when one is
+	// configured, which is zero by default. It is carried here for one reason: the
+	// transport reports its expiry as a plain timeout, and a timeout that does not
+	// say which bound expired reads as an upstream that answered nothing. Knowing
+	// the value lets the recorded failure name the bound instead.
+	ResponseHeaderTimeout time.Duration
+	Policy                domain.RetryPolicy
 	// Failover is the static failover configuration. A nil value means the
 	// engine's own default: a failed channel may be replaced by any other
 	// eligible one.
@@ -183,6 +189,7 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 		attempt := domain.Attempt{
 			Number:       attemptNumber,
 			ChannelID:    channel.ID,
+			ChannelName:  channel.Name,
 			ChannelIndex: channelAttempt,
 			KeyID:        channel.APIKey,
 			Model:        selection.Model,
@@ -196,6 +203,24 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 			ChannelName: channel.Name,
 			Model:       selection.Model,
 			StartedAt:   attempt.StartedAt,
+		}
+		// note records a line the request was selected onto but nothing was sent
+		// through. The line is still the answer to "where did this fail": a trace
+		// that leaves it out makes the record of a failed request read as if no
+		// line had ever been chosen, and the console can then only show a blank
+		// where the upstream belongs.
+		note := func(cause error) {
+			traced.Error = cause.Error()
+			traced.DurationMS = now().Sub(attempt.StartedAt).Milliseconds()
+			trace.Attempts = append(trace.Attempts, traced)
+		}
+		// abandon is note for the cases where the failure ends the request, and it
+		// names the line in the error as well: a failure that only the request log
+		// can attribute leaves the caller reading a sentence about nothing.
+		abandon := func(cause error) (Result, error) {
+			note(cause)
+			return Result{Trace: trace}, fmt.Errorf("the request could not be sent over %s: %w",
+				domain.LineLabel(channel.Name, channel.ID), cause)
 		}
 
 		// A line may speak a different conversational protocol than the caller
@@ -211,22 +236,21 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 				// This line cannot express the request, but another one may. The
 				// line is skipped without a circuit failure — its upstream did
 				// nothing wrong — and the request keeps its bounded number of
-				// attempts.
-				traced.Error = convertErr.Error()
-				traced.DurationMS = now().Sub(attempt.StartedAt).Milliseconds()
-				trace.Attempts = append(trace.Attempts, traced)
+				// attempts. It is still the line the request failed on while it is
+				// the only one, so the trace keeps it.
 				conversionFailure = convertErr
 				excluded[channel.ID] = struct{}{}
 				if !policy.Failover.Enabled || attemptNumber >= retry.MaxAttempts {
-					return Result{Trace: trace}, convertErr
+					return abandon(convertErr)
 				}
+				note(convertErr)
 				continue
 			}
 			body = transform.Body{Raw: converted, ContentType: "application/json", Shape: transform.ShapeJSON}
 		}
 		body, err = body.Rewrite(selection.Model, channel.Transform)
 		if err != nil {
-			return Result{Trace: trace}, err
+			return abandon(err)
 		}
 		// An upstream that serves one model from several internal providers can be
 		// told which one to use. The pin is written per attempt, because a strict
@@ -237,7 +261,7 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 			if selected, strict := pin.StrictProviderFor(channelAttempt); strict || pin.Pinned() {
 				updated, pinErr := transform.ApplyModelPin(body.Raw, pin, selected)
 				if pinErr != nil {
-					return Result{Trace: trace}, pinErr
+					return abandon(pinErr)
 				}
 				if len(updated) > 0 {
 					body = transform.Body{Raw: updated, ContentType: body.ContentType, Shape: body.Shape}
@@ -246,7 +270,7 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 		}
 		call, err := buildRequest(ctx, input, channel, body, streamIdle, conversion.UpstreamPath(input.Path))
 		if err != nil {
-			return Result{Trace: trace}, err
+			return abandon(err)
 		}
 		request := call.request
 
@@ -255,7 +279,7 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 			resolved, resolveErr := e.ProxyResolver.Resolve(ProxyRequest{KeyID: channel.APIKey, TargetURL: request.URL})
 			if resolveErr != nil {
 				call.cancel()
-				return Result{Trace: trace}, resolveErr
+				return abandon(resolveErr)
 			}
 			pool := e.TransportPool
 			if input.Media && e.MediaTransportPool != nil {
@@ -267,7 +291,7 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 			dispatchClient, err = pool.Client(resolved)
 			if err != nil {
 				call.cancel()
-				return Result{Trace: trace}, err
+				return abandon(err)
 			}
 		}
 
@@ -277,6 +301,12 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 			// transport reports that as a canceled context, which says nothing about
 			// who canceled it, so the bound that actually expired is named here.
 			dispatchErr = fmt.Errorf("%w: the upstream did not start answering within %s", ErrStreamSilent, call.firstByte)
+		} else if dispatchErr != nil && e.responseHeaderTimeoutExpired(dispatchErr, ctx) {
+			// The transport's own header bound expired. It reports that as a plain
+			// timeout, which reads as an upstream that answered nothing: naming the
+			// bound is what tells an operator that the gateway gave up on a model
+			// that was still thinking, and which setting to look at.
+			dispatchErr = fmt.Errorf("%w: the upstream did not send response headers within the %s response header timeout", dispatchErr, e.ResponseHeaderTimeout)
 		}
 		call.answer(response, streamIdle)
 		traced.DurationMS = now().Sub(attempt.StartedAt).Milliseconds()
@@ -342,6 +372,24 @@ func (e *Engine) Forward(ctx context.Context, input domain.Request) (Result, err
 		return Result{Trace: trace}, conversionFailure
 	}
 	return Result{Trace: trace}, finalError(lastFailure)
+}
+
+// responseHeaderTimeoutExpired reports whether a dispatch failed on the transport's
+// response-header bound rather than on the attempt's own deadline. Only the transport
+// knows about that bound, and it reports its expiry as a timeout without saying which
+// one expired; because the engine knows the value it configured, it can attribute the
+// failure instead of leaving it looking like an upstream that answered nothing.
+func (e *Engine) responseHeaderTimeoutExpired(err error, ctx context.Context) bool {
+	if err == nil || e.ResponseHeaderTimeout <= 0 {
+		return false
+	}
+	// A request the caller abandoned, or one whose own deadline passed, is not this
+	// bound's doing even when the transport reports it as a timeout.
+	if ctx.Err() != nil {
+		return false
+	}
+	var timeout interface{ Timeout() bool }
+	return errors.As(err, &timeout) && timeout.Timeout()
 }
 
 // selectionRequest builds one lookup, restricted to the channel or the upstream
@@ -758,11 +806,12 @@ func drainAndClose(body io.ReadCloser) {
 }
 
 func finalError(failure domain.Failure) error {
+	line := domain.LineLabel(failure.Attempt.ChannelName, failure.Attempt.ChannelID)
 	if failure.Err != nil {
-		return fmt.Errorf("upstream request failed after attempt %d: %w", failure.Attempt.Number, failure.Err)
+		return fmt.Errorf("%s failed after attempt %d: %w", line, failure.Attempt.Number, failure.Err)
 	}
 	if failure.StatusCode != 0 {
-		return fmt.Errorf("upstream request failed after attempt %d with status %d", failure.Attempt.Number, failure.StatusCode)
+		return fmt.Errorf("%s failed after attempt %d with status %d", line, failure.Attempt.Number, failure.StatusCode)
 	}
-	return errors.New("upstream request failed")
+	return fmt.Errorf("%s failed", line)
 }

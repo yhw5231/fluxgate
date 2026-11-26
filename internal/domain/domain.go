@@ -547,8 +547,14 @@ type Request struct {
 
 // Attempt describes a single upstream dispatch for observability and selectors.
 type Attempt struct {
-	Number       int
+	Number int
+	// ChannelID is the line the attempt went out on, and ChannelName is the
+	// upstream that line belongs to. The name travels with the attempt so a
+	// failure can be reported by name: an observer, or the record of a request
+	// that could not be dispatched, has no route table to look either of them up
+	// in, and a failure that names no upstream is one nobody can act on.
 	ChannelID    string
+	ChannelName  string
 	ChannelIndex int
 	KeyID        string
 	Model        string
@@ -585,6 +591,26 @@ type AttemptTrace struct {
 // led to it.
 type RequestTrace struct {
 	Attempts []AttemptTrace `json:"attempts"`
+}
+
+// LineLabel names one line the way a person reads it: the upstream it belongs to
+// and the line itself, which is the credential that carried the attempt. A line
+// whose upstream name is missing — an imported configuration, a site renamed to
+// nothing — still gets a label, because a failure that names nothing is one nobody
+// can act on.
+func LineLabel(name, id string) string {
+	name = strings.TrimSpace(name)
+	id = strings.TrimSpace(id)
+	switch {
+	case name != "" && id != "":
+		return name + " (line " + id + ")"
+	case name != "":
+		return name
+	case id != "":
+		return "line " + id
+	default:
+		return "the selected line"
+	}
 }
 
 // LastFailure returns the last attempt that did not succeed, which is the one

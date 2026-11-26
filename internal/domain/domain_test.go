@@ -208,3 +208,26 @@ func TestAllowsModelAcceptsEverySpellingOfAnAllowedRoute(t *testing.T) {
 		}
 	}
 }
+
+// A failure has to name the line it happened on. The label is built from whatever
+// the record still holds, so it never comes out blank — a line whose upstream name
+// is gone is named by its id rather than by nothing.
+func TestLineLabelNeverEndsUpEmpty(t *testing.T) {
+	cases := []struct {
+		name     string
+		upstream string
+		id       string
+		expected string
+	}{
+		{"named", "relay", "7", "relay (line 7)"},
+		{"unnamed upstream", "", "7", "line 7"},
+		{"no line id", "relay", "", "relay"},
+		{"neither", "  ", "  ", "the selected line"},
+	}
+	for _, testCase := range cases {
+		if got := LineLabel(testCase.upstream, testCase.id); got != testCase.expected {
+			t.Errorf("%s: LineLabel(%q, %q) = %q, want %q",
+				testCase.name, testCase.upstream, testCase.id, got, testCase.expected)
+		}
+	}
+}

@@ -226,6 +226,11 @@ func passthroughFailure(trace domain.RequestTrace, status int) (code, message st
 		code = "upstream_error"
 	}
 	if last, ok := trace.LastFailure(); ok {
+		// Naming the line is what makes a relayed upstream error actionable: the
+		// caller talks to a gateway with several upstreams, and "the upstream" on
+		// its own leaves it guessing which one answered.
+		message = fmt.Sprintf("the upstream %s answered HTTP %d",
+			domain.LineLabel(last.ChannelName, last.ChannelID), status)
 		switch {
 		case strings.TrimSpace(last.Response) != "":
 			message += ": " + strings.TrimSpace(last.Response)
@@ -298,18 +303,28 @@ func classifyDispatchError(err error, trace domain.RequestTrace, requestID strin
 		// The upstream's own answer is the part of a failure that names the cause,
 		// so it is handed to the client rather than left in the console. The
 		// gateway is the operator's own proxy and the caller already holds a key
-		// for it; an opaque 502 only costs them a round trip through the logs.
-		if last.Response != "" {
-			message += ": " + last.Response
-		}
-		if last.Error != "" {
-			message += ": " + last.Error
+		// for it; an opaque 502 only costs them a round trip through the logs. It
+		// is added only once: an engine message already carries the transport
+		// failure it was built from, and repeating that reads as two faults.
+		if response := strings.TrimSpace(last.Response); response != "" && !strings.Contains(message, response) {
+			message += ": " + response
 		}
 		if last.StatusCode != 0 {
 			details["upstream_status"] = last.StatusCode
 		}
 		if last.Response != "" {
 			details["upstream_message"] = last.Response
+		}
+		// Which line failed travels with the failure, by the name a person reads:
+		// a failure that does not say which upstream answered leaves every caller
+		// of this API guessing from the log.
+		if name := strings.TrimSpace(last.ChannelName); name != "" {
+			details["upstream"] = name
+		} else if last.ChannelID != "" {
+			details["upstream"] = "#" + last.ChannelID
+		}
+		if last.ChannelID != "" {
+			details["channel_id"] = last.ChannelID
 		}
 	}
 	if clientGone {
@@ -333,6 +348,19 @@ func classifyDispatchError(err error, trace domain.RequestTrace, requestID strin
 		}
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
+		return dispatchFailure{
+			Status:  http.StatusGatewayTimeout,
+			Code:    "upstream_timeout",
+			Message: message,
+			Details: details,
+		}
+	}
+	// A transport timeout — the response-header bound, most often — is a bound of
+	// the gateway's own expiring as well. It arrives as a plain timeout rather than
+	// as a done context, so without this it would be reported as a bad gateway and
+	// send an operator looking for an upstream fault that is not there.
+	var timeout interface{ Timeout() bool }
+	if errors.As(err, &timeout) && timeout.Timeout() {
 		return dispatchFailure{
 			Status:  http.StatusGatewayTimeout,
 			Code:    "upstream_timeout",
