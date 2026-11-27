@@ -145,7 +145,7 @@ func Load() (Config, error) {
 	if cfg.TLSHandshakeTimeout, err = durationEnv("FLUXGATE_TLS_HANDSHAKE_TIMEOUT", cfg.TLSHandshakeTimeout, true); err != nil {
 		return Config{}, err
 	}
-	if cfg.ResponseHeaderTimeout, err = durationEnv("FLUXGATE_RESPONSE_HEADER_TIMEOUT", cfg.ResponseHeaderTimeout, true); err != nil {
+	if cfg.ResponseHeaderTimeout, err = durationEnv("FLUXGATE_RESPONSE_HEADER_TIMEOUT", cfg.ResponseHeaderTimeout, false); err != nil {
 		return Config{}, err
 	}
 	if cfg.IdleConnTimeout, err = durationEnv("FLUXGATE_IDLE_CONN_TIMEOUT", cfg.IdleConnTimeout, true); err != nil {
