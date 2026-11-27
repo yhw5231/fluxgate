@@ -1,11 +1,14 @@
 package console
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestHandlerServesIndexAndAssets(t *testing.T) {
@@ -1127,4 +1130,96 @@ func TestConsoleRequestRecordsLabelProbesAndCopyContent(t *testing.T) {
 			t.Errorf("console script is missing %q", wanted)
 		}
 	}
+}
+
+// Upstream actions and help have their own DOM, not an editor note or another dialog.
+func TestConsoleUpstreamActionsAndHelpStructure(t *testing.T) {
+	page := consoleAsset(t, "/console/")
+	start := strings.Index(page, `data-view-panel="upstream"`)
+	if start < 0 {
+		t.Fatal("upstream view is missing")
+	}
+	end := strings.Index(page[start:], "</main>")
+	if end < 0 {
+		t.Fatal("upstream view is not closed")
+	}
+	view := page[start : start+end]
+	for _, wanted := range []string{
+		`id="upstreams-help"`, `aria-controls="upstreams-help-overlay"`,
+		`aria-haspopup="dialog"`, `id="upstreams-probe-all"`,
+		`<span class="btn-label">检测全部</span>`, `data-create="upstreams"`,
+	} {
+		if !strings.Contains(view, wanted) {
+			t.Errorf("upstream view is missing %q", wanted)
+		}
+	}
+	if strings.Contains(view, `class="panel-help"`) {
+		t.Error("upstream panel help must live only in the dedicated help dialog")
+	}
+	for _, wanted := range []string{
+		`id="upstreams-help-overlay" class="modal-overlay" hidden`,
+		`aria-labelledby="upstreams-help-title"`, `id="upstreams-help-close"`,
+		`id="upstreams-help-fields"`, "一个上游填一处上游服务：",
+	} {
+		if !strings.Contains(page, wanted) {
+			t.Errorf("upstream help dialog is missing %q", wanted)
+		}
+	}
+	for _, dialog := range []string{"upstreams-help-overlay", "editor-overlay", "confirm-overlay", "secret-overlay"} {
+		if strings.Count(page, `id="`+dialog+`"`) != 1 {
+			t.Errorf("dialog %s must have one dedicated root", dialog)
+		}
+	}
+}
+
+func TestConsoleUpstreamProbeAndHistoryContracts(t *testing.T) {
+	script := consoleScript(t)
+	for _, wanted := range []string{
+		"function probeUpstreamNow(row, button)", "var siteID = Number(row.id)",
+		"post('/management/probes/run', { site_id: siteID })",
+		"function runProbeSweep(button, idleLabel)", "post('/management/probes/run', {})",
+		"state.probes.sites[siteID]", "data-probe-site", "结果可在「探测」页查看",
+		"invalid_probe:", "unknown_site:", "probe_timeout:",
+		"Object.keys(FIELDS.upstreams)", "resource !== 'upstreams' && meta.help",
+		"UPSTREAM_KEYS_MASK_HELP", "UPSTREAM_MODEL_HELP", "upstreamHelpKeydown(event)",
+		"event.target === els.upstreamsHelpOverlay", "els.upstreamsHelp.focus()",
+		"function upstreamNameOf(id, fallback)", "rowByID('upstreams', id)",
+		"未关联线路（历史记录）", "（历史线路）", "这条记录对应的密钥已不再属于任何线路",
+	} {
+		if !strings.Contains(script, wanted) {
+			t.Errorf("console script is missing %q", wanted)
+		}
+	}
+	if strings.Contains(script, "结果会陆续出现在这里") {
+		t.Error("probe sweep must not promise results in the upstream list")
+	}
+	for _, scope := range []struct{ start, end string }{
+		{"function createKeysField(", "var MODEL_VARIANTS"},
+		{"function createModelPicker(", "function mappingTarget("},
+	} {
+		start := strings.Index(script, scope.start)
+		end := strings.Index(script, scope.end)
+		if start < 0 || end <= start {
+			t.Fatalf("cannot locate upstream editor scope %s", scope.start)
+		}
+		if strings.Contains(script[start:end], "'field-help'") {
+			t.Errorf("upstream editor %s still renders static field help", scope.start)
+		}
+	}
+}
+
+// A normal Go-only CI does not need Node. When available, also exercise the real
+// JavaScript in a small DOM harness, including pending requests and rejections.
+func TestConsoleJavaScriptBehavior(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node.js is optional; Go structure regressions still run")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, node, "app_behavior_test.cjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("console JavaScript behavior tests: %v\n%s", err, output)
+	}
+	t.Log(strings.TrimSpace(string(output)))
 }

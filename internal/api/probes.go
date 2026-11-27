@@ -16,6 +16,8 @@ import (
 //
 //	GET    /management/probes?limit=100
 //	POST   /management/probes/run            {"channel_id": "12"}
+//	POST   /management/probes/run            {"site_id": 3}
+//	POST   /management/probes/run            {}
 //	DELETE /management/probes
 //
 // A key can stop working between two requests: a quota expires, an account is
@@ -25,7 +27,7 @@ import (
 // found and how an operator asks for a check right now.
 //
 // A probe never changes a circuit: it is evidence, not a decision. Bringing a
-// line back is 恢复 or its cooldown expiring.
+// line back is 鎭㈠ or its cooldown expiring.
 
 // ProbeService runs probes and reads their record. It is satisfied by the probe
 // service the process starts; a gateway assembled without one answers 503.
@@ -38,6 +40,10 @@ type ProbeService interface {
 	ProbeAllAsync(ctx context.Context) bool
 	// ProbeChannel probes every line of one upstream.
 	ProbeChannel(ctx context.Context, channelID string) []probe.Result
+	// ProbeSite probes every probeable line of one upstream, which is what the
+	// 涓婃父 view's 妫€娴?action asks for: one check per key of the upstream the
+	// operator named, rather than one per line of the whole gateway.
+	ProbeSite(ctx context.Context, siteID int64) []probe.Result
 	// Targets reports the lines that could be probed now, with the newest result
 	// recorded for each.
 	Targets(ctx context.Context) []probe.Target
@@ -116,19 +122,56 @@ func (s *Server) handleProbeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		ChannelID string `json:"channel_id"`
+		ChannelID string          `json:"channel_id"`
+		SiteID    json.RawMessage `json:"site_id"`
 	}
 	if raw := strings.TrimSpace(r.Header.Get("Content-Type")); strings.HasPrefix(raw, "application/json") {
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil && err != io.EOF {
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+		if err := decoder.Decode(&body); err != nil && err != io.EOF {
 			writeError(w, http.StatusBadRequest, "invalid_probe", "the probe request must be a JSON object")
+			return
+		}
+		var extra json.RawMessage
+		if decoder.Decode(&extra) != io.EOF {
+			writeError(w, http.StatusBadRequest, "invalid_probe", "the probe request must contain one JSON object")
 			return
 		}
 	}
 
+	if body.SiteID != nil {
+		siteID, ok := probeSiteID(w, body.SiteID, body.ChannelID)
+		if !ok {
+			return
+		}
+		// One upstream is checked while the operator waits: it is one small request
+		// per key, and its answer is what they clicked for. The upstream is named
+		// rather than its lines, so the console does not have to know which channel
+		// ids belong to the row it is looking at.
+		ctx, cancel := context.WithTimeout(r.Context(), manualProbeTimeout)
+		defer cancel()
+		results := s.Probes.ProbeSite(ctx, siteID)
+		if ctx.Err() != nil {
+			writeError(w, http.StatusGatewayTimeout, "probe_timeout",
+				"the upstream probe did not finish before its deadline")
+			return
+		}
+		if len(results) == 0 {
+			// The upstream holds no line a probe can ask: every key it has is
+			// disabled, its routes are off, or no model name its upstream knows can
+			// be sent. That is a different condition from a failed check, and the
+			// console says so rather than reporting a healthy answer.
+			writeError(w, http.StatusNotFound, "unknown_site",
+				"no enabled line of that upstream can be probed")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"probes": results})
+		return
+	}
+
 	if channelID := strings.TrimSpace(body.ChannelID); channelID != "" {
-		// One upstream is checked while the operator waits: it is one small request,
+		// One line is checked while the operator waits: it is one small request,
 		// and its answer is what they clicked for.
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+		ctx, cancel := context.WithTimeout(r.Context(), manualProbeTimeout)
 		defer cancel()
 		results := s.Probes.ProbeChannel(ctx, channelID)
 		if len(results) == 0 {
@@ -150,6 +193,31 @@ func (s *Server) handleProbeRun(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logConfigurationChange(r, "console_probe_sweep_started", "probes", 0)
 	writeJSON(w, http.StatusAccepted, map[string]any{"started": true})
+}
+
+// manualProbeTimeout bounds a check an operator is waiting for. It is one small
+// request per key of one upstream, so it is generous enough for an upstream with
+// many accounts and short enough that a hung upstream answers instead of hanging
+// the click.
+const manualProbeTimeout = 2 * time.Minute
+
+// probeSiteID reads the site_id of a probe request. The value is decoded from raw
+// JSON because a missing key must start a sweep while a key that is present and
+// wrong must be refused: a zero, a fraction, a string, or a boolean is a mistake
+// the console has to hear about, not something to guess around.
+func probeSiteID(w http.ResponseWriter, raw json.RawMessage, channelID string) (int64, bool) {
+	var siteID int64
+	if err := json.Unmarshal(raw, &siteID); err != nil || siteID <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid_probe",
+			"site_id must be a positive integer")
+		return 0, false
+	}
+	if strings.TrimSpace(channelID) != "" {
+		writeError(w, http.StatusBadRequest, "invalid_probe",
+			"a probe names one line, one upstream, or everything, not two of them")
+		return 0, false
+	}
+	return siteID, true
 }
 
 // handleProbeClear empties the probe record.
@@ -178,7 +246,7 @@ func (s *Server) handleProbeClear(w http.ResponseWriter, r *http.Request) {
 }
 
 // RecordProbeRun stores one finished probe in the request log. A probe is a request
-// the gateway made on its own behalf, and 请求记录 is where an operator looks for
+// the gateway made on its own behalf, and 璇锋眰璁板綍 is where an operator looks for
 // what the gateway did and when; leaving probes out of it would keep the checks
 // nobody asked for out of the one place that explains failures.
 func (s *Server) RecordProbeRun(result probe.Result) {
@@ -220,8 +288,8 @@ func (s *Server) RecordProbeRun(result probe.Result) {
 		record.ErrorCode = result.Reason
 		record.ErrorMessage = result.Detail
 	}
-	// A probe outlives the request that may have triggered it — a sweep runs in the
-	// background — so the write is not tied to a caller's context.
+	// A probe outlives the request that may have triggered it 鈥?a sweep runs in the
+	// background 鈥?so the write is not tied to a caller's context.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := s.RequestLog.AppendRequestRecord(ctx, record, applied.Keep); err != nil {

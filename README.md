@@ -373,7 +373,13 @@ because a line's state changes without an operator doing anything.
 The 上游 view shows the same lines from the upstream's side. The priority and the
 weight are both edited in place: type a number in the row, press Enter or 保存, and
 the change is stored and applied for the next request. A 线路状态 column summarizes
-how that upstream's lines currently stand, and expanding a row lists them.
+how that upstream's lines currently stand, and expanding a row lists them. 检测
+checks one upstream on the spot — one small request per key it can ask about, answered
+while the operator waits, with the number of healthy lines in the notice and the full
+results under 探测 — and 检测全部 starts the background sweep of every line instead.
+The 帮助 button opens the field-by-field explanation of the upstream form, which is
+deliberately not printed in the form itself: the editor is a form to fill in, and what
+each field means lives one click away, in a dialog that scrolls on its own.
 
 The upstream form is built around the things that actually vary between
 upstreams:
@@ -605,6 +611,14 @@ brought back from 概览 (where every recorded circuit is listed and can be clea
 by one or all at once with 全部恢复) or from the line itself on the 路由 and 上游 views
 (恢复), so it returns to service before its cooldown would have expired.
 
+The circuit table on 概览 names the lines each circuit holds. A circuit filed under a
+credential names every line presenting it; one that outlived its line — a key that was
+replaced, an upstream whose models were all deselected, an upstream that was deleted —
+cannot be filed under a line any more, and is shown against the upstream it belonged to
+with （历史线路） beside it rather than as an empty cell, which would read as a
+rendering fault. 恢复 on such a row clears that upstream's recorded circuits, so the
+history does not accumulate, and 全部恢复 clears all of them.
+
 A few rules the console enforces, all of them on the server rather than in the
 browser:
 
@@ -768,7 +782,11 @@ used by two upstreams is two accounts, and they cool down and recover apart — 
 state is resolved per line by the gateway and the `scope` it names is where the circuit
 lives; the credential itself is never part of a line's entry. Each circuit in the
 `breakers` list names the lines it holds, and a credential-scoped one carries its
-`site_id`, which is what a console action addresses it by.
+`site_id`, which is what a console action addresses it by. A circuit whose credential
+no current line presents any more has no `lines` to name: it carries the `site_name`
+of the upstream it belonged to instead, so the console can still show which upstream
+the record is about without ever receiving the credential. `site_name` is a label for
+display, not a claim that a line still presents the credential.
 
 `upstreams` is the composite resource the console's upstream form writes, and the only
 one whose fields are assembled from several tables. Alongside the columns of `sites` it
@@ -808,9 +826,14 @@ because bringing one line back is what an operator means and which circuit filed
 failure is the gateway's to know. A `site` scope naming a `site_id` does the same for
 every line of one upstream, which is how a circuit the browser cannot name — one filed
 under a credential, which never leaves the gateway — is still recovered from the
-console. The `key` and `key_model` scopes stay available for automation: they name the
-credential itself, in every upstream that holds it, or in the one their optional
-`site_id` names. `POST /management/upstreams/models` asks an upstream for its model
+console. It also clears that upstream's circuits whose credential no line presents any
+more, which is what a 恢复 on a historical row on 概览 sends: the record is about that
+upstream even though the line it was recorded on is gone. A legacy circuit filed under
+a credential with no upstream belongs to every upstream holding that key, so a `site`
+scope leaves it alone; `all` or a `key` scope clears it. The `key` and `key_model`
+scopes stay available for automation: they name the credential itself, in every
+upstream that holds it, or in the one their optional `site_id` names.
+`POST /management/upstreams/models` asks an upstream for its model
 list: the body carries the `url`, one `key`, the `proxy_url`, and any `headers` from the
 form before it is saved, or an `id` and a masked key so the gateway probes with the key
 it already stores. An empty `proxy_url` probes through the default proxy profile, which
@@ -1030,7 +1053,12 @@ The answer carries `probes` (the recorded results), `targets` (the lines a probe
 each with its model and its newest result), `retention`, and `policy`.
 
 `POST /management/probes/run` asks for a check now. With `{"channel_id": "12"}` it
-probes that upstream and answers with the results; with no body it starts a sweep of
+probes that line and answers with the results; with `{"site_id": 3}` it probes every
+probeable line of that upstream in one batch and answers the same way, which is what
+the 检测 button on 上游 sends — the upstream is named rather than its lines, so the
+browser does not have to know which channel ids belong to the row it shows. An
+upstream with no probeable line answers `404 unknown_site`, which the console words as
+"no line to check" rather than as a failed check. With no body it starts a sweep of
 every eligible line in the background — a sweep can take long enough that holding
 the request open would look like a hang — and answers `202 accepted`. A sweep
 already running is refused with `409 probe_in_progress` rather than queued, so a

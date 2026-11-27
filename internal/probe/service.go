@@ -100,6 +100,9 @@ type LatestResultStore interface {
 // 探测 view lists these, so an operator sees what the gateway can check and how each
 // line last answered, and not only the checks that already happened.
 type Target struct {
+	// SiteID is the upstream the line belongs to, so a view can group the lines it
+	// can check by the upstream they serve.
+	SiteID      int64  `json:"site_id,omitempty"`
 	ChannelID   string `json:"channel_id"`
 	ChannelName string `json:"channel_name"`
 	Model       string `json:"model"`
@@ -306,6 +309,25 @@ func (s *Service) ProbeChannel(ctx context.Context, channelID string) []Result {
 	return s.runLines(ctx, selected, KindManual, settings)
 }
 
+// ProbeSite checks every probeable line of one upstream, now. It is the batch a
+// console row asks for: one small request per key of that upstream, sharing the
+// concurrency limit a sweep would use, and answered while the operator waits. A
+// line whose circuit is cooling down is included, because confirming that the
+// upstream serves again is what a manual check is for; a disabled line, or one
+// whose routes name no concrete model, cannot be asked and is left out.
+func (s *Service) ProbeSite(ctx context.Context, siteID int64) []Result {
+	if s == nil || s.Prober == nil || siteID <= 0 {
+		return nil
+	}
+	selected := make([]Line, 0)
+	for _, line := range s.lines() {
+		if line.SiteID == siteID {
+			selected = append(selected, line)
+		}
+	}
+	return s.runLines(ctx, selected, KindManual, s.currentSettings())
+}
+
 // ListRuns answers the console's probe view.
 func (s *Service) ListRuns(ctx context.Context, limit int) ([]Result, int64, error) {
 	if s == nil || s.Store == nil {
@@ -398,6 +420,7 @@ func (s *Service) Targets(ctx context.Context) []Target {
 	targets := make([]Target, 0, len(lines))
 	for _, line := range lines {
 		target := Target{
+			SiteID:      line.SiteID,
 			ChannelID:   line.ChannelID,
 			ChannelName: line.ChannelName,
 			Model:       line.Model,

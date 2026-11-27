@@ -480,9 +480,12 @@
             <h2>上游</h2>
             <span class="panel-meta" data-meta></span>
           </div>
-          <button class="btn btn-primary" type="button" data-create="upstreams">添加上游</button>
+          <div class="panel-actions">
+            <button id="upstreams-help" class="btn btn-ghost" type="button" aria-haspopup="dialog" aria-controls="upstreams-help-overlay" aria-expanded="false">帮助</button>
+            <button id="upstreams-probe-all" class="btn btn-ghost" type="button"><span class="btn-label">检测全部</span></button>
+            <button class="btn btn-primary" type="button" data-create="upstreams">添加上游</button>
+          </div>
         </header>
-        <p class="panel-help">一个上游填一处上游服务：名称、API 地址、权重、请求头、一组密钥，以及它提供哪些模型。保存后网关会按选中的模型自动建立路由，无需再手工配置通道。优先级和权重可以直接在表格里改，点状态徽标就能启用或停用，都不必打开编辑框；点开一行能看到这个上游的每条线路（每个密钥一条）和它们的当前状态。</p>
         <div class="table-wrap">
           <table class="data-table" data-table="upstreams"><tbody data-body="upstreams"></tbody></table>
         </div>
@@ -762,6 +765,21 @@
         </section>
       </div>
     </main>
+      </div>
+    </div>
+  </div>
+
+  <!-- 上游帮助：表单字段的说明集中在这里，编辑框本身只放输入项。 -->
+  <div id="upstreams-help-overlay" class="modal-overlay" hidden>
+    <div class="modal-card upstream-help-card" role="dialog" aria-modal="true" aria-labelledby="upstreams-help-title">
+      <header class="modal-header">
+        <h2 id="upstreams-help-title" class="modal-title">上游配置说明</h2>
+        <button id="upstreams-help-close" class="btn btn-ghost btn-icon" type="button" title="关闭" aria-label="关闭上游配置说明">×</button>
+      </header>
+      <div class="modal-body upstream-help-content" tabindex="0" aria-label="上游配置说明">
+        <p class="modal-note">一个上游填一处上游服务：名称、API 地址、权重、请求头、一组密钥，以及它提供哪些模型。保存后网关会按选中的模型自动建立路由，不需要再手工配置线路。优先级和权重可以直接在表格里改，点状态徽标就能启用或停用；点开一行能看到这个上游的每条线路（每个密钥一条）和它们的当前状态。</p>
+        <p class="modal-note">「检测」按这个上游的每个密钥发一次小请求，核对它能回答的线路，完成后在页面上报告正常数 / 总数；「检测全部」在后台检查所有上游的线路。两种检测的明细都在「探测」页，检测本身不会改变熔断状态。</p>
+        <div id="upstreams-help-fields"></div>
       </div>
     </div>
   </div>

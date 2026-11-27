@@ -23,6 +23,9 @@ type fakeProbes struct {
 	results []probe.Result
 	targets []probe.Target
 	channel string
+	// site is the upstream a site probe was asked about; channel stays empty for
+	// such a request, because one batch answers it rather than one call per line.
+	site    int64
 	busy    bool
 	cleared int64
 	started bool
@@ -59,6 +62,27 @@ func (f *fakeProbes) ProbeChannel(_ context.Context, channelID string) []probe.R
 	selected := make([]probe.Result, 0, 1)
 	for _, result := range f.results {
 		if result.ChannelID == channelID {
+			selected = append(selected, result)
+		}
+	}
+	return selected
+}
+
+// ProbeSite answers as the real service does: every probeable line of one
+// upstream, found through the targets it reports.
+func (f *fakeProbes) ProbeSite(_ context.Context, siteID int64) []probe.Result {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.site = siteID
+	wanted := make(map[string]bool, len(f.targets))
+	for _, target := range f.targets {
+		if target.SiteID == siteID && target.ChannelID != "" {
+			wanted[target.ChannelID] = true
+		}
+	}
+	selected := make([]probe.Result, 0, len(wanted))
+	for _, result := range f.results {
+		if wanted[result.ChannelID] {
 			selected = append(selected, result)
 		}
 	}

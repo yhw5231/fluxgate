@@ -1366,6 +1366,11 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   overflow: hidden;
 }
 .modal-card-narrow { max-width: 460px; }
+.upstream-help-card { max-width: 720px; }
+.upstream-help-content { max-height: 70vh; overflow-y: auto; overscroll-behavior: contain; overflow-wrap: anywhere; }
+.upstream-help-section + .upstream-help-section { margin-top: 16px; }
+.upstream-help-section h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; color: var(--text-primary); }
+.upstream-help-section .modal-note + .modal-note { margin-top: 6px; }
 
 .modal-header {
   display: flex;
@@ -1441,6 +1446,10 @@ input[type="password"].field-input { font-family: var(--font-mono); }
   color: var(--text-faint);
   white-space: nowrap;
 }
+
+/* An empty picker says what is missing in one line: the reasoning lives in the
+ * upstream help dialog, not inside a form an operator is filling in. */
+.picker-empty { margin: 10px 2px 0; font-size: 11.5px; line-height: 1.6; color: var(--text-faint); }
 
 .model-list,
 .choice-list {

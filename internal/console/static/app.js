@@ -92,7 +92,7 @@
     // read on its own so a usage refresh never waits on the configuration.
     usage: { window: '7d', summary: null, error: null },
     // probes holds the lines a probe could ask, and what the probes found.
-    probes: { targets: [], runs: [], total: 0, retention: null, policy: null, error: null, running: false },
+    probes: { targets: [], runs: [], total: 0, retention: null, policy: null, error: null, running: false, sites: {} },
     // poolLeases holds the leases the gateway holds from its pools.
     poolLeases: { assignments: [], pools: [], sites: {}, error: null },
     // revealedKeys holds the client keys an operator asked to see, by row id.
@@ -162,6 +162,11 @@
     els.routingMeta = document.querySelector('[data-panel="routing"] [data-meta]');
     els.routingTable = document.querySelector('[data-table="routing"]');
     els.upstreamsBody = document.querySelector('[data-management="upstreams"] [data-body]');
+    els.upstreamsProbeAll = $('upstreams-probe-all');
+    els.upstreamsHelp = $('upstreams-help');
+    els.upstreamsHelpOverlay = $('upstreams-help-overlay');
+    els.upstreamsHelpFields = $('upstreams-help-fields');
+    els.upstreamsHelpClose = $('upstreams-help-close');
 
     els.requestsBody = document.querySelector('[data-requests-body]');
     els.requestsEmpty = document.querySelector('[data-empty="requests"]');
@@ -635,6 +640,71 @@
     }
   };
 
+  /* Upstream help is rendered separately, never inside the editor. */
+  var UPSTREAM_MODEL_HELP =
+    '勾选这个上游提供的模型；保存后网关会自动为它们建立路由。模型名会去掉大小写和' +
+    '渠道路径（/ 前面）的差别，:free、:nitro 这类已知变体后缀也算同一个模型：' +
+    'cline-free/deepseek-v4.1-flash:free 和 DeepSeek-V4.1-Flash 是同一个模型。' +
+    'cn:deepseek-v4.1-flash 这类名字里，第一个冒号前是渠道分组，冒号后面才是模型：' +
+    '模型名是 deepseek-v4.1-flash，「上游模型名」自动填 cn:deepseek-v4.1-flash，' +
+    '发往上游的就是上游列出的写法；同一个模型由多个分组提供时（cn: 与 global:）' +
+    '只留一条，行里标出另一种写法，「上游模型名」可改成想要的那一组。' +
+    '「获取模型」按上游最新的列表重建：勾选保持原样，上游新增的模型默认不勾选，' +
+    '用「全选」「反选」或逐个勾选来挑；上游不再提供的自动取消勾选并标出。' +
+    '全选和反选只作用于当前筛选显示的模型，也可以手动添加模型名。';
+  var UPSTREAM_KEYS_MASK_HELP = '编辑时已保存的密钥仅显示末四位掩码，按原行序排列；提交掩码表示保留对应密钥，不会把掩码当作新密钥。留空表示保持已保存的密钥不变。';
+
+  function renderUpstreamHelp() {
+    els.upstreamsHelpFields.textContent = '';
+    // Every field the form renders. The model mapping is edited inside the picker,
+    // one model at a time, so a section presenting it as a form field would
+    // describe an input the operator cannot find.
+    Object.keys(FIELDS.upstreams).forEach(function (name) {
+      if (name === 'model_mapping') { return; }
+      var meta = FIELDS.upstreams[name];
+      if (!meta.help) { return; }
+      var section = element('section', 'upstream-help-section');
+      section.appendChild(element('h3', '', meta.label || name));
+      section.appendChild(element('p', 'modal-note', meta.help));
+      if (name === 'keys') { section.appendChild(element('p', 'modal-note', UPSTREAM_KEYS_MASK_HELP)); }
+      if (name === 'models') { section.appendChild(element('p', 'modal-note', UPSTREAM_MODEL_HELP)); }
+      els.upstreamsHelpFields.appendChild(section);
+    });
+  }
+
+  function openUpstreamHelp() {
+    if (!els.editorOverlay.hidden || !els.confirmOverlay.hidden || !els.secretOverlay.hidden) { return; }
+    renderUpstreamHelp();
+    els.upstreamsHelpOverlay.hidden = false;
+    els.upstreamsHelp.setAttribute('aria-expanded', 'true');
+    els.upstreamsHelpClose.focus();
+  }
+
+  function closeUpstreamHelp(restoreFocus) {
+    if (!els.upstreamsHelpOverlay || els.upstreamsHelpOverlay.hidden) { return; }
+    els.upstreamsHelpOverlay.hidden = true;
+    els.upstreamsHelp.setAttribute('aria-expanded', 'false');
+    if (restoreFocus !== false && !els.app.hidden) { els.upstreamsHelp.focus(); }
+  }
+
+  function upstreamHelpKeydown(event) {
+    if (!els.upstreamsHelpOverlay || els.upstreamsHelpOverlay.hidden) { return false; }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeUpstreamHelp();
+    } else if (event.key === 'Tab') {
+      var focusable = els.upstreamsHelpOverlay.querySelectorAll('button:not([disabled]), [href], [tabindex="0"]');
+      var first = focusable[0];
+      var last = focusable[focusable.length - 1];
+      if (first && ((event.shiftKey ? document.activeElement === first : document.activeElement === last) ||
+        !els.upstreamsHelpOverlay.contains(document.activeElement))) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      }
+    }
+    return true;
+  }
+
   /* RESOURCES[resource] describes the management table of a resource. */
   var RESOURCES = {
     upstreams: {
@@ -679,7 +749,7 @@
           cell: function (row) { return upstreamStatusToggle(row); }
         }
       ],
-      actions: ['edit', 'delete'],
+      actions: ['detect', 'edit', 'delete'],
       // 一个上游的每个密钥都是一条线路，各有自己的优先级和当前状态。展开的内容
       // 只在真的展开时才构建，折叠着的一行不必付这个代价。
       detail: function (row) {
@@ -1429,6 +1499,7 @@
    * (a password reset, a sign-out) is noticed on the next request. */
 
   function showAuth(message) {
+    closeUpstreamHelp(false);
     stopAutoRefresh();
     stopCooldownTicker();
     els.app.hidden = true;
@@ -1597,6 +1668,9 @@
     // 运行策略与上游探测
     upstream_probe_failed: '获取模型失败，请检查 API 地址和密钥。',
     upstream_unreachable: '无法连接该上游。',
+    invalid_probe: '检测参数无效，请刷新上游列表后重试。',
+    unknown_site: '这个上游没有可检测的线路：线路已停用，或没有能发给上游的模型名。',
+    probe_timeout: '检测超时，请稍后重试；已完成的结果可在「探测」页查看。',
     breakers_not_supported: '本网关没有可恢复的熔断记录。'
   };
 
@@ -2013,17 +2087,44 @@
 
   /* breakerLineCell names the lines a recorded circuit holds out of rotation. A
    * circuit filed under a credential covers every line presenting it, and the
-   * gateway reports those lines rather than the credential it is filed under. */
+   * gateway reports those lines rather than the credential it is filed under.
+   *
+   * A circuit can outlive the line that recorded it: a key is replaced, an
+   * upstream's models are all deselected, an upstream is deleted. The gateway then
+   * has no line to name, but the circuit is still listed and still counted, so the
+   * cell names the upstream it belonged to instead of leaving the column blank —
+   * an empty cell reads as a rendering fault rather than as the staleness it is. */
   function breakerLineCell(entry) {
     var names = [];
     if (Array.isArray(entry.lines)) { names = uniqueValues(entry.lines); }
     if (names.length === 0 && entry.channel_id) {
       names = [state.channelNames[entry.channel_id] || String(entry.channel_id)];
     }
-    if (names.length === 0) { return element('span', 'cell-muted', '—'); }
+    if (names.length === 0) {
+      var siteID = number(entry.site_id);
+      var owner = siteID > 0 ? (upstreamNameOf(siteID, entry.site_name) || '上游#' + siteID) : '';
+      var historical = element('span', 'cell-muted',
+        owner ? owner + '（历史线路）' : '未关联线路（历史记录）');
+      historical.title = owner
+        ? '这条记录对应的密钥已不再属于任何线路（可能已更换或上游已删除），所以只能标出它原来的上游；用「全部恢复」可以清除这条历史记录。'
+        : '这条记录没有可关联的线路或上游；用「全部恢复」可以清除历史记录。';
+      return historical;
+    }
     var node = element('span', 'cell-strong', names.join('、'));
     node.title = names.join('、');
     return node;
+  }
+
+  /* upstreamNameOf names one upstream the way the operator knows it: the label the
+   * gateway sent with the circuit, or the name the configuration holds for that id.
+   * The configuration is read because an upstream that serves no line right now —
+   * every model deselected, every key removed — is absent from the snapshot's lines
+   * but still present as an upstream. */
+  function upstreamNameOf(id, fallback) {
+    var name = String(fallback === null || fallback === undefined ? '' : fallback).trim();
+    if (name) { return name; }
+    var row = rowByID('upstreams', id);
+    return row ? text(row.name, '') : '';
   }
 
   /* resetBreaker clears one recorded circuit, by the identifiers the breaker
@@ -3176,34 +3277,84 @@
     });
   }
 
-  function runProbeSweep() {
-    if (!els.probesRunAll) { return; }
-    setSubmitting(els.probesRunAll, true, '探测全部线路');
-    post('/management/probes/run', {}).then(function (result) {
-      setSubmitting(els.probesRunAll, false, '探测全部线路');
+  /* Both pages share the background sweep; never promise inline upstream results. */
+  function setProbeSweepSubmitting(button, submitting, idleLabel) {
+    state.probes.running = submitting;
+    if (els.probesRunAll) { setSubmitting(els.probesRunAll, submitting, '探测全部线路'); }
+    if (els.upstreamsProbeAll) { setSubmitting(els.upstreamsProbeAll, submitting, '检测全部'); }
+    if (button && button !== els.probesRunAll && button !== els.upstreamsProbeAll) {
+      setSubmitting(button, submitting, idleLabel);
+    }
+  }
+
+  function runProbeSweep(button, idleLabel) {
+    button = button || els.probesRunAll;
+    idleLabel = idleLabel || '探测全部线路';
+    if (!button || state.probes.running) { return; }
+    setProbeSweepSubmitting(button, true, idleLabel);
+    return post('/management/probes/run', {}).then(function (result) {
+      setProbeSweepSubmitting(button, false, idleLabel);
       if (result.status === 401) {
         showAuth('登录状态已失效，请重新登录后继续。');
         return;
       }
       if (result.ok) {
-        // 全量探测在后台跑，结果会陆续出现在下面的表格里。
-        showNotice('已开始探测全部线路，结果会陆续出现在这里。');
+        showNotice('已开始检测全部线路，结果可在「探测」页查看。');
         state.probes.lastSweep = Date.now();
         refresh();
         return;
       }
       if (result.status === 409) {
-        showNotice('上一次探测还在进行中，请稍候。');
+        showNotice('上一次检测还在进行中，请稍候；结果可在「探测」页查看。');
         return;
       }
-      refreshFailure('探测失败', errorMessage(result.body, '无法开始探测。'));
+      showBanner('检测失败', errorMessage(result.body, '无法开始检测。'));
+    }).catch(function (err) {
+      setProbeSweepSubmitting(button, false, idleLabel);
+      showBanner('无法连接网关', String(err && err.message ? err.message : err));
+    });
+  }
+
+  /* Keep the pending state by site, so a configuration repaint cannot re-enable it. */
+  function setUpstreamProbeSubmitting(siteID, button, submitting) {
+    if (submitting) { state.probes.sites[siteID] = true; }
+    else { delete state.probes.sites[siteID]; }
+    if (button) { setSubmitting(button, submitting, '检测'); }
+    document.querySelectorAll('[data-probe-site]').forEach(function (current) {
+      if (Number(current.getAttribute('data-probe-site')) === siteID) {
+        setSubmitting(current, submitting, '检测');
+      }
+    });
+  }
+
+  function probeUpstreamNow(row, button) {
+    var siteID = Number(row.id);
+    if (!Number.isInteger(siteID) || siteID <= 0 || state.probes.sites[siteID]) { return; }
+    setUpstreamProbeSubmitting(siteID, button, true);
+    return post('/management/probes/run', { site_id: siteID }).then(function (result) {
+      setUpstreamProbeSubmitting(siteID, button, false);
+      if (result.status === 401) {
+        showAuth('登录状态已失效，请重新登录后继续。');
+        return;
+      }
+      if (result.ok) {
+        var probes = result.body && Array.isArray(result.body.probes) ? result.body.probes : [];
+        var healthy = probes.filter(function (entry) { return entry && entry.ok; }).length;
+        showNotice('检测完成：' + healthy + ' / ' + probes.length + ' 条线路正常；结果可在「探测」页查看。');
+        refresh();
+        return;
+      }
+      showBanner('检测失败', errorMessage(result.body, '无法检测这个上游。'));
+    }).catch(function (err) {
+      setUpstreamProbeSubmitting(siteID, button, false);
+      showBanner('无法连接网关', String(err && err.message ? err.message : err));
     });
   }
 
   function probeChannelNow(channelID, button) {
-    if (!channelID) { return; }
+    if (!channelID || button.disabled) { return; }
     setSubmitting(button, true, '再探测');
-    post('/management/probes/run', { channel_id: channelID }).then(function (result) {
+    return post('/management/probes/run', { channel_id: channelID }).then(function (result) {
       setSubmitting(button, false, '再探测');
       if (result.status === 401) {
         showAuth('登录状态已失效，请重新登录后继续。');
@@ -3216,7 +3367,10 @@
         refresh();
         return;
       }
-      refreshFailure('探测失败', errorMessage(result.body, '无法探测这条线路。'));
+      showBanner('探测失败', errorMessage(result.body, '无法探测这条线路。'));
+    }).catch(function (err) {
+      setSubmitting(button, false, '再探测');
+      showBanner('无法连接网关', String(err && err.message ? err.message : err));
     });
   }
 
@@ -4122,6 +4276,14 @@
     td.className = 'actions';
     var group = element('div', 'row-actions');
 
+    if (metadata.actions.indexOf('detect') !== -1) {
+      var detect = busyButton('btn btn-ghost btn-small', '检测');
+      detect.title = '检测这个上游的全部可探测线路，结果可在「探测」页查看。';
+      detect.setAttribute('data-probe-site', row.id);
+      setSubmitting(detect, Boolean(state.probes.sites[Number(row.id)]), '检测');
+      detect.addEventListener('click', function () { probeUpstreamNow(row, detect); });
+      group.appendChild(detect);
+    }
     if (metadata.actions.indexOf('test') !== -1) {
       var test = element('button', 'btn btn-ghost btn-small', '测试');
       test.type = 'button';
@@ -4308,12 +4470,6 @@
     area.value = stored.join('\n');
     wrapper.appendChild(area);
 
-    wrapper.appendChild(element('p', 'field-help', (FIELDS.upstreams.keys || {}).help || ''));
-    if (stored.length > 0) {
-      wrapper.appendChild(element('p', 'field-help',
-        '已保存 ' + stored.length + ' 个密钥，上面显示的是末四位；按行序排列，留空表示保持不变。'));
-    }
-
     return {
       name: 'keys', kind: 'json_array', required: false, input: area, wrapper: wrapper,
       read: function () {
@@ -4370,16 +4526,6 @@
     wrapper.setAttribute('data-field', 'models');
     var heading = element('span', 'field-label', (FIELDS.upstreams.models || {}).label || '模型');
     wrapper.appendChild(heading);
-    wrapper.appendChild(element('p', 'field-help',
-      '勾选这个上游提供的模型；保存后网关会自动为它们建立路由。模型名会去掉大小写和' +
-      '渠道路径（/ 前面）的差别，:free、:nitro 这类已知变体后缀也算同一个模型：' +
-      'cline-free/deepseek-v4.1-flash:free 和 DeepSeek-V4.1-Flash 是同一个模型。' +
-      'cn:deepseek-v4.1-flash 这类名字里，第一个冒号前是渠道分组，冒号后面才是模型：' +
-      '模型名是 deepseek-v4.1-flash，「上游模型名」自动填 cn:deepseek-v4.1-flash，' +
-      '发往上游的就是上游列出的写法；同一个模型由多个分组提供时（cn: 与 global:）' +
-      '只留一条，行里标出另一种写法，「上游模型名」可改成想要的那一组。' +
-      '「获取模型」按上游最新的列表重建：勾选保持原样，上游新增的模型默认不勾选，' +
-      '用「全选」「反选」或逐个勾选来挑；上游不再提供的自动取消勾选并标出。'));
 
     var rows = [];
     var known = {};
@@ -4576,8 +4722,8 @@
       list.textContent = '';
       var visible = visibleRows();
       if (visible.length === 0) {
-        list.appendChild(element('p', 'field-help', rows.length === 0
-          ? '还没有模型。填写 API 地址和密钥后点「获取模型」，也可以手动添加。'
+        list.appendChild(element('p', 'picker-empty', rows.length === 0
+          ? '还没有模型。'
           : '没有符合筛选条件的模型。'));
       }
       visible.forEach(function (entry) {
@@ -4788,10 +4934,10 @@
     var input = createInput(resource, field, meta, inputID, row);
     wrapper.appendChild(input.node);
 
-    if (meta.help) {
+    if (resource !== 'upstreams' && meta.help) {
       wrapper.appendChild(element('p', 'field-help', meta.help));
     }
-    if (field.secret && row) {
+    if (resource !== 'upstreams' && field.secret && row) {
       wrapper.appendChild(element('p', 'field-help', '当前值：' + (row[field.name] || '未设置') + '，留空表示保持不变。'));
     }
 
@@ -6097,10 +6243,22 @@
       els.usageClear.addEventListener('click', clearUsageLog);
     }
     if (els.probesRunAll) {
-      els.probesRunAll.addEventListener('click', runProbeSweep);
+      els.probesRunAll.addEventListener('click', function () { runProbeSweep(); });
     }
     if (els.probesClear) {
       els.probesClear.addEventListener('click', clearProbeLog);
+    }
+    if (els.upstreamsProbeAll) {
+      els.upstreamsProbeAll.addEventListener('click', function () {
+        runProbeSweep(els.upstreamsProbeAll, '检测全部');
+      });
+    }
+    if (els.upstreamsHelp) {
+      els.upstreamsHelp.addEventListener('click', openUpstreamHelp);
+      els.upstreamsHelpClose.addEventListener('click', function () { closeUpstreamHelp(); });
+      els.upstreamsHelpOverlay.addEventListener('click', function (event) {
+        if (event.target === els.upstreamsHelpOverlay) { closeUpstreamHelp(); }
+      });
     }
     var probesPanel = document.querySelector('[data-view-panel="probes"]');
     if (probesPanel) {
@@ -6139,6 +6297,7 @@
     // Escape closes whichever dialog is on top, which is what a keyboard user
     // expects from a modal.
     document.addEventListener('keydown', function (event) {
+      if (upstreamHelpKeydown(event)) { return; }
       if (event.key !== 'Escape') { return; }
       if (!els.editorOverlay.hidden) { closeEditor(); return; }
       if (!els.confirmOverlay.hidden) { closeConfirm(); return; }

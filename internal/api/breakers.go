@@ -108,11 +108,13 @@ func (s *Server) breakerScopes(w http.ResponseWriter, body map[string]any) ([]br
 }
 
 // siteScopes lists every circuit that can hold one upstream's lines out of
-// rotation: each line's own, and the circuits filed under each of its credentials.
-// A circuit filed under a credential covers every line presenting it, so the lines
-// of one upstream are the whole of what an operator means by bringing that
-// upstream back — and it is how a circuit the browser cannot name, because it is
-// filed under the credential, is still recoverable from the console.
+// rotation: each line's own, the circuits filed under each of its credentials, and
+// the circuits filed under a credential it no longer presents — a replaced key —
+// which the console still lists against that upstream. A circuit filed under a
+// credential covers every line presenting it, so the lines of one upstream are the
+// whole of what an operator means by bringing that upstream back — and it is how a
+// circuit the browser cannot name, because it is filed under the credential, is
+// still recoverable from the console.
 func (s *Server) siteScopes(siteID int64) []breaker.Scope {
 	scopes := make([]breaker.Scope, 0)
 	for _, route := range s.currentConfiguration().Routes {
@@ -121,6 +123,21 @@ func (s *Server) siteScopes(siteID int64) []breaker.Scope {
 				continue
 			}
 			scopes = append(scopes, s.lineScopes(channel.ID, "")...)
+		}
+	}
+	// A circuit filed under a credential that no line presents any more — a key that
+	// was replaced, an upstream whose models were all deselected — still holds state,
+	// and the console lists it against this upstream because the credential itself is
+	// never sent to the browser. Including it here is what makes 恢复 on such a row
+	// work; without it the row would be listed and could not be cleared one by one.
+	// Only this upstream's own circuits are included: a legacy circuit filed without
+	// an upstream belongs to every upstream that holds that key, and clearing it from
+	// one of them would clear another one's.
+	if s.BreakerSnapshotter != nil {
+		for scope := range s.BreakerSnapshotter.Snapshot() {
+			if scope.SiteID == siteID && scope.KeyID != "" {
+				scopes = append(scopes, scope)
+			}
 		}
 	}
 	return dedupeScopes(scopes)

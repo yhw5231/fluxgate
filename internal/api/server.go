@@ -477,7 +477,12 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 		// SiteID is the upstream a credential-scoped circuit belongs to. One key
 		// string can be an account of two upstreams, and those are two accounts, so
 		// the circuit is filed per upstream and this is what tells them apart.
+		//
+		// SiteName is a display-only label for a circuit whose credential no current
+		// line presents any more. It says which upstream the record is about without
+		// claiming that a line still presents the credential.
 		SiteID              int64  `json:"site_id,omitempty"`
+		SiteName            string `json:"site_name,omitempty"`
 		ConsecutiveFailures int    `json:"consecutive_failures"`
 		CooldownLevel       int    `json:"cooldown_level"`
 		BlockedUntil        string `json:"blocked_until,omitempty"`
@@ -500,7 +505,7 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 	// can resolve one to the other, and it never leaves the gateway. The upstream
 	// is part of the key: one key string can be an account of two upstreams, and the
 	// lines of one are not the lines of the other.
-	linesByKey := map[string][]string{}
+	breakerLines := newBreakerLineIndex(configuration)
 	for _, route := range configuration.Routes {
 		mappings := make([]modelMappingSnapshot, 0, len(route.ModelMapping))
 		for _, entry := range route.ModelMapping {
@@ -514,12 +519,6 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 		})
 
 		for _, channel := range route.Channels {
-			if channel.APIKey != "" {
-				key := channel.CredentialKey()
-				if !containsString(linesByKey[key], channel.Name) {
-					linesByKey[key] = append(linesByKey[key], channel.Name)
-				}
-			}
 			proxySource := "direct"
 			switch {
 			case channel.ProxyURL != "":
@@ -588,14 +587,14 @@ func (s *Server) handleManagementSnapshot(w http.ResponseWriter, r *http.Request
 		if !state.BlockedUntil.IsZero() {
 			blockedUntil = state.BlockedUntil.UTC().Format(time.RFC3339Nano)
 		}
-		lines := append([]string(nil), linesByKey[domain.CredentialKeyOf(scope.SiteID, scope.KeyID)]...)
-		sort.Strings(lines)
+		lines := breakerLines.lines(scope)
 		breakers = append(breakers, breakerSnapshot{
 			Scope:               circuitScopeName(scope),
 			ChannelID:           scope.ChannelID,
 			Lines:               lines,
 			Model:               scope.Model,
 			SiteID:              scope.SiteID,
+			SiteName:            breakerLines.siteNames[scope.SiteID],
 			ConsecutiveFailures: state.ConsecutiveFailures,
 			CooldownLevel:       state.CooldownLevel,
 			BlockedUntil:        blockedUntil,
